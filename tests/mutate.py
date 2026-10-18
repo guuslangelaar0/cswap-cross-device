@@ -254,6 +254,15 @@ MUTATIONS = [
         "expect": "red",
     },
     {
+        "name": "claim-identity",
+        "what": "a claim is judged alive by its pid alone (a recycled pid keeps it forever)",
+        "edits": [("lib/cxd/hook.py",
+                   '    return claim_token(pid) == "%d-%s" % (pid, digest)  # GUARD:claim-identity\n',
+                   "    return proc_identity(pid) is not None  # MUTATION\n")],
+        "tests": [T + "TestHooks.test_claim_of_a_recycled_pid_is_requeued"],
+        "expect": "red",
+    },
+    {
         "name": "init-no-link",
         "what": "cxd init does not link ~/.cxd/bin/cxd, so peers cannot reach this host",
         "edits": [("lib/cxd/cli.py", "    link, target = _link_cli()\n",

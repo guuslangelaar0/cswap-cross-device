@@ -147,7 +147,6 @@ def proc_identity(pid):
     except (OSError, ValueError):
         return None
     pid = int(pid)
-    import subprocess
     if sys.platform.startswith("linux"):
         try:
             with open("/proc/%d/stat" % pid, "r") as f:
@@ -158,6 +157,7 @@ def proc_identity(pid):
         if len(rest) < 20 or rest[0] in ("Z", "X"):
             return None
         return "linux:" + rest[19]
+    import subprocess  # only off Linux: the hook path stays light
     try:
         r = subprocess.run(
             ["ps", "-o", "stat=,lstart=", "-p", str(pid)],

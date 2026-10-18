@@ -84,9 +84,13 @@ def mark_ended(sid, reason):
 # cannot write its output loses nothing; the message comes again.
 
 def claim_token(pid=None):
+    """<pid>-<fingerprint of its start identity>, or None if the identity
+    cannot be read (then nothing may be claimed under it)."""
     import hashlib
     pid = pid or os.getpid()
-    ident = proc_identity(pid) or "unknown"
+    ident = proc_identity(pid)
+    if not ident:
+        return None
     return "%d-%s" % (pid, hashlib.sha1(ident.encode("utf-8")).hexdigest()[:12])
 
 
@@ -96,9 +100,7 @@ def _claimer_alive(token):
         pid = int(pid)
     except ValueError:
         return False
-    if pid == os.getpid():
-        return True
-    return claim_token(pid) == "%d-%s" % (pid, digest)
+    return claim_token(pid) == "%d-%s" % (pid, digest)  # GUARD:claim-identity
 
 
 def recover_claims(sid):
@@ -120,9 +122,21 @@ def recover_claims(sid):
             pass  # another hook requeued it first
 
 
+def _valid_message(m):
+    return isinstance(m, dict) and isinstance(m.get("text"), str)
+
+
+def _set_aside(src, sid, name):
+    """A file that is not a message must not block the queue: move it to bad/."""
+    try:
+        os.rename(src, os.path.join(ensure_dir(path("bad", sid)), name))
+    except OSError:
+        pass
+
+
 def claim_inbox(sid):
-    """Claim queued messages, oldest first, within the context budget.
-    Returns [(message, claimed_path)]."""
+    """Claim queued messages, oldest first, while their formatted text fits the
+    context budget. Returns [(message, claimed_path)]."""
     recover_claims(sid)
     inbox = path("inbox", sid)
     try:
@@ -131,15 +145,20 @@ def claim_inbox(sid):
         return []
     if not names:
         return []
-    claimed = ensure_dir(path("claimed", sid))
     token = claim_token()
+    if token is None:
+        return []  # without our own identity a claim could never be recovered
+    claimed = ensure_dir(path("claimed", sid))
     got, used = [], 0
     for n in names:
         src = os.path.join(inbox, n)
-        try:
-            size = os.path.getsize(src)
-        except OSError:
+        m = read_json(src, None)
+        if m is None and not os.path.exists(src):
+            continue  # another hook claimed it
+        if not _valid_message(m):
+            _set_aside(src, sid, n)
             continue
+        size = len(format_messages([m])) + 2
         if got and used + size > CONTEXT_BUDGET:
             break  # leave the rest for the next hook
         dst = os.path.join(claimed, "%s.claim-%s.json" % (n[:-5], token))
@@ -147,25 +166,26 @@ def claim_inbox(sid):
             os.rename(src, dst)
         except OSError:
             continue  # another hook claimed it
-        m = read_json(dst, None)
-        if m:
-            got.append((m, dst))
-            used += size
+        got.append((m, dst))
+        used += size
     return got
 
 
 def ack(sid, claims, event):
     """The hook's output is written: the claimed messages are delivered."""
     done = ensure_dir(path("delivered", sid))
-    ensure_dir(path("outbox"))
     for m, claimed in claims:
         try:
             os.rename(claimed, os.path.join(done, os.path.basename(claimed).partition(".claim-")[0] + ".json"))
         except OSError:
             continue
-        append_jsonl(path("outbox", sid + ".jsonl"), {
-            "ts": now_iso(), "kind": "delivered", "session_id": sid, "id": m.get("id"),
-            "event": event, "text": (m.get("text") or "")[:200]})
+        try:  # a receipt that cannot be written does not undo the delivery
+            ensure_dir(path("outbox"))
+            append_jsonl(path("outbox", sid + ".jsonl"), {
+                "ts": now_iso(), "kind": "delivered", "session_id": sid, "id": m.get("id"),
+                "event": event, "text": (m.get("text") or "")[:200]})
+        except OSError:
+            pass
 
 
 def _fmt_time(ts):
@@ -213,6 +233,7 @@ def handle(event, data):
 
 def main(event):
     out, claims, sid = None, [], None
+    parent = os.getppid()
     try:
         raw = sys.stdin.read()
         data = json.loads(raw) if raw.strip() else {}
@@ -227,6 +248,8 @@ def main(event):
             sys.stdout.flush()
         except Exception:
             return 0  # not handed over: no ack, so the messages come again
+        if os.getppid() != parent:
+            return 0  # our hook wrapper was killed (a timeout): nobody reads this output
         try:
             ack(sid, claims, event)  # GUARD:ack-after-write
         except Exception:

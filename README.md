@@ -70,10 +70,11 @@ flowchart LR
   `~/.cxd/sessions/`. `cxd send <host> <session-id>` drops a message in that session's
   inbox, and its next `PostToolUse`, `UserPromptSubmit` or `Stop` hook delivers it as
   `additionalContext` (a message that reads *"Message from the lead session …"*). Delivery is
-  at-least-once: a hook claims the message, and only once it has handed it over is the
-  message marked delivered. A hook that dies, times out or cannot write in between loses
-  nothing, because the session's next hook delivers the message again. Each message carries
-  its id, so the rare repeat is recognisable.
+  at-least-once: a hook claims the message, and only once it has written it out is the
+  message marked delivered. If a hook is killed, times out or cannot write in between, the
+  session's next hook delivers the message again. Each message carries its id, so the rare
+  repeat is recognisable. A long message is queued as numbered parts that each fit in one
+  delivery, and they arrive whole and in order.
 - **Reports.** The `Stop` hook appends the last assistant message of every turn to the
   session's outbox, and a worker can add its own lines with `cxd notify "…"`. The lead
   sees them in `cxd watch`.

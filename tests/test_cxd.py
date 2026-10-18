@@ -977,6 +977,55 @@ class TestHooks(Base):
         self.assertEqual(self.run_hook(sid), "")  # another hook holds it
         self.assertEqual(len(os.listdir(claimed)), 1)
 
+    def test_claim_of_a_recycled_pid_is_requeued(self):
+        """GUARD claim-identity. Mutation: only the pid is compared -> a live
+        process that reuses a dead claimer's pid keeps the claim forever."""
+        sid = "abcdabcd-2222-3333-4444-555555555555"
+        mid = self.queue(sid, 4, "MARK-RECYCLED")
+        live = subprocess.Popen(["sleep", "30"])
+        self.bg.append(live)
+        claimed = os.path.join(self.local, "claimed", sid)
+        os.makedirs(claimed, mode=0o700)
+        os.rename(os.path.join(self.local, "inbox", sid, mid + ".json"),
+                  os.path.join(claimed, "%s.claim-%d-%s.json" % (mid, live.pid, "f" * 12)))
+        out = self.run_hook(sid)
+        self.assertIn("MARK-RECYCLED", json.loads(out)["hookSpecificOutput"]["additionalContext"])
+
+    def test_a_malformed_inbox_file_is_set_aside(self):
+        sid = "bcdebcde-2222-3333-4444-555555555555"
+        inbox = os.path.join(self.local, "inbox", sid)
+        os.makedirs(inbox, mode=0o700)
+        for name, body in (("0000000000000000001-000001.json", "[1]"), ("0000000000000000002-000002.json", "")):
+            with open(os.path.join(inbox, name), "w") as f:
+                f.write(body)
+        self.queue(sid, 3, "MARK-AFTER-BAD")
+        out = self.run_hook(sid)
+        self.assertIn("MARK-AFTER-BAD", json.loads(out)["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(sorted(os.listdir(os.path.join(self.local, "bad", sid))),
+                         ["0000000000000000001-000001.json", "0000000000000000002-000002.json"])
+        self.assertEqual(self.run_hook(sid), "")
+
+    def test_a_long_message_arrives_whole_in_parts(self):
+        sid = "cdefcdef-2222-3333-4444-555555555555"
+        p = self.fake_session(sid)
+        self.hook(p, "SessionStart")
+        words = ["w%05d" % i for i in range(3000)]  # about 21,000 characters
+        text = " ".join(words)
+        r = self.ok("send", "laptop", sid, text, "--json")
+        self.assertGreater(json.loads(r.stdout)["parts"], 1)
+        got = []
+        for _ in range(10):
+            res = self.hook(p, "PostToolUse")
+            if not res["out"]:
+                break
+            ctx = json.loads(res["out"])["hookSpecificOutput"]["additionalContext"]
+            self.assertNotIn("truncated", ctx)
+            self.assertLessEqual(len(ctx), 10000)
+            got.append(ctx)
+        joined = " ".join(" ".join(c.split()) for c in got)
+        self.assertEqual([w for w in joined.split() if w.startswith("w") and w[1:].isdigit()], words)
+        self.assertIn("[part 1/", got[0])
+
     def test_hook_never_breaks_a_session(self):
         cases = [b"", b"not json", b"[]", json.dumps({"session_id": "../../etc"}).encode()]
         for inp in cases:

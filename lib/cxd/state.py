@@ -448,11 +448,33 @@ def op_send(args):
         raise CxdError("session %s is not running (%s); refusing to send" % (
             sid, "ended " + rec["ended"] if rec.get("ended") else "process gone"), "dead")
     inbox = ensure_dir(path("inbox", sid))
-    msg = {"id": msg_id, "ts": now_iso(), "sender": sender, "text": text}
-    tmp = os.path.join(inbox, ".tmp-" + msg_id)
-    atomic_write_json(tmp, msg)
-    os.replace(tmp, os.path.join(inbox, msg_id + ".json"))
-    return {"target": sid, "via": "inbox", "id": msg_id}
+    # A hook can hand over at most ~10,000 characters at a time, so a long
+    # message is queued as numbered parts, each delivered whole, in order.
+    chunks = _split_text(text, PART_CHARS)
+    ts = now_iso()
+    for k, chunk in enumerate(chunks, 1):
+        part_id = msg_id if len(chunks) == 1 else "%s-p%03d" % (msg_id, k)
+        body = chunk if len(chunks) == 1 else "[part %d/%d] %s" % (k, len(chunks), chunk)
+        msg = {"id": part_id, "ts": ts, "sender": sender, "text": body}
+        tmp = os.path.join(inbox, ".tmp-" + part_id)
+        atomic_write_json(tmp, msg)
+        os.replace(tmp, os.path.join(inbox, part_id + ".json"))
+    return {"target": sid, "via": "inbox", "id": msg_id, "parts": len(chunks)}
+
+
+PART_CHARS = 6000
+
+
+def _split_text(text, n):
+    """Split text into chunks of at most n characters, at whitespace when it can."""
+    chunks = []
+    while len(text) > n:
+        cut = text.rfind(" ", n // 2, n)
+        cut = n if cut < 0 else cut
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip(" ")
+    chunks.append(text)
+    return chunks
 
 
 def op_notify(args):
