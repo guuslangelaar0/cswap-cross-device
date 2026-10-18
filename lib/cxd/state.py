@@ -522,9 +522,12 @@ def _scan_out(out, cur, emit):
     end = chunk.rfind(b"\n")
     if end < 0:
         return
-    cur["out"] = off + end + 1
     seen_pr = set(cur.get("prs", []))
-    for raw in chunk[: end + 1].splitlines():
+    pos = off
+    for raw in chunk[: end + 1].split(b"\n")[:-1]:
+        pos += len(raw) + 1
+        cur["out"] = pos  # per line: an event's cursor resumes right after it
+        cur["prs"] = sorted(seen_pr)
         ev = _parse(raw.decode("utf-8", "replace"))
         if not ev:
             continue
@@ -544,6 +547,7 @@ def _scan_out(out, cur, emit):
                     for url in PR_RE.findall(block.get("text") or ""):
                         if url not in seen_pr:
                             seen_pr.add(url)
+                            cur["prs"] = sorted(seen_pr)
                             emit({"ev": "pr", "url": url})
         elif t == "result":
             cur["turns"] = cur.get("turns", 0) + 1
@@ -555,6 +559,7 @@ def _scan_out(out, cur, emit):
             for url in PR_RE.findall(res or ""):
                 if url not in seen_pr:
                     seen_pr.add(url)
+                    cur["prs"] = sorted(seen_pr)
                     emit({"ev": "pr", "url": url})
             emit({"ev": "turn", "turn": cur["turns"], "is_error": bool(ev.get("is_error")),
                   "subtype": ev.get("subtype"), "num_turns": ev.get("num_turns"),
@@ -579,8 +584,10 @@ def _scan_outbox(sid, cur, emit, skip_kinds=()):
     end = chunk.rfind(b"\n")
     if end < 0:
         return
-    offs[sid] = off + end + 1
-    for raw in chunk[: end + 1].splitlines():
+    pos = off
+    for raw in chunk[: end + 1].split(b"\n")[:-1]:
+        pos += len(raw) + 1
+        offs[sid] = pos  # per line, as in _scan_out
         rec = _parse(raw.decode("utf-8", "replace"))
         if not rec or rec.get("kind") in skip_kinds:
             continue
@@ -610,11 +617,17 @@ def run_cost(cur):
 
 
 def poll(target, cur):
-    """One scan. Returns (events, cursor). Emits 'exit' once, from host state only."""
+    """One scan. Returns (events, cursor). Emits 'exit' once, from host state only.
+    Each event carries, under "_cursor", the cursor as it stands right after
+    that event: a client that loses the stream between two events of one scan
+    resumes exactly after the last one it received."""
     events = []
-    emit = events.append
     kind, ref = _resolve(target)
     cur = dict(cur or {})
+
+    def emit(e):
+        e["_cursor"] = json.loads(json.dumps(cur))  # GUARD:event-cursor
+        events.append(e)
     cur["kind"] = kind
     if kind == "run":
         d = ref
@@ -699,9 +712,10 @@ def stream(args):
         events, cur = poll(target, cur)
         for e in events:
             last_msg = time.time()
-            yield {"type": "event", "event": e, "cursor": cur}
+            at = e.pop("_cursor", cur)
+            yield {"type": "event", "event": e, "cursor": at}
             if e["ev"] == "exit":
-                yield {"type": "end", "cursor": cur}
+                yield {"type": "end", "cursor": at}
                 return
         now = time.time()
         if now - last_hb >= heartbeat:

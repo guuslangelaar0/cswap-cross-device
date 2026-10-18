@@ -361,6 +361,14 @@ MUTATIONS = [
         "expect": "red",
     },
     {
+        "name": "event-cursor",
+        "what": "every event of a scan carries the cursor from after the scan (a break between two events loses the second)",
+        "edits": [("lib/cxd/state.py", '        e["_cursor"] = json.loads(json.dumps(cur))  # GUARD:event-cursor\n',
+                   "        pass  # MUTATION\n")],
+        "tests": [T + "TestExitRecord.test_a_break_between_two_events_of_one_batch_loses_neither"],
+        "expect": "red",
+    },
+    {
         "name": "init-no-link",
         "what": "cxd init does not link ~/.cxd/bin/cxd, so peers cannot reach this host",
         "edits": [("lib/cxd/cli.py", "    link, target = _link_cli()\n",

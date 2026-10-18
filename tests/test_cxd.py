@@ -661,6 +661,36 @@ class TestExitRecord(Base):
                 if time.time() - t0 > timeout:
                     self.fail("no exit event within %ss" % timeout)
 
+    def test_a_break_between_two_events_of_one_batch_loses_neither(self):
+        """GUARD event-cursor. Mutation: every message of a batch carries the
+        cursor from after the batch -> a client that drops after `turn`
+        resumes past `exit` and waits forever."""
+        from cxd import state
+        from cxd.common import atomic_write_json
+        d = self.fake_run("wb", supervisor_alive=False)
+        with open(os.path.join(d, "out.jsonl"), "a") as f:
+            f.write(json.dumps({"type": "result", "subtype": "success", "result": "MARK-LAST",
+                                "total_cost_usd": 0.01}) + "\n")
+        atomic_write_json(os.path.join(d, "exit.json"), {"gen": 1, "rc": 0})
+        with self.home_env():
+            msgs = []
+            for m in state.stream({"target": "wb", "interval": 0.1, "heartbeat": 3600, "keepalive": 0.2,
+                                   "from_start": True}):
+                msgs.append(m)
+                if m.get("type") == "end":
+                    break
+            turn = [m for m in msgs if m.get("type") == "event" and m["event"]["ev"] == "turn"][0]
+            # The client dropped right after `turn`: resume from its cursor.
+            t0 = time.time()
+            resumed = []
+            for m in state.stream({"target": "wb", "interval": 0.1, "heartbeat": 3600, "keepalive": 0.2,
+                                   "cursor": json.loads(json.dumps(turn["cursor"]))}):
+                resumed.append(m)
+                if m.get("type") == "end" or time.time() - t0 > 5:
+                    break
+        evs = [m["event"]["ev"] for m in resumed if m.get("type") == "event"]
+        self.assertEqual(evs, ["exit"], resumed)
+
     def test_watch_waits_for_the_recorded_exit_code(self):
         """GUARD exit-rc. Mutation: the exit is reported as soon as claude is
         gone, before the supervisor has recorded the rc -> rc=None."""
