@@ -280,10 +280,10 @@ MUTATIONS = [
     },
     {
         "name": "npm-claude",
-        "what": "an npm-installed Claude Code (node .../@anthropic-ai/claude-code/cli.js) is not recognised",
-        "edits": [("lib/cxd/hook.py", '    return "/@anthropic-ai/claude-code/" in args  # GUARD:npm-claude\n',
-                   "    return False  # MUTATION\n")],
-        "tests": [T + "TestHooks.test_an_npm_installed_claude_is_recognised"],
+        "what": "a JS runtime running Claude Code (node .../bin/claude, node .../claude-code/cli.js) is not recognised",
+        "edits": [("lib/cxd/hook.py", "    if prog in _RUNTIMES and len(argv) > 1:  # GUARD:npm-claude\n",
+                   "    if False:  # MUTATION\n")],
+        "tests": [T + "TestHooks.test_every_claude_code_launch_is_recognised"],
         "expect": "red",
     },
     {
