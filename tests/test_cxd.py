@@ -479,6 +479,66 @@ class TestWatch(Base):
         self.assertEqual((exits[0]["rc"], exits[0]["gen"], exits[0]["turns"]), (0, 1, 2), exits[0])
 
 
+class TestExitRecord(Base):
+    """watch reports a run's exit with the rc its supervisor records. claude
+    is reaped (and so already gone) a moment before exit.json is written."""
+
+    def fake_run(self, name, supervisor_alive):
+        from cxd.common import atomic_write_json, proc_identity
+        d = os.path.join(self.local, "runs", name)
+        os.makedirs(d, mode=0o700)
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        pids = {"gen": 1, "claude_pid": gone.pid, "claude_ident": "never:" + name,
+                "keeper_pid": gone.pid, "keeper_ident": "never:" + name}
+        if supervisor_alive:
+            sup = subprocess.Popen(["sleep", "60"])
+            self.bg.append(sup)
+            pids.update(supervisor_pid=sup.pid, supervisor_ident=proc_identity(sup.pid))
+        atomic_write_json(os.path.join(d, "meta.json"), {"name": name, "gen": 1})
+        atomic_write_json(os.path.join(d, "pids.json"), pids)
+        with open(os.path.join(d, "out.jsonl"), "w") as f:
+            f.write(json.dumps({"type": "cxd", "event": "gen-start", "gen": 1}) + "\n")
+        return d
+
+    def first_exit(self, name):
+        from cxd import state
+        old = os.environ.get("CXD_HOME")
+        os.environ["CXD_HOME"] = self.local
+        t0 = time.time()
+        try:
+            for msg in state.stream({"target": name, "interval": 0.1, "heartbeat": 3600}):
+                if msg.get("type") == "event" and msg["event"]["ev"] == "exit":
+                    return msg["event"], time.time() - t0
+        finally:
+            if old is None:
+                del os.environ["CXD_HOME"]
+            else:
+                os.environ["CXD_HOME"] = old
+
+    def test_watch_waits_for_the_recorded_exit_code(self):
+        """GUARD exit-rc. Mutation: the exit is reported as soon as claude is
+        gone, before the supervisor has recorded the rc -> rc=None."""
+        from cxd.common import atomic_write_json
+        d = self.fake_run("wz", supervisor_alive=True)
+
+        def record():
+            time.sleep(1.5)
+            atomic_write_json(os.path.join(d, "exit.json"), {"gen": 1, "rc": 7})
+
+        th = threading.Thread(target=record)
+        th.start()
+        ev, _ = self.first_exit("wz")
+        th.join()
+        self.assertEqual((ev["rc"], ev["gen"]), (7, 1), ev)
+
+    def test_watch_does_not_wait_when_the_supervisor_is_gone(self):
+        self.fake_run("wy", supervisor_alive=False)
+        ev, took = self.first_exit("wy")
+        self.assertIsNone(ev["rc"])
+        self.assertLess(took, 3)
+
+
 class TestRemote(Base):
     def test_remote_start_send_stop_resume_list(self):
         self.start("buildbox", "rr", "MARK-R1")

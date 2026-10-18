@@ -55,6 +55,14 @@ MUTATIONS = [
         "expect": "red",
     },
     {
+        "name": "exit-rc",
+        "what": "watch reports a run's exit before its supervisor has recorded the rc (rc=None)",
+        "edits": [("lib/cxd/state.py", "            if not recorded and supervisor_alive(pids):  # GUARD:exit-rc\n",
+                   "            if False:  # MUTATION\n")],
+        "tests": [T + "TestExitRecord.test_watch_waits_for_the_recorded_exit_code"],
+        "expect": "red",
+    },
+    {
         "name": "stop-alive",
         "what": "stop leaves the process alive: signals are never delivered",
         "edits": [("lib/cxd/common.py", "        os.kill(int(pid), sig)\n", "        pass  # MUTATION: no signal\n")],

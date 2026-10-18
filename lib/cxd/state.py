@@ -74,6 +74,10 @@ def keeper_alive(pids):
     return proc_alive(pids.get("keeper_pid"), pids.get("keeper_ident"))
 
 
+def supervisor_alive(pids):
+    return proc_alive(pids.get("supervisor_pid"), pids.get("supervisor_ident"))
+
+
 def _run_accepts_input(d):
     """A run takes input only while its claude process AND its keeper live."""
     _, pids, _ = _run_files(d)
@@ -521,6 +525,11 @@ def _scan_outbox(sid, cur, emit, skip_kinds=()):
               "text": excerpt(rec.get("text"), 600), "id": rec.get("id"), "event": rec.get("event")})
 
 
+# How long watch waits, after claude is gone, for its live supervisor to record
+# the exit code. The supervisor writes exit.json right after reaping claude.
+EXIT_RECORD_WAIT = 10.0
+
+
 def run_cost(cur):
     return round(sum((cur.get("gen_costs") or {}).values()), 6)
 
@@ -541,10 +550,18 @@ def poll(target, cur):
             _scan_outbox(sid, cur, emit, skip_kinds=("stop",))  # turn events already carry results
         gen = pids.get("gen")
         if pids and not claude_alive(pids) and cur.get("exit_gen") != gen:
+            ex = read_json(os.path.join(d, "exit.json"), None) or {}
+            recorded = ex.get("gen") == gen
+            # The supervisor reaps claude, then writes exit.json: while it lives,
+            # wait (bounded) for the rc rather than report the exit without it.
+            if not recorded and supervisor_alive(pids):  # GUARD:exit-rc
+                since = cur.setdefault("exit_wait", time.time())
+                if time.time() - since < EXIT_RECORD_WAIT:
+                    return events, cur
+            cur.pop("exit_wait", None)
             _scan_out(out, cur, emit)  # final flush after the process ended
-            ex = read_json(os.path.join(d, "exit.json"), None)
             cur["exit_gen"] = gen
-            emit({"ev": "exit", "rc": (ex or {}).get("rc") if (ex or {}).get("gen") == gen else None,
+            emit({"ev": "exit", "rc": ex.get("rc") if recorded else None,
                   "gen": gen, "turns": cur.get("turns", 0), "cost_usd": run_cost(cur)})
     else:
         rec = ref
