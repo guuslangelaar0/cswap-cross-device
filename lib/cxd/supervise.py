@@ -157,7 +157,7 @@ def _supervise(d, gen, resume_sid, skip_permissions):
         "supervisor_pid": os.getpid(), "supervisor_ident": proc_identity(os.getpid()),
         "keeper_pid": keeper.pid, "keeper_ident": proc_identity(keeper.pid),
         "claude_pid": claude.pid, "claude_ident": proc_identity(claude.pid),
-        "cmd": cmd[:4] + ["..."],
+        "cmd": cmd[:4] + ["..."], "skip_permissions": bool(skip_permissions),
     }
     atomic_write_json(os.path.join(d, "pids.gen%d.json" % gen), pids)  # history, for audits/cleanup
     atomic_write_json(os.path.join(d, "pids.json"), pids)

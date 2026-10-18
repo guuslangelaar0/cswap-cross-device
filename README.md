@@ -167,8 +167,11 @@ that runs the worker (any other value counts as false). The host setting is read
 run starts or resumes, so turning it off stops the bypass for runs that did not opt in
 themselves. It is opt-in because a bypassed worker can run any command and change any file
 your user can, without asking. Use it only in directories and on machines you would let it
-change freely. If a host does not apply a `--skip-permissions` you asked for (it runs an
-older `cxd`), the command says so and exits 3.
+change freely. `cxd resume … --no-skip-permissions` withdraws a run's own opt-in. Runs
+started by cxd 0.1.0 resume without the bypass unless you opt in again (0.1.0 stored the
+choice mixed with the host setting). If a host does not apply a `--skip-permissions` you
+asked for (it runs an older `cxd`), the command says so and exits 5: the run is running,
+without the bypass.
 
 ## Commands
 
@@ -181,14 +184,15 @@ older `cxd`), the command says so and exits 3.
 | `cxd watch <host> <run\|session>` | `--json`, `--heartbeat S` (60), `--from-start` | Stream events, one line each, until the target exits. |
 | `cxd list [host]` | `--all`, `--json` | Runs and live sessions on one host, or on every configured host. `--all` includes ended sessions. |
 | `cxd stop <host> <name>` | `--now`, `--grace S` (120), `--int-wait S` (15), `--term-wait S` (10), `--json` | Stop a run (see [Stop semantics](#stop-semantics)) and report its exit code. |
-| `cxd resume <host> <name> <prompt-file\|->` | `--skip-permissions`, `--init-timeout S` (90), `--json` | Continue an exited run's conversation (`--resume <session id>`) with a new prompt. Refuses while the run is alive. Keeps the run's permission choice; `--skip-permissions` opts in. |
+| `cxd resume <host> <name> <prompt-file\|->` | `--skip-permissions` or `--no-skip-permissions`, `--init-timeout S` (90), `--json` | Continue an exited run's conversation (`--resume <session id>`) with a new prompt. Refuses while the run is alive. Keeps the run's own permission choice; `--skip-permissions` opts in, `--no-skip-permissions` withdraws it. |
 | `cxd notify <text\|@file\|->` | `--session SID` | Inside a worker: add a report to its outbox (uses `CLAUDE_CODE_SESSION_ID`). |
 | `cxd doctor [host...]` | `--json` | Check every host: ssh round-trip, `cxd` home mode, cswap, claude, a hook self-test, and whether the plugin is enabled per account. |
 | `cxd init` | `--self NAME`, `--peer ALIAS` (repeatable), `--account A` (repeatable), `--default-account A` | Write `~/.cxd/config.json` and link `~/.cxd/bin/cxd`. |
 | `cxd --version` | | Print the version. |
 
 Exit codes: `0` ok, `2` usage, `3` refused (dead run, alive on resume, unknown target, start
-failure), `4` transport failure (the host could not be reached, so nothing was decided).
+failure), `4` transport failure (the host could not be reached, so nothing was decided), `5`
+started or resumed, but without a `--skip-permissions` you asked for (the run is running).
 
 **`watch` lines:** `status`, `session … started`, `turn N ended cost=$…: <result>`,
 `PR <url>`, `delivered message <id> via <Hook> hook`, `report (stop|notify): …`,
