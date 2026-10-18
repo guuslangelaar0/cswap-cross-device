@@ -59,7 +59,7 @@ scan_stream() { # label ; content on stdin
   content="$(cat)"
   [ -n "$content" ] || return 0
   # Skip binary content.
-  if ! printf '%s' "$content" | LC_ALL=C grep -Iq . 2>/dev/null; then
+  if ! printf '%s' "$content" 2>/dev/null | LC_ALL=C grep -Iq . 2>/dev/null; then  # grep -q may exit first
     return 0
   fi
   i=0
