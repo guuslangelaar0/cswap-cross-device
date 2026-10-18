@@ -305,10 +305,9 @@ MUTATIONS = [
     },
     {
         "name": "prune-unknown",
-        "what": "a session that never recorded its process counts as dead and is pruned while live",
-        "edits": [("lib/cxd/prune.py",
-                   '    if not known and os.path.exists(path("sessions", sid + ".json")):  # GUARD:prune-unknown\n',
-                   "    if False:  # MUTATION\n")],
+        "what": "a session that never recorded its process (or its identity) counts as dead and is pruned while live",
+        "edits": [("lib/cxd/common.py", '    if not pid or not ident:  # GUARD:prune-unknown\n        return "unknown"\n',
+                   '    if not pid or not ident:\n        return "dead"  # MUTATION\n')],
         "tests": [T + "TestPrune.test_a_session_whose_process_is_unknown_is_kept_until_it_ends"],
         "expect": "red",
     },

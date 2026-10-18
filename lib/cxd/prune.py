@@ -139,9 +139,9 @@ def _prunable_session(sid, cutoff):
     rec = _record(sid)
     if rec.get("ended"):
         return True
-    known = rec.get("pid") and rec.get("pid_ident")
-    if not known and os.path.exists(path("sessions", sid + ".json")):  # GUARD:prune-unknown
-        return False  # its process (or its identity) was never recorded: cannot prove it is gone
+    if not os.path.exists(path("sessions", sid + ".json")):
+        return True  # leftovers of a session with no record at all
+    # A process (or identity) that was never recorded is "unknown", never "dead".
     return proc_state(rec.get("pid"), rec.get("pid_ident")) == "dead"  # GUARD:prune-live
 
 

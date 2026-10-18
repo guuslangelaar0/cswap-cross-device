@@ -195,7 +195,7 @@ def proc_state(pid, ident):
     such process, a zombie, or another process now has that pid), or
     "unknown" (nothing recorded, or it could not be checked). Destructive
     decisions (pruning) act only on "dead"."""
-    if not pid or not ident:
+    if not pid or not ident:  # GUARD:prune-unknown
         return "unknown"
     status, cur = _read_identity(pid)
     if status == "ok":
