@@ -249,6 +249,9 @@ def _launch(d, meta, gen, resume_sid, prompt, init_timeout, opt_in):
     meta = read_json(os.path.join(d, "meta.json"), meta)
     if sid:
         meta["session_id"] = sid
+        ids = meta.get("session_ids") if isinstance(meta.get("session_ids"), list) else []
+        if sid not in ids:
+            meta["session_ids"] = ids + [sid]  # every gen's, so pruning keeps them with the run
     meta["bypass_opt_in"] = opt_in
     meta.pop("skip_permissions", None)  # cxd 0.1.0's key, never trusted
     atomic_write_json(os.path.join(d, "meta.json"), meta)
@@ -844,7 +847,8 @@ def op_doctor_info(args):
     st = hook_selftest()
     check("hook self-test (empty inbox silent, message delivered once)", st["ok"],
           "empty %.0f ms, delivery %.0f ms" % (st["empty_inbox_ms"], st["delivery_ms"]))
-    regs = {}
+    regs = read_json(path("registrations.json"), {})  # kept by the SessionStart hook
+    regs = dict(regs) if isinstance(regs, dict) else {}
     sd = path("sessions")
     if os.path.isdir(sd):
         for n in os.listdir(sd):
@@ -873,8 +877,24 @@ def op_doctor_info(args):
     return info
 
 
+def op_prune(args):
+    from .prune import prune
+    older = args.get("older_than_days")
+    if older is not None and (isinstance(older, bool) or not isinstance(older, (int, float))):
+        raise CxdError("--older-than must be a number of days", "usage")
+    import fcntl
+    fd = os.open(path("prune.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)  # one pass at a time (with the automatic one)
+        return dict(prune(load_config(), older_than_days=older, runs=bool(args.get("runs")),
+                          dry_run=bool(args.get("dry_run"))), host=self_label())
+    finally:
+        os.close(fd)
+
+
 OPS = {
     "ping": op_ping,
+    "prune": op_prune,
     "start": op_start,
     "send": op_send,
     "stop": op_stop,

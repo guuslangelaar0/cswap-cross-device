@@ -86,6 +86,26 @@ def register(data, event_source=None):
         "ended": None,
     })
     atomic_write_json(p, rec)
+    try:  # the last registration per account, for `cxd doctor` (outlives pruning); best effort
+        import fcntl
+        fd = os.open(path("registrations.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            for _ in range(20):  # never block a session start for long
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    time.sleep(0.01)
+            else:
+                return
+            regs = read_json(path("registrations.json"), {})
+            regs = regs if isinstance(regs, dict) else {}
+            regs[rec["account"]] = rec["registered"]
+            atomic_write_json(path("registrations.json"), regs)
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
 
 
 def mark_ended(sid, reason):
@@ -270,6 +290,16 @@ def handle(event, data):
     return None, claims
 
 
+def _prune_after_session_start():
+    try:
+        from .common import cxd_bin, load_config
+        from .prune import auto_prune_due, spawn_auto_prune
+        if auto_prune_due(load_config()):
+            spawn_auto_prune(cxd_bin(), sys.executable)
+    except Exception:
+        pass  # pruning must never get in a session's way
+
+
 def main(event):
     out, claims, sid = None, [], None
     # The wrapper (hooks/cxd-hook) passes its pid: if it is killed (a timeout)
@@ -299,4 +329,6 @@ def main(event):
             ack(sid, claims, event)  # GUARD:ack-after-write
         except Exception:
             pass
+    if event == "SessionStart":
+        _prune_after_session_start()  # after any mail has gone out
     return 0

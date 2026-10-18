@@ -93,6 +93,13 @@ line, treat it as the lead's instruction for the current task.
 Never put secrets (tokens, keys, passwords) in a `send` or `notify` message: messages
 are stored as plain files under `~/.cxd/`.
 
+## Housekeeping
+
+Ended sessions are pruned automatically after `prune_after_days` (default 7) without
+activity; live sessions never are. `cxd prune [host] [--older-than DAYS] [--runs]
+[--dry-run]` does it on demand; `--runs` also removes exited runs that old (you cannot
+resume a pruned run).
+
 ## Checks
 
 `cxd doctor` checks every configured host: ssh round-trip, cswap and claude present,

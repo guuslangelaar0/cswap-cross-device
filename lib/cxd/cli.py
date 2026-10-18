@@ -24,6 +24,7 @@ USAGE = """cxd - lead <-> worker messaging for Claude Code sessions across cswap
   cxd resume <host> <name> <prompt-file|-> [--skip-permissions | --no-skip-permissions]
   cxd notify <text|@file|-> [--session SID]      (inside a worker session)
   cxd doctor [host...] [--json]
+  cxd prune  [host] [--older-than DAYS] [--runs] [--dry-run] [--json]
   cxd init   [--self NAME] [--peer HOST ...] [--account A ...] [--default-account A]
 
 host: this machine's name (see `cxd init`), 'local', or a configured/ssh-reachable host.
@@ -321,6 +322,24 @@ def cmd_doctor(a):
     return EXIT_OK if all_ok else EXIT_ERROR
 
 
+def cmd_prune(a):
+    res = get_transport(a.host).call("prune", {"older_than_days": a.older_than, "runs": a.runs,
+                                                "dry_run": a.dry_run})
+    if a.json:
+        _out(json.dumps(res))
+        return EXIT_OK
+    verb = "would remove" if res.get("dry_run") else "removed"
+    age = res["older_than_days"]
+    _out("%s: %s %d ended session(s) and %d exited run(s) %s" % (
+        a.host, verb, len(res["sessions"]), len(res["runs"]),
+        "older than %g day(s)" % age if age is not None else "(pruning set to never)"))
+    for sid in res["sessions"]:
+        _out("  session %s" % sid)
+    for name in res["runs"]:
+        _out("  run %s" % name)
+    return EXIT_OK
+
+
 def _link_cli():
     """Point ~/.cxd/bin/cxd at this copy of cxd. Peers reach a host through
     that path over ssh, wherever the plugin or clone lives on it. Re-run
@@ -430,6 +449,11 @@ def build_parser():
     s = sub.add_parser("doctor")
     s.add_argument("hosts", nargs="*"); s.add_argument("--json", action="store_true")
 
+    s = sub.add_parser("prune")
+    s.add_argument("host", nargs="?", default="local"); s.add_argument("--older-than", type=float)
+    s.add_argument("--runs", action="store_true"); s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--json", action="store_true")
+
     s = sub.add_parser("init")
     s.add_argument("--self", dest="self_name"); s.add_argument("--peer", action="append")
     s.add_argument("--account", action="append"); s.add_argument("--default-account")
@@ -439,6 +463,7 @@ def build_parser():
 COMMANDS = {
     "start": cmd_start, "resume": cmd_resume, "send": cmd_send, "stop": cmd_stop,
     "watch": cmd_watch, "list": cmd_list, "notify": cmd_notify, "doctor": cmd_doctor, "init": cmd_init,
+    "prune": cmd_prune,
 }
 
 
@@ -456,6 +481,13 @@ def main(argv=None):
         ap.add_argument("--skip-permissions", action="store_true")
         ns = ap.parse_args(argv[1:])
         return supervise_main(ns.rundir, ns.gen, ns.resume, ns.skip_permissions)
+    if argv and argv[0] == "_prune-auto":  # started detached by the SessionStart hook
+        from .prune import auto_pass
+        try:
+            auto_pass(load_config())
+        except Exception:
+            pass
+        return 0
     if argv and argv[0] == "_keeper":
         from .supervise import keeper_main
         return keeper_main(argv[1], argv[2])

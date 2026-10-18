@@ -130,6 +130,72 @@ def excerpt(text, n=300):
 
 # ---------------------------------------------------------------- processes
 
+def _gone_or_unknown(pid):
+    """The pid's details could not be read: "dead" only if it is now gone."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "dead", None
+    except OSError:
+        pass
+    return "unknown", None
+
+
+def _read_identity(pid, legacy=False):
+    """("ok", identity) for a live, non-zombie pid; ("dead", None) when it
+    provably is not running (no such process, or a zombie); ("unknown", None)
+    when it could not be checked (an unreadable /proc, a `ps` that failed or
+    timed out, a pid that is not a number).
+
+    Off Linux the identity is the start time from `ps`, read in UTC (TZ=UTC0)
+    so that it does not change with the time zone; `legacy` reads it in local
+    time, as records written before that ("ps:" instead of "psutc:") were."""
+    try:
+        pid = int(pid)
+        if pid <= 0:
+            return "unknown", None
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "dead", None
+    except PermissionError:
+        pass  # it exists, under another user
+    except (OSError, ValueError, TypeError, OverflowError):
+        return "unknown", None
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/%d/stat" % pid, "r") as f:
+                data = f.read()
+        except FileNotFoundError:
+            return _gone_or_unknown(pid)
+        except OSError:
+            return "unknown", None
+        rest = data.rsplit(")", 1)[-1].split()
+        if len(rest) < 20:
+            return "unknown", None
+        if rest[0] in ("Z", "X"):
+            return "dead", None
+        return "ok", "linux:" + rest[19]
+    import subprocess  # only off Linux: the hook path stays light
+    env = dict(os.environ, LC_ALL="C")
+    if not legacy:
+        env["TZ"] = "UTC0"  # GUARD:identity-utc
+    try:
+        r = subprocess.run(
+            ["ps", "-o", "stat=,lstart=", "-p", str(pid)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            universal_newlines=True, env=env, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown", None
+    line = r.stdout.strip()
+    if not line:
+        return _gone_or_unknown(pid) if r.returncode != 0 else ("unknown", None)
+    stat, _, lstart = line.partition(" ")
+    if stat.startswith("Z"):
+        return "dead", None
+    return "ok", ("ps:" if legacy else "psutc:") + " ".join(lstart.split())
+
+
 def proc_identity(pid):
     """A stable identity for a live, non-zombie pid (its start time), or None.
 
@@ -138,48 +204,32 @@ def proc_identity(pid):
     """
     if not pid:
         return None
-    try:
-        os.kill(int(pid), 0)
-    except ProcessLookupError:
-        return None
-    except PermissionError:
-        pass
-    except (OSError, ValueError):
-        return None
-    pid = int(pid)
-    if sys.platform.startswith("linux"):
-        try:
-            with open("/proc/%d/stat" % pid, "r") as f:
-                data = f.read()
-        except OSError:
-            return None
-        rest = data.rsplit(")", 1)[-1].split()
-        if len(rest) < 20 or rest[0] in ("Z", "X"):
-            return None
-        return "linux:" + rest[19]
-    import subprocess  # only off Linux: the hook path stays light
-    try:
-        r = subprocess.run(
-            ["ps", "-o", "stat=,lstart=", "-p", str(pid)],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            universal_newlines=True, env=dict(os.environ, LC_ALL="C"), timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    line = r.stdout.strip()
-    if not line:
-        return None
-    stat, _, lstart = line.partition(" ")
-    if stat.startswith("Z"):
-        return None
-    return "ps:" + " ".join(lstart.split())
+    status, ident = _read_identity(pid)
+    return ident if status == "ok" else None
+
+
+def proc_state(pid, ident):
+    """"alive" (pid is still the recorded process), "dead" (provably not: no
+    such process, a zombie, or another process now has that pid), or
+    "unknown" (nothing recorded, or it could not be checked). Destructive
+    decisions (pruning) act only on "dead"."""
+    if not pid or not ident:  # GUARD:prune-unknown
+        return "unknown"
+    legacy = isinstance(ident, str) and ident.startswith("ps:")
+    status, cur = _read_identity(pid, legacy=legacy)
+    if status == "ok":
+        if cur == ident:
+            return "alive"
+        # A local-time identity can differ only because the time zone changed.
+        return "unknown" if legacy else "dead"
+    return status  # GUARD:prune-tristate
 
 
 def proc_alive(pid, ident):
     """True only if pid is alive AND is the process we recorded."""
     if not pid or not ident:
         return False
-    return proc_identity(pid) == ident
+    return proc_state(pid, ident) == "alive"
 
 
 def proc_parent_and_argv(pid):
