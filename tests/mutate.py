@@ -183,6 +183,14 @@ MUTATIONS = [
         "expect": "red",
     },
     {
+        "name": "table-fold",
+        "what": "the mutation table check misses an entry folded into the next by a bad merge",
+        "edits": [("tests/mutate.py", "        problems += check_source(f.read())  # GUARD:table-fold\n",
+                   "        f.read()  # MUTATION\n")],
+        "tests": [T + "TestMutationTable.test_a_folded_entry_is_refused"],
+        "expect": "red",
+    },
+    {
         "name": "release-pin-sha",
         "what": "the marketplace pin's sha is not compared with the tag's commit",
         "edits": [("scripts/check-release-pin.py", "    if tagged != sha:  # GUARD:release-pin-sha\n",
@@ -281,6 +289,77 @@ MUTATIONS = [
 ]
 
 
+KEYS = {"name", "what", "edits", "tests", "expect"}
+
+
+def check_source(text):
+    """Dict literals with a repeated key: a bad merge that folds one entry
+    into the next still parses, and Python keeps only the last value, so the
+    folded entry looks whole while a guard silently disappears."""
+    import ast
+    problems = []
+    for node in ast.walk(ast.parse(text)):
+        if isinstance(node, ast.Dict):
+            keys = [k.value for k in node.keys if isinstance(k, ast.Constant)]
+            dup = sorted(set(k for k in keys if keys.count(k) > 1))
+            if dup:
+                problems.append("line %d: a dict repeats key(s) %s (a folded entry?)" % (node.lineno, ", ".join(map(str, dup))))
+    return problems
+
+
+def guard_names_in_tests():
+    """Names in test docstrings that say `GUARD <name>.`: each needs a mutation."""
+    import re
+    with open(os.path.join(REPO, "tests", "test_cxd.py"), encoding="utf-8") as f:
+        return set(re.findall(r'"""GUARD ([a-z0-9-]+)[.\s]', f.read()))
+
+
+def check_table(mutations, root=REPO):
+    """Refuse a malformed table before running anything."""
+    problems, seen = [], set()
+    for i, m in enumerate(mutations):
+        name = m.get("name") if isinstance(m, dict) else None
+        where = "MUTATIONS[%d] (%s)" % (i, name)
+        if not isinstance(m, dict) or set(m) != KEYS:
+            got = set(m) if isinstance(m, dict) else set()
+            problems.append("%s: missing %s, unexpected %s" % (
+                where, sorted(KEYS - got, key=str), sorted(map(str, got - KEYS))))
+            continue
+        if not isinstance(name, str) or name in seen:
+            problems.append("%s: the name must be a unique string" % where)
+        seen.add(name if isinstance(name, str) else repr(name))
+        if m["expect"] not in ("red", "green"):
+            problems.append("%s: expect must be red or green" % where)
+        tests = m["tests"]
+        if not isinstance(tests, list) or not tests or not all(isinstance(t, str) and t.startswith(T) for t in tests):
+            problems.append("%s: tests must be a non-empty list of %s* names" % (where, T))
+        edits = m["edits"]
+        if not isinstance(edits, list) or not edits:
+            problems.append("%s: edits must be a non-empty list" % where)
+            continue
+        for e in edits:
+            if not (isinstance(e, tuple) and len(e) == 3 and all(isinstance(x, str) for x in e) and e[1] != e[2]):
+                problems.append("%s: each edit must be a (file, old, new) tuple of strings that changes something" % where)
+                continue
+            if os.path.isabs(e[0]) or ".." in e[0].replace("\\", "/").split("/"):
+                problems.append("%s: edit paths must stay inside the repository: %r" % (where, e[0]))
+                continue
+            try:
+                with open(os.path.join(root, e[0]), encoding="utf-8") as f:
+                    n = f.read().count(e[1])
+            except (OSError, ValueError) as err:
+                problems.append("%s: %s" % (where, err))
+                continue
+            if n != 1:  # an anchor that drifted shows up now, not after a slow run
+                problems.append("%s: anchor found %d times in %s: %r" % (where, n, e[0], e[1][:60]))
+    missing = sorted(guard_names_in_tests() - seen)
+    if missing:
+        problems.append("tests name guard(s) with no mutation: %s" % ", ".join(missing))
+    with open(os.path.abspath(__file__), encoding="utf-8") as f:
+        problems += check_source(f.read())  # GUARD:table-fold
+    return problems
+
+
 def copy_repo(dst):
     shutil.copytree(REPO, dst, ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc", ".tmp-tests"))
 
@@ -292,6 +371,14 @@ def run_tests(root, tests):
 
 
 def main(names):
+    problems = check_table(MUTATIONS)
+    known = {m.get("name") for m in MUTATIONS if isinstance(m, dict) and isinstance(m.get("name"), str)}
+    unknown = [n for n in names if n not in known]
+    if unknown:
+        problems.append("unknown mutation(s): %s" % ", ".join(unknown))
+    if problems:
+        print("\n".join("!! " + p for p in problems))
+        return 1
     chosen = [m for m in MUTATIONS if not names or m["name"] in names]
     failures = 0
     for m in chosen:
