@@ -249,6 +249,9 @@ def _launch(d, meta, gen, resume_sid, prompt, init_timeout, opt_in):
     meta = read_json(os.path.join(d, "meta.json"), meta)
     if sid:
         meta["session_id"] = sid
+        ids = meta.get("session_ids") if isinstance(meta.get("session_ids"), list) else []
+        if sid not in ids:
+            meta["session_ids"] = ids + [sid]  # every gen's, so pruning keeps them with the run
     meta["bypass_opt_in"] = opt_in
     meta.pop("skip_permissions", None)  # cxd 0.1.0's key, never trusted
     atomic_write_json(os.path.join(d, "meta.json"), meta)

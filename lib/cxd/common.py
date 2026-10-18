@@ -130,33 +130,36 @@ def excerpt(text, n=300):
 
 # ---------------------------------------------------------------- processes
 
-def proc_identity(pid):
-    """A stable identity for a live, non-zombie pid (its start time), or None.
-
-    Recording this next to a pid lets cxd prove a pid is still the process it
-    started before it signals it: a recycled pid has another start time.
-    """
-    if not pid:
-        return None
+def _read_identity(pid):
+    """("ok", identity) for a live, non-zombie pid; ("dead", None) when it
+    provably is not running (no such process, or a zombie); ("unknown", None)
+    when it could not be checked (an unreadable /proc, a `ps` that failed or
+    timed out, a pid that is not a number)."""
     try:
-        os.kill(int(pid), 0)
+        pid = int(pid)
+        if pid <= 0:
+            return "unknown", None
+        os.kill(pid, 0)
     except ProcessLookupError:
-        return None
+        return "dead", None
     except PermissionError:
-        pass
-    except (OSError, ValueError):
-        return None
-    pid = int(pid)
+        pass  # it exists, under another user
+    except (OSError, ValueError, TypeError, OverflowError):
+        return "unknown", None
     if sys.platform.startswith("linux"):
         try:
             with open("/proc/%d/stat" % pid, "r") as f:
                 data = f.read()
+        except FileNotFoundError:
+            return "dead", None
         except OSError:
-            return None
+            return "unknown", None
         rest = data.rsplit(")", 1)[-1].split()
-        if len(rest) < 20 or rest[0] in ("Z", "X"):
-            return None
-        return "linux:" + rest[19]
+        if len(rest) < 20:
+            return "unknown", None
+        if rest[0] in ("Z", "X"):
+            return "dead", None
+        return "ok", "linux:" + rest[19]
     import subprocess  # only off Linux: the hook path stays light
     try:
         r = subprocess.run(
@@ -165,14 +168,39 @@ def proc_identity(pid):
             universal_newlines=True, env=dict(os.environ, LC_ALL="C"), timeout=5,
         )
     except (OSError, subprocess.SubprocessError):
-        return None
+        return "unknown", None
     line = r.stdout.strip()
     if not line:
-        return None
+        return ("dead", None) if r.returncode != 0 else ("unknown", None)
     stat, _, lstart = line.partition(" ")
     if stat.startswith("Z"):
+        return "dead", None
+    return "ok", "ps:" + " ".join(lstart.split())
+
+
+def proc_identity(pid):
+    """A stable identity for a live, non-zombie pid (its start time), or None.
+
+    Recording this next to a pid lets cxd prove a pid is still the process it
+    started before it signals it: a recycled pid has another start time.
+    """
+    if not pid:
         return None
-    return "ps:" + " ".join(lstart.split())
+    status, ident = _read_identity(pid)
+    return ident if status == "ok" else None
+
+
+def proc_state(pid, ident):
+    """"alive" (pid is still the recorded process), "dead" (provably not: no
+    such process, a zombie, or another process now has that pid), or
+    "unknown" (nothing recorded, or it could not be checked). Destructive
+    decisions (pruning) act only on "dead"."""
+    if not pid or not ident:
+        return "unknown"
+    status, cur = _read_identity(pid)
+    if status == "ok":
+        return "alive" if cur == ident else "dead"
+    return status  # GUARD:prune-tristate
 
 
 def proc_alive(pid, ident):

@@ -282,9 +282,9 @@ def handle(event, data):
 
 def _prune_after_session_start():
     try:
-        from .common import cxd_bin
+        from .common import cxd_bin, load_config
         from .prune import auto_prune_due, spawn_auto_prune
-        if auto_prune_due():
+        if auto_prune_due(load_config()):
             spawn_auto_prune(cxd_bin(), sys.executable)
     except Exception:
         pass  # pruning must never get in a session's way

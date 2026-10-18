@@ -480,9 +480,9 @@ def main(argv=None):
         ns = ap.parse_args(argv[1:])
         return supervise_main(ns.rundir, ns.gen, ns.resume, ns.skip_permissions)
     if argv and argv[0] == "_prune-auto":  # started detached by the SessionStart hook
-        from .prune import AUTO_LIMIT, prune
+        from .prune import auto_pass
         try:
-            prune(load_config(), limit=AUTO_LIMIT)
+            auto_pass(load_config())
         except Exception:
             pass
         return 0

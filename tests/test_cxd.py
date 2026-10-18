@@ -1567,6 +1567,79 @@ class TestPrune(Base):
         # The run's session data goes only with the run, so it survives too.
         self.assertEqual(len(self.session_files("eeee0000-wp4-session")), 4)
 
+    def test_a_failed_identity_lookup_keeps_a_live_session(self):
+        """GUARD prune-tristate. Mutation: a process whose identity cannot be
+        read (a `ps` that timed out) counts as dead -> a live session is pruned."""
+        from cxd import common, prune as prune_mod
+        from cxd.common import load_config, proc_identity
+        self.fake_record("f0f0f0f0-live-unreadable", ended=False, age_days=30,
+                         pid=os.getpid(), ident=proc_identity(os.getpid()))
+        with mock.patch.dict(os.environ, {"CXD_HOME": self.local}), \
+                mock.patch.object(common, "_read_identity", return_value=("unknown", None)):
+            res = prune_mod.prune(load_config())
+        self.assertEqual(res["sessions"], [])
+        self.assertEqual(len(self.session_files("f0f0f0f0-live-unreadable")), 4)
+
+    def test_run_liveness_rules(self):
+        """GUARD prune-run-unknown. Mutation: a run without pids.json counts as
+        over -> a run still starting up is removed."""
+        from cxd.common import atomic_write_json
+        old = time.time() - 10 * self.DAY
+
+        def run(name, files):
+            d = os.path.join(self.local, "runs", name)
+            os.makedirs(d, mode=0o700)
+            for fname, body in files.items():
+                atomic_write_json(os.path.join(d, fname), body)
+            self.age_tree(d, old)
+        run("r-starting", {"meta.json": {"name": "r-starting"}})  # no pids yet, no exit
+        run("r-failed", {"meta.json": {"name": "r-failed"}, "exit.json": {"gen": 1, "rc": None, "error": "x"}})
+        run("r-no-ident", {"meta.json": {"name": "r-no-ident"},
+                           "pids.json": {"gen": 1, "claude_pid": os.getpid(), "claude_ident": None}})
+        res = self.prune("--runs")
+        self.assertEqual(res["runs"], ["r-failed"])
+
+    def test_a_session_of_two_runs_stays_while_either_stays(self):
+        from cxd.common import atomic_write_json
+        old = time.time() - 10 * self.DAY
+        sid = "c1c1c1c1-two-runs"
+        for name, files in (("ra", {"meta.json": {"name": "ra"}, "exit.json": {"gen": 1, "rc": 0}}),
+                            ("rb", {"meta.json": {"name": "rb", "session_id": sid}})):  # rb: unknown, stays
+            d = os.path.join(self.local, "runs", name)
+            os.makedirs(d, mode=0o700)
+            for fname, body in files.items():
+                atomic_write_json(os.path.join(d, fname), body)
+            self.age_tree(d, old)
+        self.fake_record(sid, ended=True, age_days=10, run="ra")
+        res = self.prune("--runs")
+        self.assertEqual((res["runs"], res["sessions"]), (["ra"], []))
+        self.assertEqual(len(self.session_files(sid)), 4)
+
+    def test_earlier_session_ids_of_a_run_are_protected(self):
+        from cxd.common import atomic_write_json
+        self.start("laptop", "wp5", "MARK-1")
+        self.wait_results("laptop", "wp5", 1)
+        meta_p = os.path.join(self.local, "runs", "wp5", "meta.json")
+        meta = read_json(meta_p)
+        self.assertEqual(meta["session_ids"], [meta["session_id"]])
+        meta["session_ids"].insert(0, "c2c2c2c2-earlier-gen")
+        atomic_write_json(meta_p, meta)
+        self.fake_record("c2c2c2c2-earlier-gen", ended=True, age_days=10)
+        os.unlink(os.path.join(self.local, "sessions", "c2c2c2c2-earlier-gen.json"))
+        self.assertEqual(self.prune()["sessions"], [])
+        self.assertTrue(os.path.exists(os.path.join(self.local, "outbox", "c2c2c2c2-earlier-gen.jsonl")))
+
+    def test_odd_pids_in_records_do_not_stop_the_pass(self):
+        from cxd.common import atomic_write_json
+        self.fake_record("c3c3c3c3-odd-pid", ended=False, age_days=10)
+        atomic_write_json(os.path.join(self.local, "sessions", "c3c3c3c3-odd-pid.json"),
+                          {"session_id": "c3c3c3c3-odd-pid", "pid": 1e30, "pid_ident": "x"})
+        os.utime(os.path.join(self.local, "sessions", "c3c3c3c3-odd-pid.json"), (time.time() - 10 * self.DAY,) * 2)
+        self.fake_record("c3c3c3c4-old-ended", ended=True, age_days=10)
+        res = self.prune()
+        self.assertIn("c3c3c3c4-old-ended", res["sessions"])
+        self.assertNotIn("c3c3c3c3-odd-pid", res["sessions"])  # unknown: kept
+
     def test_malformed_records_do_not_stop_the_pass(self):
         self.fake_record("acac0000-list-record", ended=True, age_days=10)
         with open(os.path.join(self.local, "sessions", "acac0000-list-record.json"), "w") as f:
