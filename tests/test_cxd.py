@@ -1276,6 +1276,61 @@ class TestVersion(unittest.TestCase):
         r = subprocess.run([sys.executable, CXD, "--version"], stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, universal_newlines=True)
         self.assertEqual((r.returncode, r.stdout.strip()), (0, "cxd " + version))
+class TestMutationTable(unittest.TestCase):
+    MUTATE = os.path.join(REPO, "tests", "mutate.py")
+
+    def load(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("cxd_mutate", self.MUTATE)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_the_table_is_well_formed(self):
+        m = self.load()
+        self.assertEqual(m.check_table(m.MUTATIONS), [])
+
+    def test_a_folded_entry_is_refused(self):
+        """GUARD table-fold. Mutation: the source check is off -> an entry that a
+        bad merge folded into the next goes unnoticed (and its guard unchecked)."""
+        m = self.load()
+        with open(self.MUTATE) as f:
+            src = f.read()
+        # Fold the first entry into the second, as a sloppy conflict resolution does.
+        i = src.index('        "name": "', src.index("MUTATIONS = ["))
+        j = src.index("\n    },\n    {\n", i)
+        folded = src[:j] + "\n" + src[j + len("\n    },\n    {\n"):]
+        problems = m.check_source(folded)
+        self.assertTrue(problems and "repeats key" in problems[0], problems)
+        with mock.patch("builtins.open", mock.mock_open(read_data=folded)):
+            self.assertTrue(any("repeats key" in p for p in m.check_table([])))
+
+    def test_other_bad_entries_are_refused(self):
+        m = self.load()
+        first = dict(m.MUTATIONS[0])
+        cases = [
+            ([first, dict(first)], "the name must be a unique string"),
+            ([dict(first, edits=[("lib/cxd/cli.py", "x", "x")])], "changes something"),
+            ([dict(first, edits=[("lib/cxd/cli.py", "no such anchor", "y")])], "anchor found 0 times"),
+            ([dict(first, edits=[("../outside.py", "a", "b")])], "inside the repository"),
+            ([dict(first, tests=1)], "tests must be a non-empty list"),
+            ([dict(first, expect="maybe")], "expect must be red or green"),
+            ([{k: v for k, v in first.items() if k != "what"}], "missing ['what']"),
+            ([dict(first, **{"1": 1})], "unexpected ['1']"),
+        ]
+        with mock.patch.object(m, "guard_names_in_tests", return_value=set()):
+            self.assertEqual(m.check_table([first]), [])  # the baseline is clean
+            for table, msg in cases:
+                problems = m.check_table(table)
+                self.assertTrue(any(msg in p for p in problems), (msg, problems))
+        # Every GUARD named in a test docstring needs an entry.
+        self.assertTrue(any("no mutation" in p for p in m.check_table([first])))
+
+    def test_an_unknown_name_fails(self):
+        r = subprocess.run([sys.executable, self.MUTATE, "no-such-guard"], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, universal_newlines=True, timeout=60)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("unknown mutation", r.stdout)
 
 
 class TestSecretsCheck(unittest.TestCase):
