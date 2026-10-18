@@ -176,7 +176,9 @@ def _fmt_event(host, target, e):
     if ev == "exit":
         if "reason" in e:
             return "%s EXITED: %s" % (tag, e.get("reason"))
-        return "%s EXITED rc=%s gen=%s turns=%s cost=%s" % (tag, e.get("rc"), e.get("gen"), e.get("turns"), _usd(e.get("cost_usd")))
+        return "%s EXITED rc=%s gen=%s turns=%s cost=%s%s" % (
+            tag, e.get("rc"), e.get("gen"), e.get("turns"), _usd(e.get("cost_usd")),
+            " error: %s" % e["error"] if e.get("error") else "")
     return "%s %s" % (tag, json.dumps(e))
 
 
