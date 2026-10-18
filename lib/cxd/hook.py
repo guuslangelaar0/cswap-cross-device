@@ -86,11 +86,14 @@ def register(data, event_source=None):
         "ended": None,
     })
     atomic_write_json(p, rec)
-    try:
-        regs = read_json(path("registrations.json"), {})
-        regs = regs if isinstance(regs, dict) else {}
-        regs[rec["account"]] = rec["registered"]
-        atomic_write_json(path("registrations.json"), regs)
+    try:  # the last registration per account, for `cxd doctor` (outlives pruning)
+        import fcntl
+        with open(path("registrations.lock"), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            regs = read_json(path("registrations.json"), {})
+            regs = regs if isinstance(regs, dict) else {}
+            regs[rec["account"]] = rec["registered"]
+            atomic_write_json(path("registrations.json"), regs)
     except Exception:
         pass
 
@@ -279,9 +282,10 @@ def handle(event, data):
 
 def _prune_after_session_start():
     try:
-        from .common import load_config
-        from .prune import maybe_prune
-        maybe_prune(load_config())
+        from .common import cxd_bin
+        from .prune import auto_prune_due, spawn_auto_prune
+        if auto_prune_due():
+            spawn_auto_prune(cxd_bin(), sys.executable)
     except Exception:
         pass  # pruning must never get in a session's way
 

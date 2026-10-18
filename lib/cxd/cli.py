@@ -479,6 +479,13 @@ def main(argv=None):
         ap.add_argument("--skip-permissions", action="store_true")
         ns = ap.parse_args(argv[1:])
         return supervise_main(ns.rundir, ns.gen, ns.resume, ns.skip_permissions)
+    if argv and argv[0] == "_prune-auto":  # started detached by the SessionStart hook
+        from .prune import AUTO_LIMIT, prune
+        try:
+            prune(load_config(), limit=AUTO_LIMIT)
+        except Exception:
+            pass
+        return 0
     if argv and argv[0] == "_keeper":
         from .supervise import keeper_main
         return keeper_main(argv[1], argv[2])

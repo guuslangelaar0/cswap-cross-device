@@ -1464,24 +1464,66 @@ class TestPrune(Base):
         self.assertEqual(res["runs"], [])
         self.ok("send", "laptop", "wp2", "MARK-2")
 
-    def test_session_start_prunes_at_most_hourly(self):
+    def wait_gone(self, sid, timeout=15):
+        deadline = time.time() + timeout
+        while self.session_files(sid) and time.time() < deadline:
+            time.sleep(0.1)
+        return self.session_files(sid)
+
+    def test_session_start_prunes_at_most_hourly_in_the_background(self):
         sid = "cccc0000-2222-3333-4444-555555555555"
         self.fake_record("cccc0001-old-ended", ended=True, age_days=10)
         p = self.fake_session(sid)
+        t0 = time.time()
         self.assertEqual(self.hook(p, "SessionStart")["out"], "")
-        self.assertEqual(self.session_files("cccc0001-old-ended"), [])
+        self.assertLess(time.time() - t0, 5)
+        self.assertEqual(self.wait_gone("cccc0001-old-ended"), [])  # pruned by a detached process
         self.fake_record("cccc0002-old-ended", ended=True, age_days=10)
         self.hook(p, "SessionStart")  # within the hour: no second pass
+        time.sleep(1.5)
         self.assertEqual(len(self.session_files("cccc0002-old-ended")), 4)
+        # A stamp dated in the future (the clock stepped back) does not stop pruning.
+        future = time.time() + 7200
+        os.utime(os.path.join(self.local, "prune.stamp"), (future, future))
+        self.hook(p, "SessionStart")
+        self.assertEqual(self.wait_gone("cccc0002-old-ended"), [])
+        regs = read_json(os.path.join(self.local, "registrations.json"))
+        self.assertIn(read_json(os.path.join(self.local, "sessions", sid + ".json"))["account"], regs)
+
+    def test_stray_temp_files_and_odd_meta_are_handled(self):
+        os.makedirs(os.path.join(self.local, "sessions"), mode=0o700, exist_ok=True)
+        tmp = os.path.join(self.local, "sessions", "x.json.tmp.123.0a1b2c3d")
+        keep = os.path.join(self.local, "sessions", "a.tmp.b.json")  # a session id may contain ".tmp."
+        for p in (tmp, keep):
+            with open(p, "w") as f:
+                f.write("{}")
+            os.utime(p, (time.time() - 10 * self.DAY,) * 2)
+        os.makedirs(os.path.join(self.local, "runs", "odd"), mode=0o700)
+        with open(os.path.join(self.local, "runs", "odd", "meta.json"), "w") as f:
+            json.dump({"session_id": ["not", "a", "string"]}, f)
+        self.prune()
+        self.assertFalse(os.path.exists(tmp))
+        self.assertTrue(os.path.exists(keep))  # a session record (no pid: unknown, kept), not a temp file
+
+    def test_an_unlistable_runs_dir_aborts_the_pass(self):
+        self.fake_record("bcbc0000-run-session", ended=True, age_days=10, run="gone-run")
+        with open(os.path.join(self.local, "runs"), "w") as f:  # runs/ is not a directory
+            f.write("x")
+        r = self.cxd("prune", "local", "--json")
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertEqual(len(self.session_files("bcbc0000-run-session")), 4)
 
     def test_a_session_whose_process_is_unknown_is_kept_until_it_ends(self):
         """GUARD prune-unknown. Mutation: a session that never recorded its pid
-        counts as dead -> a live session (e.g. an npm-installed claude) is pruned."""
+        (or its process identity) counts as dead -> a live session (e.g. an
+        npm-installed claude, or a `ps` that timed out) is pruned."""
         self.fake_record("ffff0000-no-pid-open", ended=False, age_days=30, pid=None, ident=None)
+        self.fake_record("ffff0002-no-ident-open", ended=False, age_days=30, pid=os.getpid(), ident=None)
         self.fake_record("ffff0001-no-pid-ended", ended=True, age_days=30, pid=None, ident=None)
         res = self.prune()
         self.assertEqual(res["sessions"], ["ffff0001-no-pid-ended"])
         self.assertEqual(len(self.session_files("ffff0000-no-pid-open")), 4)
+        self.assertEqual(len(self.session_files("ffff0002-no-ident-open")), 4)
 
     def test_configured_age_and_invalid_overrides(self):
         with open(os.path.join(self.local, "config.json"), "w") as f:
@@ -1516,11 +1558,14 @@ class TestPrune(Base):
         with open(os.path.join(d, "meta.json"), "w") as f:
             json.dump({"name": "wp4", "gen": 1}, f)
         self.age_tree(d, time.time() - 10 * self.DAY)
+        self.fake_record("eeee0000-wp4-session", ended=True, age_days=10, run="wp4")
         with mock.patch.dict(os.environ, {"CXD_HOME": self.local}), \
                 mock.patch.object(prune_mod, "_run_alive", side_effect=[False, True]):
             res = prune_mod.prune(load_config(), runs=True)
-        self.assertEqual(res["runs"], [])
+        self.assertEqual((res["runs"], res["sessions"]), ([], []))
         self.assertTrue(os.path.isdir(d))
+        # The run's session data goes only with the run, so it survives too.
+        self.assertEqual(len(self.session_files("eeee0000-wp4-session")), 4)
 
     def test_malformed_records_do_not_stop_the_pass(self):
         self.fake_record("acac0000-list-record", ended=True, age_days=10)
@@ -1533,12 +1578,16 @@ class TestPrune(Base):
         self.assertIn("acac0001-old-ended", res["sessions"])
 
     def test_a_broken_prune_setting_breaks_nothing(self):
-        for bad in ("soon", -3, None, [1]):
+        for bad in ("soon", -3, None, [1], 10 ** 400):
             with open(os.path.join(self.local, "config.json"), "w") as f:
                 json.dump({"self": ["laptop"], "default_account": "work", "prune_after_days": bad}, f)
             self.fake_record("dddd0000-new-ended", ended=True, age_days=1)
             res = self.prune()  # falls back to the default (7 days)
             self.assertEqual(res["sessions"], [], bad)
+            try:
+                os.unlink(os.path.join(self.local, "prune.stamp"))  # let SessionStart prune again
+            except OSError:
+                pass
             for ev in ("SessionStart", "Stop"):
                 r = subprocess.run([HOOK, ev], input=json.dumps({"session_id": "eeee0000-x"}).encode(),
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env)
