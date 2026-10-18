@@ -76,6 +76,9 @@ flowchart LR
   repeat is recognisable. A long message (up to 1,000,000 characters) is queued as numbered
   parts that each fit in one delivery; they arrive whole, in order as the session's hooks run
   one after another.
+  A message delivered at `Stop` keeps the session going: Claude reads it and acts on it
+  before the turn ends (Claude Code documents Stop-hook `additionalContext` as feedback the
+  conversation continues on; observed with Claude Code 2.1.302).
 - **Reports.** The `Stop` hook appends the last assistant message of every turn to the
   session's outbox, and a worker can add its own lines with `cxd notify "…"`. The lead
   sees them in `cxd watch`.
@@ -285,9 +288,10 @@ See [SECURITY.md](SECURITY.md) to report a vulnerability.
 - Messages to a headless run are queued as its next turn; they are not injected into the
   turn that is running. A session that waits for a human sees an inbox message only at its
   next prompt or tool call.
-- Inbox delivery through `PostToolUse` has been exercised with real Claude Code sessions.
-  Delivery into an interactive (TUI) session, delivery on `UserPromptSubmit`, and a session
-  continuing after a `Stop` delivery are so far covered only by the stub tests.
+- Inbox delivery into an interactive (TUI) session is proven with real Claude Code 2.1.302 on
+  Linux on `PostToolUse`, on `UserPromptSubmit` and at `Stop`, where the session continues and
+  acts on the message ([evidence](docs/evidence/2026-10-18-tui-delivery-linux.md)). A session
+  that sits idle at its prompt gets the message only when it next does something.
 - Remote hosts need `ssh` access as the same user and `cxd init` run on them.
 - **Planned: a broker transport.** A small broker on your LAN or VPN, so hosts can reach each
   other without an ssh alias for every pair. Hosts would pair with `cxd join` and

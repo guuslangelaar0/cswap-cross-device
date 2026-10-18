@@ -1371,5 +1371,20 @@ class TestMutationTable(unittest.TestCase):
         self.assertIn("unknown mutation", r.stdout)
 
 
+class TestSecretsCheck(unittest.TestCase):
+    def test_a_large_file_scans_without_pipe_errors(self):
+        """With SIGPIPE ignored (as under some git hook runners), the early exit
+        of `grep -q` must not make the scan print write errors."""
+        d = tempfile.mkdtemp(prefix="cxd-secrets-")
+        self.addCleanup(shutil.rmtree, d, True)
+        big = os.path.join(d, "big.txt")
+        with open(big, "w") as f:
+            f.write("plain text line\n" * 40000)  # well over a pipe buffer
+        r = subprocess.run([os.path.join(REPO, "scripts", "check-secrets.sh"), big], cwd=d,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                           restore_signals=False, timeout=120)
+        self.assertEqual((r.returncode, r.stderr), (0, ""), r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
