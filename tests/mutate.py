@@ -16,6 +16,8 @@ import tempfile
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 T = "tests.test_cxd."
+B = "tests.test_broker."
+TESTS = "tests.test_"
 MUTATIONS = [
     {
         "name": "keeper",
@@ -287,6 +289,15 @@ MUTATIONS = [
         "expect": "red",
     },
     {
+        "name": "pin-node-id",
+        "what": "a broker peer is admitted on TLS verification alone (a certificate signed by a member's key gets in)",
+        "edits": [("lib/cxd/broker/identity.py",
+                   "    return peer_id is not None and peer_id in member_ids  # GUARD:pin-node-id\n",
+                   "    return peer_id is not None  # MUTATION\n")],
+        "tests": [B + "TestIdentity.test_a_certificate_signed_by_a_member_passes_tls_but_not_the_pin"],
+        "expect": "red",
+    },
+    {
         "name": "prune-age",
         "what": "pruning ignores the age: recently ended sessions are removed too",
         "edits": [("lib/cxd/prune.py", "    if _last_change(_session_paths(sid)) >= cutoff:  # GUARD:prune-age\n",
@@ -391,9 +402,13 @@ def check_source(text):
 
 def guard_names_in_tests():
     """Names in test docstrings that say `GUARD <name>.`: each needs a mutation."""
+    import glob
     import re
-    with open(os.path.join(REPO, "tests", "test_cxd.py"), encoding="utf-8") as f:
-        return set(re.findall(r'"""GUARD ([a-z0-9-]+)[.\s]', f.read()))
+    names = set()
+    for p in sorted(glob.glob(os.path.join(REPO, "tests", "test_*.py"))):
+        with open(p, encoding="utf-8") as f:
+            names |= set(re.findall(r'"""GUARD ([a-z0-9-]+)[.\s]', f.read()))
+    return names
 
 
 def check_table(mutations, root=REPO):
@@ -413,8 +428,8 @@ def check_table(mutations, root=REPO):
         if m["expect"] not in ("red", "green"):
             problems.append("%s: expect must be red or green" % where)
         tests = m["tests"]
-        if not isinstance(tests, list) or not tests or not all(isinstance(t, str) and t.startswith(T) for t in tests):
-            problems.append("%s: tests must be a non-empty list of %s* names" % (where, T))
+        if not isinstance(tests, list) or not tests or not all(isinstance(t, str) and t.startswith(TESTS) for t in tests):
+            problems.append("%s: tests must be a non-empty list of %s* names" % (where, TESTS))
         edits = m["edits"]
         if not isinstance(edits, list) or not edits:
             problems.append("%s: edits must be a non-empty list" % where)
