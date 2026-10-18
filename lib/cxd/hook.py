@@ -98,9 +98,9 @@ def _claimer_alive(token):
     pid, _, digest = token.partition("-")
     try:
         pid = int(pid)
-    except ValueError:
-        return False
-    return claim_token(pid) == "%d-%s" % (pid, digest)  # GUARD:claim-identity
+        return claim_token(pid) == "%d-%s" % (pid, digest)  # GUARD:claim-identity
+    except (ValueError, OverflowError):
+        return False  # not a pid any process can have
 
 
 def recover_claims(sid):
@@ -126,6 +126,22 @@ def _valid_message(m):
     return isinstance(m, dict) and isinstance(m.get("text"), str)
 
 
+def _read_queued(p):
+    """(message, broken): broken only for a file that exists but is not a
+    message (bad JSON or shape). A failed read (EIO, EMFILE...) is neither:
+    the file stays queued and the next hook tries again."""
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except OSError:
+        return None, False
+    try:
+        m = json.loads(raw)
+    except ValueError:
+        return None, True
+    return (m, False) if _valid_message(m) else (None, True)
+
+
 def _set_aside(src, sid, name):
     """A file that is not a message must not block the queue: move it to bad/."""
     try:
@@ -146,18 +162,17 @@ def claim_inbox(sid):
     if not names:
         return []
     token = claim_token()
-    if token is None:
+    if token is None:  # GUARD:claim-needs-identity
         return []  # without our own identity a claim could never be recovered
     claimed = ensure_dir(path("claimed", sid))
     got, used = [], 0
     for n in names:
         src = os.path.join(inbox, n)
-        m = read_json(src, None)
-        if m is None and not os.path.exists(src):
-            continue  # another hook claimed it
-        if not _valid_message(m):
+        m, broken = _read_queued(src)
+        if broken:
             _set_aside(src, sid, n)
-            continue
+        if m is None:
+            continue  # set aside, unreadable for now, or claimed by another hook
         size = len(format_messages([m])) + 2
         if got and used + size > CONTEXT_BUDGET:
             break  # leave the rest for the next hook
@@ -233,7 +248,13 @@ def handle(event, data):
 
 def main(event):
     out, claims, sid = None, [], None
-    parent = os.getppid()
+    # The wrapper (hooks/cxd-hook) passes its pid: if it is killed (a timeout)
+    # even before this process got going, the output is not read by anyone.
+    parent = os.environ.get("CXD_HOOK_PARENT")
+    try:
+        parent = int(parent) if parent else os.getppid()
+    except ValueError:
+        parent = os.getppid()
     try:
         raw = sys.stdin.read()
         data = json.loads(raw) if raw.strip() else {}

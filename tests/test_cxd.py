@@ -1012,7 +1012,12 @@ class TestHooks(Base):
         words = ["w%05d" % i for i in range(3000)]  # about 21,000 characters
         text = " ".join(words)
         r = self.ok("send", "laptop", sid, text, "--json")
-        self.assertGreater(json.loads(r.stdout)["parts"], 1)
+        res = json.loads(r.stdout)
+        self.assertGreater(res["parts"], 1)
+        self.assertEqual(len(res["ids"]), res["parts"])
+        r = self.cxd("send", "laptop", sid, "-", stdin="y" * 1000001)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("too long", r.stderr)
         got = []
         for _ in range(10):
             res = self.hook(p, "PostToolUse")
@@ -1025,6 +1030,28 @@ class TestHooks(Base):
         joined = " ".join(" ".join(c.split()) for c in got)
         self.assertEqual([w for w in joined.split() if w.startswith("w") and w[1:].isdigit()], words)
         self.assertIn("[part 1/", got[0])
+
+    def test_split_text_keeps_every_character(self):
+        from cxd.state import _split_text
+        cases = ["a" * 6000 + " ", ("line of text\n" * 2000), ("    indented\n" * 1500) + "end",
+                 "x" * 13000, "", "short"]
+        for text in cases:
+            parts = _split_text(text, 6000)
+            self.assertEqual("".join(parts), text)
+            self.assertTrue(all(0 < len(p) <= 6000 for p in parts) or text == "", [len(p) for p in parts])
+
+    def test_a_hook_without_its_own_identity_claims_nothing(self):
+        """GUARD claim-needs-identity. Mutation: a hook claims without being able
+        to read its own identity -> its claim could never be recovered."""
+        from cxd import hook
+        sid = "efefefef-2222-3333-4444-555555555555"
+        self.queue(sid, 5, "MARK-NO-IDENTITY")
+        with mock.patch.dict(os.environ, {"CXD_HOME": self.local}), \
+                mock.patch.object(hook, "proc_identity", return_value=None):
+            self.assertEqual(hook.claim_inbox(sid), [])
+        self.assertEqual(len(os.listdir(os.path.join(self.local, "inbox", sid))), 1)
+        self.assertFalse(os.path.exists(os.path.join(self.local, "claimed", sid)) and
+                         os.listdir(os.path.join(self.local, "claimed", sid)))
 
     def test_hook_never_breaks_a_session(self):
         cases = [b"", b"not json", b"[]", json.dumps({"session_id": "../../etc"}).encode()]

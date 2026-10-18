@@ -263,6 +263,14 @@ MUTATIONS = [
         "expect": "red",
     },
     {
+        "name": "claim-needs-identity",
+        "what": "a hook that cannot read its own identity still claims (an unrecoverable claim)",
+        "edits": [("lib/cxd/hook.py", "    if token is None:  # GUARD:claim-needs-identity\n",
+                   "    if False:  # MUTATION\n")],
+        "tests": [T + "TestHooks.test_a_hook_without_its_own_identity_claims_nothing"],
+        "expect": "red",
+    },
+    {
         "name": "init-no-link",
         "what": "cxd init does not link ~/.cxd/bin/cxd, so peers cannot reach this host",
         "edits": [("lib/cxd/cli.py", "    link, target = _link_cli()\n",

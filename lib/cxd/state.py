@@ -450,30 +450,40 @@ def op_send(args):
     inbox = ensure_dir(path("inbox", sid))
     # A hook can hand over at most ~10,000 characters at a time, so a long
     # message is queued as numbered parts, each delivered whole, in order.
+    if len(text) > MAX_MESSAGE:
+        raise CxdError("message too long for a session (%d characters, at most %d); "
+                       "write it to a file and send the path" % (len(text), MAX_MESSAGE), "usage")
     chunks = _split_text(text, PART_CHARS)
     ts = now_iso()
+    ids = []
     for k, chunk in enumerate(chunks, 1):
-        part_id = msg_id if len(chunks) == 1 else "%s-p%03d" % (msg_id, k)
+        part_id = msg_id if len(chunks) == 1 else "%s-p%04d" % (msg_id, k)
+        ids.append(part_id)
         body = chunk if len(chunks) == 1 else "[part %d/%d] %s" % (k, len(chunks), chunk)
         msg = {"id": part_id, "ts": ts, "sender": sender, "text": body}
         tmp = os.path.join(inbox, ".tmp-" + part_id)
         atomic_write_json(tmp, msg)
         os.replace(tmp, os.path.join(inbox, part_id + ".json"))
-    return {"target": sid, "via": "inbox", "id": msg_id, "parts": len(chunks)}
+    return {"target": sid, "via": "inbox", "id": msg_id, "parts": len(chunks), "ids": ids}
 
 
 PART_CHARS = 6000
+MAX_MESSAGE = 1000000  # 167 parts at most
 
 
 def _split_text(text, n):
-    """Split text into chunks of at most n characters, at whitespace when it can."""
+    """Chunks of at most n characters that join back to text exactly; cut after
+    a newline when there is one in the second half, else after a space."""
     chunks = []
     while len(text) > n:
-        cut = text.rfind(" ", n // 2, n)
-        cut = n if cut < 0 else cut
+        cut = text.rfind("\n", n // 2, n)
+        if cut < 0:
+            cut = text.rfind(" ", n // 2, n)
+        cut = n if cut < 0 else cut + 1
         chunks.append(text[:cut])
-        text = text[cut:].lstrip(" ")
-    chunks.append(text)
+        text = text[cut:]
+    if text or not chunks:
+        chunks.append(text)
     return chunks
 
 

@@ -18,5 +18,5 @@ py="${CXD_PYTHON:-}"
 if [ -z "$py" ]; then
   if [ -x /usr/bin/python3 ]; then py=/usr/bin/python3; else py=python3; fi
 fi
-"$py" -I -S "$root/bin/cxd" _hook "$ev" 2>/dev/null
+CXD_HOOK_PARENT=$$ "$py" -I -S "$root/bin/cxd" _hook "$ev" 2>/dev/null
 exit 0

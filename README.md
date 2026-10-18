@@ -73,8 +73,9 @@ flowchart LR
   at-least-once: a hook claims the message, and only once it has written it out is the
   message marked delivered. If a hook is killed, times out or cannot write in between, the
   session's next hook delivers the message again. Each message carries its id, so the rare
-  repeat is recognisable. A long message is queued as numbered parts that each fit in one
-  delivery, and they arrive whole and in order.
+  repeat is recognisable. A long message (up to 1,000,000 characters) is queued as numbered
+  parts that each fit in one delivery; they arrive whole, in order as the session's hooks run
+  one after another.
 - **Reports.** The `Stop` hook appends the last assistant message of every turn to the
   session's outbox, and a worker can add its own lines with `cxd notify "…"`. The lead
   sees them in `cxd watch`.
