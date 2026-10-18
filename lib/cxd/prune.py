@@ -27,7 +27,8 @@ AUTO_EVERY = 3600.0
 AUTO_LIMIT = 200
 # The record comes first: it is removed last, so a partial removal is retried.
 _SESSION_PARTS = (("sessions", "%s.json"), ("outbox", "%s.jsonl"), ("inbox", "%s"),
-                  ("claimed", "%s"), ("delivered", "%s"), ("bad", "%s"), ("wake", "%s.lock"))
+                  ("claimed", "%s"), ("delivered", "%s"), ("bad", "%s"), ("wake", "%s.lock"),
+                  ("turn", "%s.idle"), ("turn", "%s.busy"))
 
 
 NEVER = float("inf")

@@ -3,14 +3,25 @@
 # Contract: fast, silent on any error, always exit 0 - never break the session.
 ev="$1"
 d="${CXD_HOME:-$HOME/.cxd}"
+input=
 case "$ev" in
   PostToolUse|UserPromptSubmit)
+    input="$(cat 2>/dev/null)"
+    if [ "$ev" = UserPromptSubmit ] && [ -d "$d" ]; then
+      # A turn starts: mark the session busy, so the idle waker leaves its mail
+      # to the hooks of this turn. (The session id is a strict character set.)
+      sid="$(printf '%s' "$input" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([A-Za-z0-9._-][A-Za-z0-9._-]*\)".*/\1/p' | head -n 1)"
+      if [ -n "$sid" ]; then (umask 077; mkdir -p "$d/turn" && : > "$d/turn/$sid.busy") 2>/dev/null; fi
+    fi
     # Fast path: nothing queued or claimed for any session -> skip Python entirely.
     mail=
     for f in "$d"/inbox/*/*.json "$d"/claimed/*/*.json; do
       if [ -e "$f" ]; then mail=1; break; fi
     done
-    if [ -z "$mail" ]; then cat >/dev/null 2>&1; exit 0; fi
+    if [ -z "$mail" ]; then exit 0; fi
+    ;;
+  *)
+    input="$(cat 2>/dev/null)"
     ;;
 esac
 root="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)" || exit 0
@@ -18,5 +29,11 @@ py="${CXD_PYTHON:-}"
 if [ -z "$py" ]; then
   if [ -x /usr/bin/python3 ]; then py=/usr/bin/python3; else py=python3; fi
 fi
-CXD_HOOK_PARENT=$$ "$py" -I -S "$root/bin/cxd" _hook "$ev" 2>/dev/null
+if [ "$ev" = Wake ]; then
+  # The idle waker (asyncRewake): exit 2 with the message on stderr wakes Claude.
+  printf '%s' "$input" | CXD_HOOK_PARENT=$$ "$py" -I -S "$root/bin/cxd" _hook Wake
+  [ $? -eq 2 ] && exit 2
+  exit 0
+fi
+printf '%s' "$input" | CXD_HOOK_PARENT=$$ "$py" -I -S "$root/bin/cxd" _hook "$ev" 2>/dev/null
 exit 0

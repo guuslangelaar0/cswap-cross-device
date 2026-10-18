@@ -13,7 +13,8 @@ scrubbed environment, then proves, one case at a time:
   B  UserPromptSubmit  a message queued while idle, then a prompt is typed
   C  Stop              a message queued while a tool-free answer streams; does
                        the session continue and act on it?
-  D  idle              a message queued while nobody types: what happens
+  D  idle              a message queued while nobody types: the waker (an
+                       asyncRewake hook) delivers it and Claude acts on it unprompted
 
 A case passes only on cxd's own receipt naming the expected hook AND Claude's
 reply (from the session transcript) following the message. Between cases the
@@ -57,11 +58,15 @@ class Driver(object):
         self.work = os.path.join(self.tmp, "work")
         os.makedirs(self.home, mode=0o700)
         os.makedirs(self.work)
+        # A machine where cxd is set up has a config. The hook paths (A-C) are
+        # proven with the idle waker off; case D turns it on.
+        self.set_config(idle_wake=False)
         self.sock = "cxdtui-%d" % os.getpid()
         self.session = "tui"
         # A neutral sender label: the injected message names it, and replies may quote it.
         self.env = worker_env({"CXD_HOME": self.home, "CXD_SELF": "laptop"})
-        self.env.pop("TMUX", None)
+        for k in ("TMUX", "CXD_RUN"):  # CXD_RUN: when the driver itself runs inside a cxd run
+            self.env.pop(k, None)
         self.log = []
         self.t0 = time.time()
         self.sid = None
@@ -83,6 +88,17 @@ class Driver(object):
             (socket.gethostname(), "<host>"), (socket.gethostname().split(".")[0], "<host>"),
             (getpass.getuser(), "<user>"), (account, "<account>"),
         ) if p and len(p) > 2]
+
+    def set_config(self, **kw):
+        p = os.path.join(self.home, "config.json")
+        try:
+            with open(p) as f:
+                cfg = json.load(f)
+        except (OSError, ValueError):
+            cfg = {"self": ["laptop"]}
+        cfg.update(kw)
+        with open(p, "w") as f:
+            json.dump(cfg, f)
 
     # ------------------------------------------------------------ plumbing
     def redact(self, s):
@@ -382,21 +398,37 @@ class Driver(object):
         return "PASS: delivered at Stop; the session continued and acted on it"
 
     def case_idle(self, wait_s):
+        """With the waker (an asyncRewake hook) the message arrives while the
+        session sits idle, and Claude acts on it with no prompt typed. Without
+        it, the message waits for the next prompt."""
+        self.set_config(idle_wake=True)
+        before = self.stop_count()
+        self.type_prompt("Reply with the single word ARMED.")  # its Stop starts a waker
+        self.wait(lambda: self.stop_count() > before and self.idle(), 120, "the arming turn to end", step=1)
+        time.sleep(2)
+        n0, prompts0 = len(self.assistant_texts()), self.prompts
         mid = self.send("Reply also with the word PLUM-D. (cxd evidence check)")
-        time.sleep(wait_s)
+        deadline = time.time() + wait_s
+        while time.time() < deadline and not self.receipts(mid):
+            time.sleep(1)
         got = self.receipts(mid)
         if got:
-            self.note("receipt: delivered by the %s hook while idle" % got[0]["event"])
-            return "delivered while idle via %s" % got[0]["event"]
+            self.note("receipt: delivered by the %s hook while idle (no prompt typed)" % got[0]["event"])
+            texts = self.wait(lambda: self.reply_with("PLUM-D", n0), 120, "Claude's reply to the woken message", step=1)
+            self.note("Claude replied, unprompted: %r" % texts[-1][:200])
+            if self.prompts != prompts0:
+                return "FAIL: a prompt was typed during the case"
+            if got[0]["event"] != "Wake":
+                return "FAIL: delivered while idle via %s, not the waker" % got[0]["event"]
+            return "PASS: delivered while idle by the waker; Claude acted on it without a prompt"
         self.note("after %ds idle: not delivered, still queued (%d pending)" % (wait_s, self.inbox_pending()))
-        n0 = len(self.assistant_texts())
         self.type_prompt("Reply with the single word OK.")
         rec = self.wait(lambda: self.receipts(mid), 60, "delivery on the next prompt", step=1)[0]
         texts = self.wait(lambda: self.reply_with("PLUM-D", n0), 120, "a reply with the marker", step=1)
         self.note("the next prompt delivered it (receipt: %s hook); Claude replied: %r" % (rec["event"], texts[-1][:200]))
         if rec["event"] != "UserPromptSubmit":
             return "FAIL: the follow-up delivery came via %s" % rec["event"]
-        return "NOT DELIVERED WHILE IDLE (expected without a waker); delivered by the next prompt"
+        return "NOT DELIVERED WHILE IDLE (no waker); delivered by the next prompt"
 
 
 def main(argv):
@@ -408,6 +440,7 @@ def main(argv):
     ap.add_argument("--idle-wait", type=int, default=30)
     ap.add_argument("--cases", default="ABCD")
     ap.add_argument("--out")
+    ap.add_argument("--keep-transcript", help="copy the session transcript here (for debugging; not redacted)")
     a = ap.parse_args(argv)
     cases = [c for c in a.cases.upper() if c in "ABCD"]
     if not cases:
@@ -435,7 +468,7 @@ def main(argv):
         d.start()
         labels = {"A": "A: delivery on PostToolUse", "B": "B: delivery on UserPromptSubmit",
                   "C": "C: delivery at Stop, and whether the session continues",
-                  "D": "D: a message queued while the session is idle"}
+                  "D": "D: a message queued while the session is idle (the waker)"}
         fns = {"A": d.case_post_tool_use, "B": d.case_user_prompt_submit, "C": d.case_stop,
                "D": lambda: d.case_idle(a.idle_wait)}
         for c in cases:
@@ -445,6 +478,8 @@ def main(argv):
         results["start"] = "FAIL: %s" % d.redact(e)
     finally:
         d.stop()
+        if a.keep_transcript and d.transcript and os.path.exists(d.transcript):
+            shutil.copy(d.transcript, a.keep_transcript)
         shutil.rmtree(tmp, ignore_errors=True)
         d.note("summary: " + json.dumps(results))
         if a.out:

@@ -74,8 +74,10 @@ The message waits in `~/.cxd/inbox/<session_id>/` until that session's next hook
 hook dies before handing it over, the next hook delivers it again. It arrives as context
 reading `Message from the lead session <sender> at <time> (cxd message <id>) [cxd:<tag>]:
 <text>`, where `<tag>` is a secret of the receiving session that its SessionStart
-announcement names; a second copy with the same id is a repeat, not a new instruction. A session that is idle
-waiting for a human only sees it on its next prompt.
+announcement names; a second copy with the same id is a repeat, not a new instruction. A
+session that sits idle at its prompt is woken for it: a background waker (an asyncRewake
+hook) hands it over and Claude starts a turn on it, with no human typing (`"idle_wake":
+false` turns this off).
 
 ## Worker: reporting back
 

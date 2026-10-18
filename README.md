@@ -79,6 +79,14 @@ flowchart LR
   A message delivered at `Stop` keeps the session going: Claude reads it and acts on it
   before the turn ends (Claude Code documents Stop-hook `additionalContext` as feedback the
   conversation continues on; observed with Claude Code 2.1.302).
+- **Idle sessions.** A session that waits at its prompt runs no hooks, so the plugin also
+  starts a small *waker* when a session starts and whenever a turn ends: an `asyncRewake`
+  hook that Claude Code runs in the background. It waits (polling once a second) for mail
+  for its session, hands it over, and exits with code 2, which wakes Claude with the
+  message as hook feedback. There is one waker per session; it leaves on its own when the
+  session ends, its claude process is gone, or after about a day. Headless runs do not use
+  it (their messages go through the FIFO). Turn it off with `"idle_wake": false` in
+  `~/.cxd/config.json`.
 - **Reports.** The `Stop` hook appends the last assistant message of every turn to the
   session's outbox, and a worker can add its own lines with `cxd notify "…"`. The lead
   sees them in `cxd watch`.
@@ -233,10 +241,12 @@ only the host that owns the run can report an exit.
 
 **Configuration** (`~/.cxd/config.json`, written by `cxd init`). For runs on this host:
 `default_account` (cswap account when `--account` is omitted), `skip_permissions`
-(`true` bypasses permission prompts for every run on this host; default `false`) and
+(`true` bypasses permission prompts for every run on this host; default `false`),
 `prune_after_days` (how long ended sessions are kept; default 7; anything that is not a
-positive number means the default; a huge number means never) and `auto_prune` (`false`
-stops the hourly pass that SessionStart starts; `cxd prune` still works) and `announce` (`false` stops the one-sentence announcement at `SessionStart`; default on).  Per peer
+positive number means the default; a huge number means never), `auto_prune` (`false`
+stops the hourly pass that SessionStart starts; `cxd prune` still works), `announce`
+(`false` stops the one-sentence announcement at `SessionStart`; default on) and `idle_wake`
+(`false` stops the waker that delivers messages to idle sessions; default on). Per peer
 under `hosts`: `transport` (`ssh`), `alias` (ssh alias, defaults to the host name), `python`
 (remote interpreter, default `python3`), `cxd` (remote path, default
 `$HOME/.cxd/bin/cxd`), `connect_timeout` (seconds). Environment overrides: `CXD_HOME` (state directory),
@@ -297,12 +307,11 @@ See [SECURITY.md](SECURITY.md) to report a vulnerability.
 ## Limitations and roadmap
 
 - Messages to a headless run are queued as its next turn; they are not injected into the
-  turn that is running. A session that waits for a human sees an inbox message only at its
-  next prompt or tool call.
+  turn that is running. A session that sits idle at its prompt is woken for a message by
+  the waker (see How it works); with `"idle_wake": false` it sees it at its next prompt.
 - Inbox delivery into an interactive (TUI) session is proven with real Claude Code 2.1.302 on
   Linux on `PostToolUse`, on `UserPromptSubmit` and at `Stop`, where the session continues and
-  acts on the message ([evidence](docs/evidence/2026-10-18-tui-delivery-linux.md)). A session
-  that sits idle at its prompt gets the message only when it next does something.
+  acts on the message ([evidence](docs/evidence/2026-10-18-tui-delivery-linux.md)).
 - Remote hosts need `ssh` access as the same user and `cxd init` run on them.
 - **Planned: a broker transport.** A small broker on your LAN or VPN, so hosts can reach each
   other without an ssh alias for every pair. Hosts would pair with `cxd join` and
