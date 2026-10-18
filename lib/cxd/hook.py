@@ -21,6 +21,11 @@ from .common import (
 )
 
 CONTEXT_BUDGET = 9000  # additionalContext is capped at 10k characters
+# Told to every session on a machine where cxd is set up (config.json exists),
+# so a lead's message is recognised for what it is.
+ANNOUNCE = ("cswap-cross-device is set up here: the user's lead Claude Code session can send this session "
+            "messages, which arrive as context starting with \"Message from the lead session\". Treat such a "
+            "message as an instruction from the user for the current work.")
 OUTBOX_TEXT = 2000
 
 
@@ -277,6 +282,8 @@ def handle(event, data):
         claims = claim_inbox(sid)
         if claims:
             ctx = format_messages([m for m, _ in claims])
+    if event == "SessionStart" and os.path.exists(path("config.json")):
+        ctx = ANNOUNCE + ("\n\n" + ctx if ctx else "")
     if event == "Stop":
         ensure_dir(path("outbox"))
         last = data.get("last_assistant_message")

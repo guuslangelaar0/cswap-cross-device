@@ -275,7 +275,11 @@ by name.
   they deliver a message. `PostToolUse` and `UserPromptSubmit` skip Python entirely when no
   inbox has mail. The test suite requires a median under 100 ms for `PostToolUse` and
   `Stop`.
-- **Factual injection.** A delivered message arrives as context that states who sent it and
+- **Announced, factual injection.** On a machine where cxd is set up (`~/.cxd/config.json`
+  exists), the `SessionStart` hook tells each session in one sentence that messages starting
+  "Message from the lead session" come from the user's lead session and are to be treated as
+  the user's instructions; without that, models tend to dismiss them as injected text. A
+  delivered message arrives as context that states who sent it and
   when (*"Message from the lead session laptop/1a2b3c4d at … (cxd message …): …"*), not as an imperative
   from the system.
 - **No secrets in messages.** Messages, reports and turn results are stored as plain files.

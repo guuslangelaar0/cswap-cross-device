@@ -841,7 +841,10 @@ class TestHooks(Base):
     def test_hook_inbox_delivery_exactly_once_and_stop_report(self):
         sid = "11111111-2222-3333-4444-555555555555"
         p = self.fake_session(sid)
-        self.assertEqual(self.hook(p, "SessionStart"), {"event": "SessionStart", "rc": 0, "out": ""})
+        start = self.hook(p, "SessionStart")
+        self.assertEqual(start["rc"], 0)
+        ctx = json.loads(start["out"])["hookSpecificOutput"]["additionalContext"]
+        self.assertIn('"Message from the lead session"', ctx)  # the session learns how lead messages arrive
         rec = read_json(os.path.join(self.local, "sessions", sid + ".json"))
         self.assertEqual(rec["pid"], p.pid, "SessionStart registered the wrong pid")
         w, log = self.watch_bg("laptop", sid)
@@ -1090,6 +1093,12 @@ class TestHooks(Base):
         self.assertEqual(len(os.listdir(os.path.join(self.local, "inbox", sid))), 1)
         self.assertFalse(os.path.exists(os.path.join(self.local, "claimed", sid)) and
                          os.listdir(os.path.join(self.local, "claimed", sid)))
+
+    def test_session_start_is_silent_where_cxd_is_not_set_up(self):
+        os.unlink(os.path.join(self.local, "config.json"))
+        r = subprocess.run([HOOK, "SessionStart"], input=json.dumps({"session_id": "bebebebe-1111"}).encode(),
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env)
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, b"", b""))
 
     def test_hook_never_breaks_a_session(self):
         cases = [b"", b"not json", b"[]", json.dumps({"session_id": "../../etc"}).encode()]
