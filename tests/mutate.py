@@ -57,9 +57,17 @@ MUTATIONS = [
     {
         "name": "exit-rc",
         "what": "watch reports a run's exit before its supervisor has recorded the rc (rc=None)",
-        "edits": [("lib/cxd/state.py", "            if not recorded and supervisor_alive(pids):  # GUARD:exit-rc\n",
+        "edits": [("lib/cxd/state.py", "            if not ex and supervisor_alive(pids):  # GUARD:exit-rc\n",
                    "            if False:  # MUTATION\n")],
         "tests": [T + "TestExitRecord.test_watch_waits_for_the_recorded_exit_code"],
+        "expect": "red",
+    },
+    {
+        "name": "exit-rc-cap",
+        "what": "watch waits forever for a supervisor that never records the exit",
+        "edits": [("lib/cxd/state.py", "                if waited < EXIT_RECORD_WAIT:  # GUARD:exit-rc-cap\n",
+                   "                if True:  # MUTATION\n")],
+        "tests": [T + "TestExitRecord.test_wait_is_capped_when_the_supervisor_hangs"],
         "expect": "red",
     },
     {

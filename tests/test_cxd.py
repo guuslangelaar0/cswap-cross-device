@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CXD = os.path.join(REPO, "bin", "cxd")
@@ -483,38 +484,37 @@ class TestExitRecord(Base):
     """watch reports a run's exit with the rc its supervisor records. claude
     is reaped (and so already gone) a moment before exit.json is written."""
 
-    def fake_run(self, name, supervisor_alive):
+    def fake_run(self, name, supervisor_alive, gen=1, pids=True):
         from cxd.common import atomic_write_json, proc_identity
         d = os.path.join(self.local, "runs", name)
         os.makedirs(d, mode=0o700)
         gone = subprocess.Popen(["true"])
         gone.wait()
-        pids = {"gen": 1, "claude_pid": gone.pid, "claude_ident": "never:" + name,
-                "keeper_pid": gone.pid, "keeper_ident": "never:" + name}
+        rec = {"gen": gen, "claude_pid": gone.pid, "claude_ident": "never:" + name,
+               "keeper_pid": gone.pid, "keeper_ident": "never:" + name}
         if supervisor_alive:
             sup = subprocess.Popen(["sleep", "60"])
             self.bg.append(sup)
-            pids.update(supervisor_pid=sup.pid, supervisor_ident=proc_identity(sup.pid))
-        atomic_write_json(os.path.join(d, "meta.json"), {"name": name, "gen": 1})
-        atomic_write_json(os.path.join(d, "pids.json"), pids)
+            rec.update(supervisor_pid=sup.pid, supervisor_ident=proc_identity(sup.pid))
+        atomic_write_json(os.path.join(d, "meta.json"), {"name": name, "gen": gen})
+        if pids:
+            atomic_write_json(os.path.join(d, "pids.json"), rec)
         with open(os.path.join(d, "out.jsonl"), "w") as f:
-            f.write(json.dumps({"type": "cxd", "event": "gen-start", "gen": 1}) + "\n")
+            f.write(json.dumps({"type": "cxd", "event": "gen-start", "gen": gen}) + "\n")
         return d
 
-    def first_exit(self, name):
+    def home_env(self):
+        return mock.patch.dict(os.environ, {"CXD_HOME": self.local})
+
+    def first_exit(self, name, timeout=30):
         from cxd import state
-        old = os.environ.get("CXD_HOME")
-        os.environ["CXD_HOME"] = self.local
         t0 = time.time()
-        try:
-            for msg in state.stream({"target": name, "interval": 0.1, "heartbeat": 3600}):
+        with self.home_env():
+            for msg in state.stream({"target": name, "interval": 0.1, "heartbeat": 3600, "keepalive": 0.2}):
                 if msg.get("type") == "event" and msg["event"]["ev"] == "exit":
                     return msg["event"], time.time() - t0
-        finally:
-            if old is None:
-                del os.environ["CXD_HOME"]
-            else:
-                os.environ["CXD_HOME"] = old
+                if time.time() - t0 > timeout:
+                    self.fail("no exit event within %ss" % timeout)
 
     def test_watch_waits_for_the_recorded_exit_code(self):
         """GUARD exit-rc. Mutation: the exit is reported as soon as claude is
@@ -528,8 +528,10 @@ class TestExitRecord(Base):
 
         th = threading.Thread(target=record)
         th.start()
-        ev, _ = self.first_exit("wz")
-        th.join()
+        try:
+            ev, _ = self.first_exit("wz")
+        finally:
+            th.join()
         self.assertEqual((ev["rc"], ev["gen"]), (7, 1), ev)
 
     def test_watch_does_not_wait_when_the_supervisor_is_gone(self):
@@ -537,6 +539,47 @@ class TestExitRecord(Base):
         ev, took = self.first_exit("wy")
         self.assertIsNone(ev["rc"])
         self.assertLess(took, 3)
+
+    def test_wait_is_capped_when_the_supervisor_hangs(self):
+        """GUARD exit-rc-cap. Mutation: no cap -> a supervisor that never writes
+        exit.json keeps watch from ever reporting the exit."""
+        from cxd import state
+        self.fake_run("wh", supervisor_alive=True)
+        with mock.patch.object(state, "EXIT_RECORD_WAIT", 1.0):
+            ev, took = self.first_exit("wh", timeout=15)
+        self.assertIsNone(ev["rc"])
+        self.assertGreaterEqual(took, 1.0)
+
+    def test_a_wait_left_from_an_earlier_gen_does_not_cut_this_one(self):
+        from cxd import state
+        from cxd.common import atomic_write_json
+        d = self.fake_run("wg", supervisor_alive=True, gen=2)
+        # A cursor (round-tripped as JSON, as over ssh) still timing gen 1's exit.
+        for stale in ({"gen": 1, "t": time.time() - 30}, time.time() - 30):
+            cur = json.loads(json.dumps({"exit_gen": 1, "exit_wait": stale}))
+            with self.home_env():
+                events, cur = state.poll("wg", cur)
+            self.assertEqual([e for e in events if e["ev"] == "exit"], [], (stale, events))
+        atomic_write_json(os.path.join(d, "exit.json"), {"gen": 2, "rc": 5})
+        with self.home_env():
+            events, cur = state.poll("wg", json.loads(json.dumps(cur)))
+        self.assertEqual([(e["rc"], e["gen"]) for e in events if e["ev"] == "exit"], [(5, 2)])
+
+    def test_exit_record_renamed_by_resume_is_read(self):
+        from cxd.common import atomic_write_json
+        d = self.fake_run("wv", supervisor_alive=False)
+        # resume moves exit.json aside as exit.<gen>.json before the next gen starts.
+        atomic_write_json(os.path.join(d, "exit.1.json"), {"gen": 1, "rc": 3})
+        ev, _ = self.first_exit("wv")
+        self.assertEqual((ev["rc"], ev["gen"]), (3, 1), ev)
+
+    def test_watch_ends_when_the_run_failed_before_it_had_pids(self):
+        from cxd.common import atomic_write_json
+        d = self.fake_run("wf", supervisor_alive=False, pids=False)
+        atomic_write_json(os.path.join(d, "exit.json"),
+                          {"gen": 1, "rc": None, "error": "keeper failed to open the FIFO"})
+        ev, took = self.first_exit("wf", timeout=10)
+        self.assertEqual((ev["rc"], ev["gen"], ev.get("error")), (None, 1, "keeper failed to open the FIFO"))
 
 
 class TestRemote(Base):

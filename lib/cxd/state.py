@@ -530,6 +530,18 @@ def _scan_outbox(sid, cur, emit, skip_kinds=()):
 EXIT_RECORD_WAIT = 10.0
 
 
+def _exit_record(d, gen):
+    """The supervisor's exit record of gen: exit.json, or exit.<gen>.json once a
+    resume has moved it aside. {} while there is none."""
+    if gen is None:
+        return {}
+    for name in ("exit.json", "exit.%s.json" % gen):
+        ex = read_json(os.path.join(d, name), None) or {}
+        if ex.get("gen") == gen:
+            return ex
+    return {}
+
+
 def run_cost(cur):
     return round(sum((cur.get("gen_costs") or {}).values()), 6)
 
@@ -543,26 +555,40 @@ def poll(target, cur):
     cur["kind"] = kind
     if kind == "run":
         d = ref
-        meta, pids, ex = _run_files(d)
+        meta, pids, _ = _run_files(d)
         out = os.path.join(d, "out.jsonl")
         _scan_out(out, cur, emit)
         for sid in list(cur.get("sids", [])) or ([meta["session_id"]] if meta.get("session_id") else []):
             _scan_outbox(sid, cur, emit, skip_kinds=("stop",))  # turn events already carry results
         gen = pids.get("gen")
-        if pids and not claude_alive(pids) and cur.get("exit_gen") != gen:
-            ex = read_json(os.path.join(d, "exit.json"), None) or {}
-            recorded = ex.get("gen") == gen
+        if not pids:
+            # No pids at all: the supervisor of the first gen failed before it
+            # started claude. Its exit record says why; nothing else will happen.
+            ex = _exit_record(d, meta.get("gen"))
+            if ex and cur.get("exit_gen") != ex["gen"]:
+                cur["exit_gen"] = ex["gen"]
+                emit({"ev": "exit", "rc": ex.get("rc"), "gen": ex["gen"], "error": ex.get("error"),
+                      "turns": cur.get("turns", 0), "cost_usd": run_cost(cur)})
+        elif claude_alive(pids):
+            cur.pop("exit_wait", None)
+        elif cur.get("exit_gen") != gen:
+            ex = _exit_record(d, gen)
             # The supervisor reaps claude, then writes exit.json: while it lives,
             # wait (bounded) for the rc rather than report the exit without it.
-            if not recorded and supervisor_alive(pids):  # GUARD:exit-rc
-                since = cur.setdefault("exit_wait", time.time())
-                if time.time() - since < EXIT_RECORD_WAIT:
+            if not ex and supervisor_alive(pids):  # GUARD:exit-rc
+                wait = cur.get("exit_wait")
+                if not (isinstance(wait, dict) and wait.get("gen") == gen):
+                    wait = cur["exit_wait"] = {"gen": gen, "t": time.time()}
+                waited = time.time() - wait["t"]
+                if waited < 0:  # the clock stepped back: start the wait again
+                    wait["t"], waited = time.time(), 0.0
+                if waited < EXIT_RECORD_WAIT:  # GUARD:exit-rc-cap
                     return events, cur
             cur.pop("exit_wait", None)
             _scan_out(out, cur, emit)  # final flush after the process ended
             cur["exit_gen"] = gen
-            emit({"ev": "exit", "rc": ex.get("rc") if recorded else None,
-                  "gen": gen, "turns": cur.get("turns", 0), "cost_usd": run_cost(cur)})
+            emit({"ev": "exit", "rc": ex.get("rc"), "gen": gen, "turns": cur.get("turns", 0),
+                  "cost_usd": run_cost(cur)})
     else:
         rec = ref
         sid = rec["session_id"]
