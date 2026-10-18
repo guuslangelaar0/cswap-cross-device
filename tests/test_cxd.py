@@ -938,5 +938,183 @@ class TestHooks(Base):
         self.assertEqual(r.returncode, 2)
 
 
+PIN = os.path.join(REPO, "scripts", "check-release-pin.py")
+
+
+def git_env():
+    """Fixture git runs must never touch the repo under test: drop GIT_DIR and
+    friends (set inside git hooks and worktrees) and ignore global config."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+    return env
+
+
+class TestReleasePin(unittest.TestCase):
+    """The marketplace installs the latest tagged release, pinned by commit."""
+
+    URL = "https://example.invalid/cxd.git"
+
+    def setUp(self):
+        self.repo = tempfile.mkdtemp(prefix="cxd-pin-")
+        os.makedirs(os.path.join(self.repo, ".claude-plugin"))
+        self.manifest("9.9.9")
+        self.git("init", "-q")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "release 9.9.9")
+        self.git("tag", "v9.9.9")
+        self.sha = self.git("rev-parse", "HEAD")
+
+    def tearDown(self):
+        shutil.rmtree(self.repo, ignore_errors=True)
+
+    def git(self, *args):
+        r = subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                            "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", "-C", self.repo]
+                           + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, check=True, env=git_env())
+        return r.stdout.strip()
+
+    def commit(self, msg, version=None):
+        if version:
+            self.manifest(version)
+        with open(os.path.join(self.repo, "work.txt"), "a") as f:
+            f.write(msg + "\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", msg)
+        return self.git("rev-parse", "HEAD")
+
+    def manifest(self, version, repository="https://example.invalid/cxd"):
+        with open(os.path.join(self.repo, ".claude-plugin", "plugin.json"), "w") as f:
+            json.dump({"name": "cswap-cross-device", "version": version, "repository": repository}, f)
+
+    def write_market(self, market):
+        with open(os.path.join(self.repo, ".claude-plugin", "marketplace.json"), "w") as f:
+            json.dump(market, f)
+
+    def market(self, **src):
+        source = dict({"source": "url", "url": self.URL, "ref": "v9.9.9", "sha": self.sha}, **src)
+        entry = {"name": "cswap-cross-device", "source": source}
+        self.write_market({"name": "m", "owner": {"name": "o"}, "plugins": [entry]})
+        return entry
+
+    def pin(self):
+        r = subprocess.run([sys.executable, PIN, "--repo", self.repo], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, universal_newlines=True, env=git_env())
+        return r.returncode, r.stdout
+
+    def assert_fails(self, msg):
+        rc, out = self.pin()
+        self.assertEqual(rc, 1, out)
+        self.assertIn(msg, out)
+        self.assertNotIn("Traceback", out)
+
+    def test_consistent_pin_passes(self):
+        self.market()
+        self.assertEqual(self.pin(), (0, "release pin: ok\n"))
+        # An annotated tag works the same way.
+        sha = self.commit("release 9.9.10", version="9.9.10")
+        self.git("tag", "-a", "-m", "v9.9.10", "v9.9.10")
+        self.market(ref="v9.9.10", sha=sha)
+        self.assertEqual(self.pin(), (0, "release pin: ok\n"))
+
+    def test_the_check_ignores_a_git_dir_it_inherits(self):
+        """GUARD release-pin-git-env. Mutation: the check passes GIT_DIR on to
+        git -> run from a git hook it checks the wrong repository."""
+        self.market()
+        decoy = tempfile.mkdtemp(prefix="cxd-decoy-")
+        self.addCleanup(shutil.rmtree, decoy, True)
+        subprocess.run(["git", "init", "-q", decoy], check=True, env=git_env())
+        env = dict(git_env(), GIT_DIR=os.path.join(decoy, ".git"))
+        r = subprocess.run([sys.executable, PIN, "--repo", self.repo], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, universal_newlines=True, env=env)
+        self.assertEqual((r.returncode, r.stdout), (0, "release pin: ok\n"))
+
+    def test_sha_of_another_commit_fails(self):
+        """GUARD release-pin-sha. Mutation: the sha is not compared with the
+        tag's commit -> a pin to an unreleased commit passes."""
+        self.market(sha=self.commit("unreleased work on main"))
+        self.assert_fails("is not the commit of v9.9.9")
+
+    def test_an_older_release_fails(self):
+        """GUARD release-pin-latest. Mutation: the newest-tag check is off ->
+        a pin left on an older release passes."""
+        self.commit("release 9.10.0", version="9.10.0")
+        self.git("tag", "v9.10.0")
+        self.market()
+        self.assert_fails("pins v9.9.9, but the newest release tag is v9.10.0")
+
+    def test_newest_means_newest_merged(self):
+        # A tag on a commit that is not merged (here) does not count as newer.
+        self.git("checkout", "-q", "-b", "side")
+        self.commit("side release", version="9.10.0")
+        self.git("tag", "v9.10.0")
+        self.git("checkout", "-q", "-")
+        self.market()
+        self.assertEqual(self.pin(), (0, "release pin: ok\n"))
+
+    def test_a_tag_on_an_unmerged_commit_fails(self):
+        """GUARD release-pin-merged. Mutation: the ancestry check is off -> a
+        release tagged on a side branch passes."""
+        self.git("checkout", "-q", "-b", "side")
+        side = self.commit("side release", version="9.9.10")
+        self.git("tag", "v9.9.10")
+        self.git("checkout", "-q", "-")
+        self.market(ref="v9.9.10", sha=side)
+        self.assert_fails("is not in the history of HEAD")
+
+    def test_tag_whose_manifest_has_another_version_fails(self):
+        """GUARD release-pin-version. Mutation: the version is not compared ->
+        a tag whose plugin.json says another version passes."""
+        sha = self.commit("bump without a matching tag", version="9.9.10")
+        self.git("tag", "v9.9.11")
+        self.market(ref="v9.9.11", sha=sha)
+        self.assert_fails("says version '9.9.10', the tag says 9.9.11")
+
+    def test_url_must_be_https(self):
+        """GUARD release-pin-https. Mutation: any url scheme passes."""
+        self.market(url="git@example.invalid:cxd.git")
+        self.assert_fails("url must be an https:// git URL")
+
+    def test_other_broken_pins_fail(self):
+        cases = [
+            (dict(ref="main"), "ref must be a release tag"),
+            (dict(ref="v9.9.8"), "tag v9.9.8 does not exist"),
+            (dict(ref="v9.9.\u00b9"), "ref must be a release tag"),
+            (dict(sha="abc123"), "sha must be the 40-character commit"),
+            (dict(url="https://example.invalid/other.git"), "is not the plugin's repository"),
+        ]
+        for src, msg in cases:
+            self.market(**src)
+            self.assert_fails(msg)
+        # A branch named like a release is not a release tag.
+        self.git("branch", "v9.9.7")
+        self.market(ref="v9.9.7")
+        self.assert_fails("tag v9.9.7 does not exist")
+        # A relative-path source installs main, not a release.
+        self.write_market({"name": "m", "owner": {"name": "o"},
+                           "plugins": [{"name": "cswap-cross-device", "source": "./"}]})
+        self.assert_fails("source must be a git url source")
+        # A version on the entry competes with plugin.json.
+        entry = self.market()
+        entry["version"] = "9.9.9"
+        self.write_market({"name": "m", "owner": {"name": "o"}, "plugins": [entry]})
+        self.assert_fails("drop 'version' from the entry")
+        # Malformed files give a message, not a traceback.
+        for bad in ([], {"plugins": []}, {"plugins": ["x"]}):
+            self.write_market(bad)
+            rc, out = self.pin()
+            self.assertEqual(rc, 1, out)
+            self.assertNotIn("Traceback", out)
+
+
+class TestVersion(unittest.TestCase):
+    def test_cli_version_matches_the_plugin_manifest(self):
+        with open(os.path.join(REPO, ".claude-plugin", "plugin.json")) as f:
+            version = json.load(f)["version"]
+        r = subprocess.run([sys.executable, CXD, "--version"], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, universal_newlines=True)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "cxd " + version))
+
+
 if __name__ == "__main__":
     unittest.main()

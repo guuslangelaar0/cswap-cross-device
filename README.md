@@ -97,6 +97,11 @@ claude plugin marketplace add guuslangelaar0/cswap-cross-device
 claude plugin install cswap-cross-device@cswap-cross-device
 ```
 
+The marketplace installs the latest [release](https://github.com/guuslangelaar0/cswap-cross-device/releases):
+its entry is pinned to the release tag and to that tag's commit, so `main` can move ahead
+without changing what you install. CI checks that the pin, the tag and the plugin version
+agree.
+
 With cswap, each account has its own Claude Code profile, so install the plugin once per
 account that should run the hooks or use `cxd`:
 
@@ -123,6 +128,19 @@ cxd doctor
 `cxd init` writes `~/.cxd/config.json` and links `~/.cxd/bin/cxd` to the copy of `cxd` it
 was run from; peers run that path over ssh. Re-run `cxd init` (no flags needed) after the
 plugin updates. To use `cxd` from a plain terminal, add `~/.cxd/bin` to your `PATH`.
+
+**Upgrade** to a new release, per account (with cswap, replace `claude` with
+`cswap run <account> --`):
+
+```bash
+claude plugin marketplace update cswap-cross-device
+claude plugin update cswap-cross-device@cswap-cross-device
+```
+
+Then, on every machine, run `cxd init` and `cxd doctor` from a new Claude Code session. Its
+`cxd` is the updated plugin, so `~/.cxd/bin/cxd` (the path peers use) moves to the new
+version. Run from an older session or a terminal, `cxd init` would link the copy it runs
+from.
 
 ## Quick start
 
@@ -276,7 +294,7 @@ See [SECURITY.md](SECURITY.md) to report a vulnerability.
 | Path | What |
 | --- | --- |
 | `.claude-plugin/plugin.json` | plugin manifest |
-| `.claude-plugin/marketplace.json` | marketplace `cswap-cross-device` (plugin source `./`) |
+| `.claude-plugin/marketplace.json` | marketplace `cswap-cross-device` (plugin source pinned to the latest release tag and its commit) |
 | `bin/cxd` | CLI entry point (on the Bash tool's `PATH` while the plugin is enabled) |
 | `lib/cxd/cli.py` | argument parsing, watch client, `_rpc` endpoint, `init` |
 | `lib/cxd/transport.py` | `Transport`, `LocalTransport`, `SshTransport`, host resolution |
@@ -296,7 +314,10 @@ See [SECURITY.md](SECURITY.md) to report a vulnerability.
 python3 -m unittest discover -s tests      # plumbing tests, with a stub claude (no account needed)
 python3 tests/mutate.py                    # every guard must go red under its mutation
 scripts/check-secrets.sh --self-test       # the secret check must catch planted fake tokens
+python3 scripts/check-release-pin.py       # the marketplace pins a released tag (needs the tags)
 ```
+
+Releases follow the steps in [CONTRIBUTING.md](CONTRIBUTING.md#releasing).
 
 ## Contributing
 

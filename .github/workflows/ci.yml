@@ -49,12 +49,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0  # the release tags, for the marketplace pin check
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.9"
       - name: Byte-compile on the oldest supported Python
         run: |
-          python -m py_compile bin/cxd tests/fakes/cswap tests/fakes/ssh
+          python -m py_compile bin/cxd tests/fakes/cswap tests/fakes/ssh scripts/check-release-pin.py
           python -m compileall -q lib tests
       - name: Shell syntax
         run: |
@@ -65,6 +66,8 @@ jobs:
           for f in .claude-plugin/plugin.json .claude-plugin/marketplace.json hooks/hooks.json; do
             python -m json.tool "$f" > /dev/null
           done
+      - name: Marketplace installs a released commit (tag + sha + version agree)
+        run: python scripts/check-release-pin.py
       - name: Secret check self-test (must catch planted fake secrets)
         run: scripts/check-secrets.sh --self-test
       - name: Secret check over the tree

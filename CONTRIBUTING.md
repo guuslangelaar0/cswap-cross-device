@@ -21,7 +21,15 @@ Thanks for helping. Changes come in through forks and pull requests; nobody push
    python3 tests/mutate.py
    scripts/check-secrets.sh --self-test
    scripts/check-secrets.sh --all
+   python3 scripts/check-release-pin.py
    ```
+
+   In a fork, the pin check needs this repository's release tags:
+   `git fetch --tags https://github.com/guuslangelaar0/cswap-cross-device.git`.
+
+   To try your change in Claude Code itself, load your working tree as a plugin:
+   `claude --plugin-dir .` (with cswap: `cswap run <account> -- --plugin-dir .`). The
+   marketplace installs releases only, so adding it does not test your branch.
 
 6. **Open a pull request** against `main`. Fill in the template: what changed, why, and how
    you verified it.
@@ -48,6 +56,33 @@ Thanks for helping. Changes come in through forks and pull requests; nobody push
   by name.
 - No machine names, account names, user names, home paths or IP addresses in code, tests or
   docs. Use the neutral examples `laptop`, `buildbox`, `work`, `personal` and `w1`.
+
+## Releasing
+
+The marketplace installs the latest release, never `main`: its plugin entry has a git `url`
+source pinned to the release tag (`ref`) and to that tag's commit (`sha`).
+`scripts/check-release-pin.py` (run in CI) fails unless:
+- the tag exists and is the newest `vX.Y.Z` tag;
+- the `sha` is its commit, and that commit is merged;
+- the `plugin.json` at that commit carries the tag's version, the entry's name and the
+  entry's `url` as its `repository`.
+
+Release tags are protected by a ruleset (no updates or deletions). A release takes two pull
+requests, with the tag between them:
+
+1. **Bump.** Set the new version in `.claude-plugin/plugin.json` and in `VERSION` in
+   `lib/cxd/common.py` (a test checks that they agree). Merge when CI is green.
+2. **Tag** (not a pull request). Create the release on the merge commit, with authored notes
+   (an intro, What's New, Fixes, Verification, Install/Upgrade). Until step 3 lands, the pin
+   check fails on every pull request, because a newer release exists than the one pinned:
+   `gh release create vX.Y.Z --target <full merge sha> --title "vX.Y.Z: …" --notes-file notes.md`
+3. **Pin.** Point the marketplace entry at the release: `ref` `vX.Y.Z` and `sha` the full
+   commit of the tag. Merge when CI is green. Installs and `claude plugin update` pick the
+   release up from here, so merge this one right after the tag.
+
+Tags cannot be moved or deleted. If a release turns out wrong (bad code, or a tag on the
+wrong commit), do not try to repair it: release a fixed `vX.Y.Z+1` the same way, which also
+unblocks the pin check. Only tags merged into the checked history count as "newest".
 
 ## Secrets
 
