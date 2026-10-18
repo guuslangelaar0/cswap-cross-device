@@ -5,9 +5,12 @@ ev="$1"
 d="${CXD_HOME:-$HOME/.cxd}"
 case "$ev" in
   PostToolUse|UserPromptSubmit)
-    # Fast path: nothing queued for any session -> skip Python entirely.
-    set -- "$d"/inbox/*/*.json
-    if [ ! -e "$1" ]; then cat >/dev/null 2>&1; exit 0; fi
+    # Fast path: nothing queued or claimed for any session -> skip Python entirely.
+    mail=
+    for f in "$d"/inbox/*/*.json "$d"/claimed/*/*.json; do
+      if [ -e "$f" ]; then mail=1; break; fi
+    done
+    if [ -z "$mail" ]; then cat >/dev/null 2>&1; exit 0; fi
     ;;
 esac
 root="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)" || exit 0

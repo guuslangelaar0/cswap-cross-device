@@ -5,8 +5,8 @@ break the session it runs in.
 
 SessionStart      register ~/.cxd/sessions/<sid>.json (pid, cwd, config dir)
 PostToolUse       \
-UserPromptSubmit   > claim queued inbox messages, return them as additionalContext
-Stop              /  (Stop also appends last_assistant_message to the outbox)
+UserPromptSubmit   > claim queued inbox messages, return them as additionalContext,
+Stop              /  ack them once written (Stop also records last_assistant_message)
 SessionEnd        mark the session ended
 """
 
@@ -74,10 +74,56 @@ def mark_ended(sid, reason):
     atomic_write_json(p, rec)
 
 
+# At-least-once delivery. A hook claims a message by renaming it from inbox/
+# to claimed/<sid>/<id>.claim-<pid>-<hash>.json, where <hash> fingerprints the
+# hook process's start identity: os.rename is atomic, so racing hooks (parallel
+# tool calls) each claim different messages, and a recycled pid cannot pass for
+# the claimer. Only after the hook has written its output does it move the
+# claim to delivered/ (the ack). Every hook of the session first returns claims
+# whose claimer has died to the inbox, so a hook that is killed, times out or
+# cannot write its output loses nothing; the message comes again.
+
+def claim_token(pid=None):
+    import hashlib
+    pid = pid or os.getpid()
+    ident = proc_identity(pid) or "unknown"
+    return "%d-%s" % (pid, hashlib.sha1(ident.encode("utf-8")).hexdigest()[:12])
+
+
+def _claimer_alive(token):
+    pid, _, digest = token.partition("-")
+    try:
+        pid = int(pid)
+    except ValueError:
+        return False
+    if pid == os.getpid():
+        return True
+    return claim_token(pid) == "%d-%s" % (pid, digest)
+
+
+def recover_claims(sid):
+    """Put messages claimed by hooks that have died back in the inbox."""
+    claimed = path("claimed", sid)
+    try:
+        names = os.listdir(claimed)
+    except OSError:
+        return
+    inbox = None
+    for n in names:
+        mid, sep, rest = n.partition(".claim-")
+        if not sep or not rest.endswith(".json") or _claimer_alive(rest[:-5]):
+            continue
+        inbox = inbox or ensure_dir(path("inbox", sid))
+        try:
+            os.rename(os.path.join(claimed, n), os.path.join(inbox, mid + ".json"))  # GUARD:redeliver
+        except OSError:
+            pass  # another hook requeued it first
+
+
 def claim_inbox(sid):
-    """Move queued messages to delivered/ one by one. os.rename is atomic, so
-    when several hooks race (parallel tool calls) each message is claimed by
-    exactly one of them."""
+    """Claim queued messages, oldest first, within the context budget.
+    Returns [(message, claimed_path)]."""
+    recover_claims(sid)
     inbox = path("inbox", sid)
     try:
         names = sorted(n for n in os.listdir(inbox) if n.endswith(".json") and not n.startswith("."))
@@ -85,26 +131,41 @@ def claim_inbox(sid):
         return []
     if not names:
         return []
-    done = ensure_dir(path("delivered", sid))
-    msgs, used = [], 0
+    claimed = ensure_dir(path("claimed", sid))
+    token = claim_token()
+    got, used = [], 0
     for n in names:
         src = os.path.join(inbox, n)
         try:
             size = os.path.getsize(src)
         except OSError:
             continue
-        if msgs and used + size > CONTEXT_BUDGET:
+        if got and used + size > CONTEXT_BUDGET:
             break  # leave the rest for the next hook
-        dst = os.path.join(done, n)
+        dst = os.path.join(claimed, "%s.claim-%s.json" % (n[:-5], token))
         try:
             os.rename(src, dst)
         except OSError:
             continue  # another hook claimed it
         m = read_json(dst, None)
         if m:
-            msgs.append(m)
+            got.append((m, dst))
             used += size
-    return msgs
+    return got
+
+
+def ack(sid, claims, event):
+    """The hook's output is written: the claimed messages are delivered."""
+    done = ensure_dir(path("delivered", sid))
+    ensure_dir(path("outbox"))
+    for m, claimed in claims:
+        try:
+            os.rename(claimed, os.path.join(done, os.path.basename(claimed).partition(".claim-")[0] + ".json"))
+        except OSError:
+            continue
+        append_jsonl(path("outbox", sid + ".jsonl"), {
+            "ts": now_iso(), "kind": "delivered", "session_id": sid, "id": m.get("id"),
+            "event": event, "text": (m.get("text") or "")[:200]})
 
 
 def _fmt_time(ts):
@@ -114,8 +175,8 @@ def _fmt_time(ts):
 def format_messages(msgs):
     parts = []
     for m in msgs:
-        parts.append("Message from the lead session %s at %s: %s" % (
-            m.get("sender") or "unknown", _fmt_time(m.get("ts")), m.get("text") or ""))
+        parts.append("Message from the lead session %s at %s (cxd message %s): %s" % (
+            m.get("sender") or "unknown", _fmt_time(m.get("ts")), m.get("id") or "?", m.get("text") or ""))
     text = "\n\n".join(parts)
     if len(text) > CONTEXT_BUDGET:
         text = text[: CONTEXT_BUDGET - 40] + "\n[message truncated by cxd]"
@@ -123,24 +184,20 @@ def format_messages(msgs):
 
 
 def handle(event, data):
+    """Returns (output or None, claims to ack once the output is written)."""
     sid = data.get("session_id")
     if not isinstance(sid, str) or not SID_RE.match(sid):
-        return None
+        return None, []
     if event == "SessionStart":
         register(data)
     elif event == "SessionEnd":
         mark_ended(sid, data.get("reason"))
-        return None
-    ctx = None
+        return None, []
+    ctx, claims = None, []
     if event in ("SessionStart", "PostToolUse", "UserPromptSubmit", "Stop"):
-        msgs = claim_inbox(sid)
-        if msgs:
-            ctx = format_messages(msgs)
-            ensure_dir(path("outbox"))
-            for m in msgs:
-                append_jsonl(path("outbox", sid + ".jsonl"), {
-                    "ts": now_iso(), "kind": "delivered", "session_id": sid, "id": m.get("id"),
-                    "event": event, "text": (m.get("text") or "")[:200]})
+        claims = claim_inbox(sid)
+        if claims:
+            ctx = format_messages([m for m, _ in claims])
     if event == "Stop":
         ensure_dir(path("outbox"))
         last = data.get("last_assistant_message")
@@ -150,23 +207,28 @@ def handle(event, data):
             "ts": now_iso(), "kind": "stop", "session_id": sid,
             "text": (last or "")[:OUTBOX_TEXT], "stop_hook_active": bool(data.get("stop_hook_active"))})
     if ctx:
-        return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": ctx}}
-    return None
+        return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": ctx}}, claims
+    return None, claims
 
 
 def main(event):
-    out = None
+    out, claims, sid = None, [], None
     try:
         raw = sys.stdin.read()
         data = json.loads(raw) if raw.strip() else {}
         if isinstance(data, dict):
-            out = handle(event, data)
+            sid = data.get("session_id")
+            out, claims = handle(event, data)
     except Exception:
-        out = None
+        out = None  # claims stay claimed by this process; the next hook requeues them
     if out:
         try:
             sys.stdout.write(json.dumps(out))
             sys.stdout.flush()
+        except Exception:
+            return 0  # not handed over: no ack, so the messages come again
+        try:
+            ack(sid, claims, event)  # GUARD:ack-after-write
         except Exception:
             pass
     return 0

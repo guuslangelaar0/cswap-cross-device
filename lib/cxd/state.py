@@ -13,7 +13,9 @@ Layout under ~/.cxd (mode 700 throughout):
         err.log         stderr
     sessions/<sid>.json registered by the SessionStart hook (any session, any account)
     inbox/<sid>/*.json  messages waiting for a hook to deliver them
-    delivered/<sid>/    messages a hook has claimed (moved here exactly once)
+    claimed/<sid>/      messages a hook has claimed and not yet handed over
+                        (<id>.claim-<pid>-<hash>.json; requeued if that hook died)
+    delivered/<sid>/    messages a hook has handed over (moved here once acked)
     outbox/<sid>.jsonl  Stop reports, `cxd notify` lines, delivery receipts
 """
 
@@ -708,8 +710,10 @@ def op_list(args):
             alive = session_alive(rec)
             if not alive and not show_all:
                 continue
-            inbox = path("inbox", rec.get("session_id", ""))
-            pending = len([m for m in os.listdir(inbox) if m.endswith(".json")]) if os.path.isdir(inbox) else 0
+            pending = 0
+            for box in ("inbox", "claimed"):  # claimed: handed to a hook, not yet acknowledged
+                d = path(box, rec.get("session_id", ""))
+                pending += len([m for m in os.listdir(d) if m.endswith(".json")]) if os.path.isdir(d) else 0
             sessions.append({
                 "session_id": rec.get("session_id"), "alive": alive, "account": rec.get("account"),
                 "cwd": rec.get("cwd"), "registered": rec.get("registered"), "pid": rec.get("pid"),
