@@ -1,42 +1,44 @@
 # Design: the broker transport
 
-Status: proposed. Implementation follows in small pull requests (see the end of this document).
+**Status:** proposed, revision 2 (after review). Implementation follows in small pull requests; see the end of this document.
 
-`cxd` reaches other machines over ssh. Each operation is one `ssh <alias> cxd _rpc`, and `cxd watch` holds a stream open. That works well, but every pair of machines needs an ssh alias and a key. The broker adds a second transport: a small mesh of `cxd` agents, one per machine, that carries the same operations. Paired machines reach each other through it, and ssh stays as the automatic fallback.
+`cxd` reaches other machines over ssh. Each operation is one `ssh <alias> cxd _rpc`, and `cxd watch` holds a stream open. That works well, but every pair of machines needs an ssh alias and a key.
+
+The broker adds a second transport: a small mesh of `cxd` agents, one per machine, that carries the same operations. Machines that have paired reach each other through it, and ssh stays as the automatic fallback.
 
 The design follows the owner's requirement, in his words: *"Dual support, dynamic master - slave handling"*:
 
 - **Dual support.** The broker and ssh both carry every operation, and `cxd` picks one per call.
-- **Dynamic master.** One agent holds a lease as the master. When the lease lapses, the highest-priority reachable agent takes over. A recovered agent does not preempt the master.
+- **Dynamic master.** One agent holds a lease as the master. When the lease lapses, the highest-priority reachable agent takes over. A recovered agent does not preempt it.
 
 ## Goals
 
-1. **Self-hosted.** Python standard library and TLS only: no third-party packages, services or relays, and nothing outside the machines you pair. Certificates come from the system `openssl` binary, a system tool like `ssh`, because the standard library cannot generate keys.
+1. **Self-hosted.** Python standard library and TLS only: no third-party packages, no third-party services, no relays outside the paired machines. The system `openssl` binary is a system tool like `ssh`; it generates the certificates, because the standard library cannot generate keys.
 2. **One agent per machine** (`cxd agent`), running as the user. It owns this machine's identity, keeps links to the other members, and executes the operations addressed to this machine, exactly as `cxd _rpc` does today.
-3. **Pairing a machine takes two commands:**
-   - `cxd join <addr>` on the new machine shows a short code;
+3. **Pairing a machine takes two commands at a terminal:**
+   - `cxd join <addr>` on the new machine shows a short code.
    - `cxd accept <code>` on *any* member admits it.
-4. **Dynamic master with a lease.** When the lease lapses, the highest-priority reachable member promotes itself. There is no preemption.
-5. **At-least-once delivery** of every request, with ids and deduplication, so retries (including a retry over ssh) never execute an operation twice.
-6. **Automatic ssh fallback** when no master is reachable, or when the target cannot be reached through the broker.
+4. **A dynamic master with a lease.** When the lease lapses, the highest-priority reachable member promotes itself. There is no preemption: a restarted or reconnecting member never takes over from a master that is serving.
+5. **At-least-once delivery** of every request, with ids and deduplication. A retry, including one over ssh, never executes an operation twice.
+6. **Automatic ssh fallback** when no master is reachable, or when the broker cannot reach the target.
 7. **Same commands.** The broker plugs in behind the existing `Transport` interface (`call`, `stream`), so `cxd start/send/watch/stop/resume/list/doctor` do not change.
 
 ## Non-goals
 
-- **No NAT traversal or relays on the internet.** Members must reach each other directly, on a LAN or a VPN. One direction is enough (see Links).
-- **No multi-user meshes.** All members belong to one person; the trust boundary is your own machines (see Threat model).
-- **No consensus-grade replication.** With two machines there is no majority. The design accepts a short split brain during a partition and heals it deterministically (see Lease and election).
+- **NAT traversal, and relays on the internet.** Members must reach each other directly, on a LAN or a VPN. One direction per pair is enough (see Links).
+- **Multi-user meshes.** All members belong to one person. The trust boundary is your own machines (see Threat model).
+- **Consensus-grade replication.** With two machines there is no majority. The design keeps a single master in the normal cases, including a restart. It accepts a short split brain only when a partition really separates groups of members, and it heals that deterministically.
 
 ## Terms
 
 | Term | Meaning |
 | --- | --- |
 | member | a machine admitted to the mesh; it runs one agent |
-| node id | a member's stable id: the SHA-256 fingerprint of its certificate, hex |
-| name | the member's `cxd` host name (`self` in config.json), used in commands |
+| node id | a member's stable id: the SHA-256 fingerprint of its certificate's DER, in hex |
+| name | the member's `cxd` host name (`self` in config.json), used in commands; unique in the mesh |
 | link | one TLS connection between two members, usable in both directions |
 | master | the member holding the current lease |
-| term | a counter that grows with every new lease holder; it orders masters |
+| term | a counter that grows with every new lease holder and orders masters |
 | request | one operation (`op`, `args`) addressed to a member, with a unique id |
 
 ## Architecture
@@ -58,163 +60,262 @@ flowchart LR
   A1 <-. "direct link, if reachable" .-> A3
 ```
 
-- **The CLI talks only to its local agent**, over a unix socket at `~/.cxd/agent/agent.sock` (mode 600, inside the mode 700 home). File permissions do the authentication, exactly as for the rest of `~/.cxd`.
-- **Agents talk to each other over TLS links** with mutual authentication (below).
-- **Routing.** A request from the laptop to buildbox goes over a direct link when one exists, and through the master otherwise. The master relays: it forwards requests and replies between links it holds.
-- **Execution.** The target agent runs the operation with the same `state.OPS` functions that `cxd _rpc` uses, and streams `state.stream()` for `watch`.
+- **The local socket.** The CLI talks only to its local agent, over a unix socket at `~/.cxd/agent/s`. The name is short because macOS limits socket paths to 104 bytes. The socket has mode 600 inside the mode 700 home, so file permissions do the authentication, as for the rest of `~/.cxd`.
+- **Links.** Agents talk to each other over mutually authenticated TLS links (below).
+- **Routing.** A request from the laptop to buildbox goes over a direct link when one exists, and through the master otherwise. The master relays.
+- **Execution.** The target agent runs the operation with the same `state.OPS` functions that `cxd _rpc` uses. For `watch` it streams `state.stream()`.
+- **One agent per machine.** An agent holds `~/.cxd/agent/lock` (flock) while it runs, so a second agent on the same machine exits at once.
+- **Version check.** An agent runs the code it was started with. `cxd doctor` warns when the agent's version differs from the installed `cxd`, for example after a plugin update. Restart the agent to pick up the new code.
 
 ### Links
 
-A link is a long-lived TLS connection. Either side may have dialed it; once up it carries traffic both ways. Every agent keeps trying (with backoff, every 2 to 60 seconds) to keep a link to:
+A link is a long-lived TLS connection. Either side may have dialed it; once up, it carries traffic both ways.
 
-- the master, always;
-- every other member whose address it knows, best effort.
+**Who dials.** Every agent keeps trying to keep a link to the master, always, and best effort to every other member whose address it knows. It retries with backoff from 2 to 60 seconds.
 
-Because one direction is enough, a member that accepts no inbound connections still works. Two examples: a WSL2 instance behind Windows NAT, or a laptop behind a firewall. The other side dials it, or both dial the master.
+**One direction is enough.** A member that accepts no inbound connections still works, because the other side dials it or both dial the master. Examples are a WSL2 instance behind Windows NAT, or a laptop behind a firewall.
 
-Members advertise the addresses they listen on (`listen` in config.json, for example `0.0.0.0:47100`). Each member also remembers the address it last saw a peer connect from.
+**Addresses.**
+- `listen` in config.json (for example `0.0.0.0:47100`) is what the agent binds.
+- `advertise` (for example `192.168.1.20:47100`, or a Windows host address and forwarded port for WSL2) is what it tells other members. A wildcard is never advertised.
+- Each member also remembers the address a peer last connected from.
+
+**Checks.** A dialer checks that the peer's node id is the member it meant to reach. A `hello` whose node is the agent itself, which happens when it dialed one of its own addresses, closes the link.
 
 ## Identity and TLS
 
-- **Keys.** On first use, each agent creates an EC P-256 key and a self-signed certificate, valid for 10 years, in `~/.cxd/agent/` (`key.pem` mode 600, `cert.pem`):
+**Keys.** On first use each agent creates an EC P-256 key and a self-signed certificate, valid for 10 years, in `~/.cxd/agent/`:
+- `key.pem` is created with umask 077, so it has mode 600;
+- the certificate is `cert.pem`.
 
-  ```text
-  openssl ecparam -name prime256v1 -genkey -noout -out key.pem
-  openssl req -new -x509 -key key.pem -out cert.pem -days 3650 -subj /CN=cxd-agent
-  ```
+The certificate's subject is unique: `CN=cxd-<16 random hex>`. Openssl gets an explicit `-config` file with the extensions below, so the result does not depend on the system's `openssl.cnf`:
 
-  Both OpenSSL and LibreSSL (macOS) accept these commands. The node id is the SHA-256 of the certificate's DER encoding.
-- **Pinning, not a CA.** Each member keeps the certificates of all members in `~/.cxd/agent/members.json` and writes them into a CA bundle, `~/.cxd/agent/trust.pem`. Both TLS contexts load that bundle and require a peer certificate (`CERT_REQUIRED`), so only member certificates complete a handshake. A self-signed certificate is its own CA, so the standard verification is exact pinning. Host names are not checked; the pinned certificate *is* the identity.
-- **Protocol floor: TLS 1.2.** The `python3` that ships with macOS is linked against LibreSSL 2.8, which has no TLS 1.3. Ciphers are restricted to ECDHE key exchange with AES-GCM or ChaCha20-Poly1305. TLS 1.3 is negotiated where both sides support it. Compression and renegotiation are off.
-- **After the handshake**, each side checks that the peer's node id is in `members.json` and not revoked, then exchanges a `hello` (below).
+```text
+openssl ecparam -name prime256v1 -genkey -noout -out key.pem
+openssl req -new -x509 -key key.pem -out cert.pem -days 3650 -config cxd-req.cnf -extensions cxd
+# cxd-req.cnf, written per agent: [req] prompt=no, distinguished_name=dn; [dn] CN=cxd-<id>;
+#   [cxd] basicConstraints=critical,CA:TRUE  keyUsage=critical,digitalSignature,keyCertSign
+#         subjectKeyIdentifier=hash  authorityKeyIdentifier=keyid
+```
+
+The CN goes in the config, not `-subj`: LibreSSL ignores `-subj` when the config sets `prompt = no`.
+
+Unique subjects and key identifiers let OpenSSL pick the right anchor out of a bundle of several self-signed certificates. With identical subjects and no key identifier it tries only the first one, and every other member fails verification. The node id is the SHA-256 of the certificate's DER encoding.
+
+This was checked before implementing, on OpenSSL 3.6 with Python 3.14 and on macOS's LibreSSL 2.8.3 with Python 3.9.6. Two members pinned through one bundle both verify; a client without a certificate completes a `CERT_OPTIONAL` handshake and is seen as having none; an unpinned certificate is refused.
+
+**Pinning, not a CA.**
+- **Trust bundle.** Each member keeps the certificates of all non-revoked members in the replicated state (below). It writes them to a CA bundle, `~/.cxd/agent/trust.pem`.
+- **Verification.** TLS verifies the peer against that bundle. A self-signed certificate is its own CA, so the standard verification amounts to exact pinning.
+- **Host names** are not checked: the pinned certificate *is* the identity.
+- **Rebuilding.** An `SSLContext`'s trust store only grows, so the agent builds new contexts after every membership change and closes links whose peer is no longer trusted.
+
+**One listener, two kinds of client.** The server context uses `CERT_OPTIONAL` with the trust bundle loaded:
+- a member presents its pinned certificate, which must verify;
+- a joining machine presents **no** certificate, and its connection may carry only `join` messages.
+
+A client certificate that fails verification aborts the handshake. Under TLS 1.3 the client notices only at its first read, so the client treats a closed link right after the handshake as an authentication failure.
+
+**Protocol floor: TLS 1.2.** The `python3` that ships with macOS is linked against LibreSSL 2.8, which has no TLS 1.3.
+- **Ciphers** are restricted to ECDHE key exchange with AES-GCM or ChaCha20-Poly1305.
+- **TLS 1.3** is used where both sides support it.
+- **Compression and renegotiation** are disabled (`OP_NO_COMPRESSION`, and `OP_NO_RENEGOTIATION` where Python offers it).
+
+**After the handshake** each side checks that the peer's node id is a member and not revoked. Then both exchange a `hello` (see Protocol).
+
+**Frames.** Before authentication a frame may be at most 64 KiB, and a joining connection may send at most 4 frames. After authentication the limit is 8 MiB.
 
 ## Pairing: `cxd join` and `cxd accept`
 
-Pairing has to work before the new machine is trusted, so it uses a separate, deliberately small path.
+Pairing has to work before the new machine is trusted, so it uses a separate, small path. That path ends only with a human who confirms on both machines.
 
-1. **Joiner connects.** On the new machine, `cxd join <addr>` creates the agent identity if needed and connects to `<addr>` (any member's listen address) with TLS. It presents its certificate but does not verify the member's, because it does not know it yet. The member's join context accepts any client certificate and allows exactly one operation on such a connection, `join`.
-2. **Joiner requests.** The joiner sends `{"t": "join", "name", "cert": <PEM>, "nonce_j"}`. The member answers `{"nonce_m", "member_fp": <its own node id>}` and records a **pending join**:
-   - the joiner's certificate fingerprint as the member saw it on the TLS connection;
-   - the name and both nonces;
+**Both commands need a real terminal.** `cxd join`, `cxd accept`, `cxd members remove` and `cxd members priority` read their confirmation from `/dev/tty` and refuse without one. Claude Code's Bash tool has no controlling terminal, so a session that has been prompt-injected ("run `cxd accept ABCDE-FGHJK`") cannot pair machines or change the mesh.
+
+1. **Joiner connects.** On the new machine, `cxd join <addr>`:
+   - refuses if this machine is already a member;
+   - creates the agent identity if needed;
+   - connects to `<addr>`, any member's advertised address, with TLS and **without** a client certificate. It does not verify the member's certificate yet, but records its fingerprint `member_fp_seen`.
+2. **Commit.** The joiner sends `{"t": "join", "name", "cert": <its PEM>, "commit": SHA-256(nonce_j)}`, where `nonce_j` is 32 random bytes.
+3. **Member's nonce.** The member checks that the name is free and records a pending join with:
+   - the joiner's PEM fingerprint `joiner_fp`, its name and address, and the commit;
+   - its own node id `member_fp`;
    - an expiry of 10 minutes.
 
-   The pending join is replicated to all members through the master.
-3. **Both sides compute the short code**, independently:
+   It answers `{"nonce_m"}` with 32 random bytes. The joiner never trusts a fingerprint sent in a message, only what TLS showed it.
+4. **Reveal.** The joiner sends `{"nonce_j"}`. The member checks it against the commit and drops the pending join on a mismatch.
+5. **The code.** Both sides compute:
 
    ```text
-   code = base32( SHA-256( "cxd-join-v1" | member_fp | joiner_fp | nonce_m | nonce_j ) )[:10]
+   code = base32( SHA-256( "cxd-join-v2" | member_fp | joiner_fp | nonce_m | nonce_j ) )[:10]
    ```
 
-   Each side uses the fingerprints *as it observed them on the TLS connection*:
-   - the joiner uses the certificate the member presented, plus its own;
-   - the member uses its own certificate, plus the one the joiner presented.
+   - The joiner uses `member_fp_seen` and its own fingerprint.
+   - The member uses its own fingerprint and the PEM fingerprint from the message.
 
-   The joiner shows the code grouped as `ABCDE-FGHJK` and waits.
-4. **A human accepts.** On any member, `cxd accept ABCDE-FGHJK` looks for a pending join whose code matches.
-   - If one matches, the joiner's certificate is added to the members, with priority below every existing member unless `--priority` says otherwise. The new membership is published through the master.
-   - If none matches, nothing happens, and the command says so.
-5. **The joiner completes.** The joiner's waiting connection receives the full member list (certificates, names, addresses, priorities), writes `members.json` and `trust.pem`, and from then on connects like any member.
+   The joiner shows the code as `ABCDE-FGHJK`, with the member's name and address, and waits.
+6. **Accept.** On any member, `cxd accept ABCDE-FGHJK` looks for a pending join with that code. It shows the joiner's name, the address it connected from, and its fingerprint, then asks for confirmation at the terminal. Accepting adds the joiner as a member, with priority below every existing member unless `--priority` says otherwise.
+7. **Join completes.** The joiner's waiting connection receives the replicated state. The joiner writes its trust bundle and from then on connects like any member.
 
-**Why the code.** A man in the middle between joiner and member has to present its own certificate to each side, so the two sides compute codes from different fingerprints and the codes differ. The human compares what the joiner shows with what `accept` checks. 10 base32 characters are 50 bits, so a guessed or forced match is out of reach within the 10-minute window. A member also rate-limits pending joins: at most 5 at a time, and the oldest is dropped first. A wrong code is never confirmed to the joiner side.
+**Why this is safe.**
+- **A man in the middle** must show its own certificate to each side, so the two sides compute codes from different fingerprints.
+- **Grinding the code is impossible.** The joiner commits to its nonce before it sees the member's, and the member's nonce is fixed before the joiner reveals. A man in the middle cannot search for nonces that make the two codes match, so its chance per attempt is 2^-50.
+- **Each attempt costs a pending join**, which a human must also accept.
 
-**Leaving.** `cxd members remove <name>` (on any member) revokes a member. Its fingerprint is removed from every `trust.pem` through the master, and its links are closed.
+**Limits.**
+- **Per member.** A member keeps at most 5 pending joins. When full it refuses new ones rather than evicting old ones, so a flood cannot push out a real join.
+- **Per address.** It accepts at most one join attempt per source address every 10 seconds.
+- **Replication.** Pending joins are replicated through the master, so that `accept` works on any member. Without a reachable master, `accept` works only on the member that received the join.
+
+**The first member.** `cxd agent start` on a machine with `listen` set and no mesh creates a mesh of one, with itself as the master at term 1.
+
+**Leaving.** `cxd members remove <name>`, on any member, revokes a member (see Revocation).
+
+## Replicated state
+
+Each agent keeps one state file, `~/.cxd/agent/state.json`:
+
+```text
+{ "members": { node_id: {name, cert, advertise, priority, rev} },
+  "revoked": { node_id: {name, at} },
+  "pending_joins": [ ... ],
+  "lease": {"term": t, "master": node_id} }
+```
+
+- **Membership entries** carry a revision `rev` that only the master increments. Merging two states keeps, per member, the entry with the higher `rev`.
+- **Revocation is sticky and needs no master.**
+  - `cxd members remove` adds the node to `revoked` locally at once and drops its links. The revoked node is removed from the trust bundle.
+  - Revocations travel in every `hello` and every state message, and merge by union, whatever the term.
+  - A revoked node id is never trusted again. Re-pairing the machine creates a new key, and so a new node id.
+  - Every lease or state message that comes from, or names as master, a revoked node is ignored.
 
 ## Lease and election
 
-Membership and the lease are the only replicated state. They live in `~/.cxd/agent/state.json`:
+- **Holding the lease.** The master holds a lease of `LEASE = 15 s` and renews it every `LEASE / 3`. A renewal `{"t": "lease", "term", "master", "seq", "remaining"}` carries the seconds left, not an absolute time. A receiver sets its own deadline to its monotonic clock plus `remaining`, so the wall clocks of different machines never matter.
+- **Forwarding.** Members forward a renewal to their other links only if its `(term, seq)` is newer than what they have seen. That makes forwarding stop.
+- **Restart grace.** A starting agent never promotes during its first `2 x LEASE`. In that time it dials, receives renewals, and learns the master.
+- **Lapse and promotion.** A member that has seen no renewal for `LEASE + 3 s` treats the lease as lapsed. It then checks which members it can reach: those with a live link that answer a `ping` within 2 s.
+  - **Alone: no promotion.** If it can reach **no** other member, it does not promote. A master would serve nobody; its own requests to other machines fall back to ssh; and bumping the term would only let it preempt later.
+  - **Otherwise the highest priority wins.** If it can reach at least one other member, the reachable member with the highest priority promotes itself with `term + 1`, ties going to the lower node id. Every other member waits `LEASE` for that member's renewal before it checks again.
+- **No preemption.** A member that receives valid renewals never takes over, whatever its priority. A recovered high-priority member therefore joins as a follower, because the restart grace makes it hear the serving master first.
+- **When two masters meet.** This happens only after a partition that separated groups of members. When links come back:
+  1. the higher term wins;
+  2. on equal terms, the master with more followers wins;
+  3. then the higher priority;
+  4. then the lower node id.
 
-```text
-{ "version": n, "members": [{node_id, name, cert, addrs, priority, revoked}], "pending_joins": [...],
-  "lease": {"term": t, "master": node_id, "expires": <unix time> } }
-```
+  The loser steps down at once. Membership entries merge by `rev`, and revocations by union.
+- **Routing never needs exactly one master.** Requests carry their target and travel over any path that reaches it, so a split brain only changes which member relays.
 
-- **Holding the lease.** The master holds the lease for `LEASE = 15 s` and renews it every `LEASE / 3`. It sends the renewal (term, master, expiry) over every link, and members forward lease messages they receive to their other links.
-- **Who may change state.** Only the master changes membership: accept, remove, and priority changes. Each change bumps `version` and is pushed to every member, which keeps the highest version it has seen for the current term.
-- **When the lease lapses.** A member that has heard no renewal for `LEASE + skew` (skew 3 s) treats the lease as lapsed. It then checks which members it can reach: itself, plus every member with a live link that answers a `ping` within 2 s. If it has the highest priority among those (ties go to the lower node id), it promotes itself with `term + 1`. Otherwise it waits one more `LEASE` for the winner's renewal before checking again.
-- **No preemption.** A member never takes over while it hears valid renewals, even from a master with lower priority. A recovered high-priority member joins as a follower.
-- **Split brain and healing.** In a partition each side can elect a master; with two machines it always will. When links come back and two masters see each other:
-  - the higher term wins;
-  - with equal terms, the higher priority wins, then the lower node id;
-  - the other steps down at once.
+## Delivery: at-least-once, deduplicated, never twice
 
-  Membership changes made on the losing side during the partition are merged by version per member entry: a revocation always wins.
+Every request has an id, 128 random bits in hex. The CLI generates it once per logical operation, and it stays the same for every retry, including a retry over ssh.
 
-  Routing never depends on there being exactly one master. Requests carry their target and travel over any path that reaches it, so a split brain only affects which member relays.
-- **Clocks.** Expiry times are absolute but compared with the receiver's own clock. A member that sees an expiry more than `LEASE` in the future clamps it to `now + LEASE`. Clock skew therefore shortens or lengthens a lease by at most the skew, and never blocks failover.
-
-## Delivery: at-least-once, deduplicated
-
-Every request carries an id: 128 random bits, hex. The client generates it once per logical operation and reuses it for every retry, including a retry over ssh.
-
-- **Retry until answered.** The origin agent keeps the request until it has the reply. It resends over a new path when a link drops or the master changes, with backoff, until the caller's timeout.
-- **Deduplicate at the target.** The target agent records each executed request id with its reply in `~/.cxd/dedupe/<id>.json` before it answers. A request whose id is already recorded is answered from the record and not executed again. `cxd _rpc`, the ssh path, uses the same store. So a request that reached the target through the broker, and is retried over ssh after the broker reply was lost, runs once. Records expire after 24 hours, and the store is pruned like sessions.
-- **Streams.** `watch` already resumes from a cursor that the host owns. Over the broker, a stream carries the same messages (`hello`, `event` with cursor, `keepalive`, `end`). After any break, on either transport, the client resumes from its last cursor. That is the existing guarantee: no lost or repeated events, and only the owning host can report an exit.
-- **Ordering.** Requests from one client to one target are executed in the order the client issued them, because the CLI waits for each reply. Concurrent clients get no ordering guarantee, which is also true over ssh.
+- **Claim on arrival.** The target agent claims the id before it executes anything. It creates `~/.cxd/dedupe/<id>.json` exclusively (`O_EXCL`), as `{"state": "running", "pid", "ident"}`. Then it answers `accepted` to the origin and runs the operation. It replaces the record with `{"state": "done", "reply"}` before it answers with the reply.
+- **A duplicate never executes again.**
+  - If the claim is `running` and the executor is alive, the duplicate waits for the result.
+  - If the claim is `running` and the executor is dead, the duplicate gets the error `outcome_unknown` (exit 3).
+  - If the claim is `done`, the duplicate gets the recorded reply.
+  - If the claim is `cancelled`, the duplicate gets the error `cancelled`.
+- **The ssh path uses the same store.** `cxd _rpc` receives the id from `SshTransport`.
+- **Expiry.** Records expire after 24 hours and are pruned with the sessions.
+- **Origin retries until accepted.** The origin agent resends over a new path whenever a link drops or the master changes, until it gets `accepted`, a reply, or its timeout.
+  - **Relays prevent loops by path and hop limit.** Each request carries `path` (the node ids it went through) and `ttl` (4). A relay never sends a request back to a node already on its path. It never drops a request just because it has seen the id before, so a retry through the same master after a reconnect still goes through.
+  - **Replies go to the origin by node id,** over whatever link reaches it at the time, not back over the link the request came in on.
+- **Timeouts bound delivery, not the operation.** The broker timeout (`broker_timeout`, default 10 s) limits how long the origin waits for `accepted`. Once accepted, the call waits for the reply with the operation's own timeout: 90 s for start, up to 240 s for stop, 600 s for doctor. A long operation is therefore never duplicated or reported as failed while it is still running.
+- **Cancel.** When the CLI gives up before `accepted`, the origin sends `cancel`. The target marks the id `cancelled` unless it has already claimed it, so a late copy cannot execute. That keeps the meaning of exit 4: the host could not be reached, so nothing was decided. If the target had already claimed the id, the CLI reports `outcome_unknown`.
+- **Streams.** `watch` resumes from a cursor that the host owns. Over the broker a stream carries the same messages (`hello`, `event` with cursor, `keepalive`, `end`, `error`). After any break, on either transport, the client resumes from its last cursor, with no lost or repeated events. Only the owning host can report an exit.
+- **Ordering.** The CLI waits for each reply, so requests from one client to one target run in the order the client issued them. Concurrent clients get no ordering guarantee, the same as over ssh.
 
 ## Transport selection and ssh fallback
 
-`hosts.<name>.transport` in config.json takes one of three values:
+`hosts.<name>.transport` in config.json is one of:
 
 | Value | Behaviour |
 | --- | --- |
+| `local` | this machine (as today) |
 | `ssh` | as today |
-| `broker` | broker only. When unreachable the call fails with exit 4, so nothing is decided. |
-| `auto` | Default for a host that is a mesh member and also has ssh settings. It tries the broker first, and falls back to ssh **for that call** when any of these holds: the local agent is not running; no master is reachable and there is no direct link to the target; the target is not linked; or the broker attempt times out (`broker_timeout`, default 10 s). The fallback reuses the request id, so the target's dedupe store prevents a double execution. `watch` switches transports between reconnects in the same way. |
+| `broker` | broker only; when unreachable, the call fails with exit 4 |
+| `auto` | broker first, ssh per call (below) |
+
+**`auto` falls back to ssh for one call, before `accepted`,** when any of these holds:
+- the local agent is not running;
+- the broker reaches neither a master nor a direct link to the target;
+- the target is not linked;
+- `broker_timeout` passes.
+
+The fallback reuses the request id, so a broker copy that arrives later is answered from, or blocked by, the dedupe store. `watch` switches transports between reconnects in the same way.
+
+**Which value a host gets.**
+- **On joining,** `cxd join` and `cxd accept` set each mesh member's host entry to `auto` when it has ssh settings, and to `broker` when it has none.
+- **`cxd init --peer`** still writes `ssh`.
+- **An unknown name** that is a mesh member resolves to the broker.
 
 `cxd list`, `cxd doctor` and `cxd watch` show which transport carried each call, for example `via broker (master buildbox)` or `via ssh (broker: no master reachable)`.
 
 ## Protocol
 
-- **Framing.** Each message is one JSON object per line (UTF-8, `\n`-terminated), at most 8 MiB. A larger frame closes the link. Every message has a type `t`.
-- **Session start.** The first message on a link is a `hello` from each side, carrying:
-  - `v`, the broker protocol version (1);
-  - `node` and `name`;
-  - `term` and `version`, the sender's view of the lease and membership;
-  - `listen`, its advertised addresses.
+Messages are framed as one JSON object per line, UTF-8, ending with `\n`. The size limits are in Identity and TLS. Every message has a type `t`.
 
-  Mismatched protocol versions close the link with a reason.
+The first message on a member link is a `hello` from each side, carrying:
+- `v`, the broker protocol version (1);
+- `node`, `name` and `advertise`;
+- `term`, the sender's lease view;
+- its member revisions;
+- `revoked`, the full set.
+
+A mismatched protocol version closes the link with a reason.
 
 | `t` | Direction | Fields |
 | --- | --- | --- |
 | `hello` | both | see above |
-| `lease` | master to all, forwarded | `term`, `master`, `expires` |
-| `state` | master to all | full replicated state (on version change, and on demand) |
+| `lease` | master to all, forwarded while newer | `term`, `master`, `seq`, `remaining` |
+| `state` | master to all, and on request | replicated state (see Replicated state) |
 | `ping` / `pong` | both | `id` |
-| `req` | origin to target, via relays | `id`, `from`, `to`, `op`, `args`, `ttl` (hops left, starts at 4) |
+| `req` | origin to target, via relays | `id`, `from`, `to`, `op`, `args`, `path`, `ttl` |
+| `accepted` | target to origin | `id` |
 | `rep` | target to origin | `id`, `ok`, `result` or `error` and `code` |
-| `stream` / `end` | target to origin | `id`, `msg` (one `state.stream()` message) |
-| `cancel` | origin to target | `id`: the client is gone, so stop the stream |
-| `join` / `joined` | joiner and member, join context only | see Pairing |
-| `accept` | any member to master | `code`, `priority` |
+| `stream` / `end` / `error` | target to origin | `id`, `msg` (one `state.stream()` message) or `error` |
+| `cancel` | origin to target | `id` |
+| `join`, `nonce`, `reveal`, `joined` | join connection only | see Pairing |
+| `accept`, `remove`, `priority` | any member to master | the change; `remove` also applies locally at once |
 
-The local unix socket uses the same framing with two message types:
-- `call` (`op`, `args`, `to`, `id`), answered by `rep`;
-- `open` (stream), answered by `stream` and `end`.
+The local unix socket uses the same framing with two requests:
+- `call` (`op`, `args`, `to`, `id`) is answered by `accepted` and then `rep`;
+- `open` (a stream) is answered by `stream`, then `end` or `error`.
 
 ## Command line and configuration
 
 ```text
 cxd agent [start|stop|status|run]   run (foreground) is for systemd/launchd; start daemonizes
-cxd join <addr> [--name NAME]       on the new machine; prints the code and waits for acceptance
-cxd accept <code> [--priority N]    on any member
-cxd members [--json]                members, priorities, links, master, term
-cxd members remove <name>
-cxd members priority <name> <N>
+cxd join <addr>                     on the new machine, at a terminal; shows the code and waits
+cxd accept <code> [--priority N]    on any member, at a terminal
+cxd members [--json]                members, priorities, links, master, term, revoked
+cxd members remove <name>           at a terminal; takes effect locally at once
+cxd members priority <name> <N>     at a terminal
 ```
 
 New keys in `~/.cxd/config.json`:
-- `listen` (addresses to listen on; default none, so outbound only);
-- `priority` (this machine's own, used when it creates a mesh);
-- per host: `transport` (`auto`, `broker` or `ssh`) and `broker_timeout`.
 
-`cxd doctor` gains checks for the agent: running, identity present, member of a mesh, links up, master known, and lease fresh.
+| Key | Meaning |
+| --- | --- |
+| `listen` | the addresses to bind; default none, so outbound only |
+| `advertise` | the addresses to give other members |
+| `priority` | this machine's own priority, used when it creates a mesh |
+| `hosts.<name>.transport` | `local`, `ssh`, `broker` or `auto` |
+| `hosts.<name>.broker_timeout` | seconds to wait for `accepted` before falling back (default 10) |
+
+`cxd doctor` gains checks for the agent: running, identity present, member of a mesh, links up, master known, lease fresh, and the agent's version matching the installed `cxd`.
 
 ## Operations
 
-- **Running the agent.** Run `cxd agent start` once per machine, or install `cxd agent run` as a user service (systemd `--user` unit, or a launchd agent). The documentation ships both unit files.
+- **Starting the agent.** Run `cxd agent start` once per machine, or install `cxd agent run` as a user service. The documentation ships both unit files:
+  - The systemd `--user` unit sets `KillMode=process`. Otherwise stopping or restarting the agent would kill every run it started, because they share its cgroup.
+  - The launchd agent sets `AbandonProcessGroup` to `true`, for the same reason.
+
+  Runs started through the agent therefore survive an agent restart, as runs started through `_rpc` do today.
 - **Ports.** A machine needs an open TCP port only if it should accept inbound links. One reachable member is enough for the mesh to form.
-- **A WSL2 machine** in NAT mode accepts no inbound connections unless Windows forwards the port. It can still be a member, and even the master, by dialing out.
-- **Logs.** Logs go to `~/.cxd/agent/agent.log`, rotated at 5 MiB. They never contain message text, only ids, ops and sizes.
+- **WSL2.** A WSL2 machine in NAT mode accepts no inbound connections unless Windows forwards the port. It can still be a member, and the master, by dialing out. Set `advertise` to the Windows address and forwarded port if you do forward one.
+- **Logs.** The agent logs to `~/.cxd/agent/agent.log`, rotated at 5 MiB. Logs never contain message text, only ids, ops and sizes.
 
 ## Threat model
 
@@ -223,53 +324,58 @@ New keys in `~/.cxd/config.json`:
 - Message and report contents.
 - The agent private keys.
 
-**Trust boundary.** Members are your own machines under your own user. Anyone who can act as your user on a member already has full control of that member, and through `cxd` (and ssh) of the others. The broker must not widen this to anyone else.
+**Trust boundary.** Members are your own machines under your own user. Anyone who can act as your user on a member already has full control of that member, and through `cxd` (and ssh) of the others. The broker must not widen this to anyone else, and not to a Claude session that has been tricked.
 
 | Threat | Mitigation |
 | --- | --- |
-| Someone on the network connects to an agent port | Mutual TLS with pinned member certificates. Without a member key, no handshake completes, except on the join path, which allows nothing but `join`. |
-| Someone joins themselves | A join stays pending until a human types the code shown on the joiner's screen into `cxd accept` on a member. The code is not guessable (50 bits, 10-minute expiry, at most 5 pending). |
-| A man in the middle during pairing | The code binds both TLS certificates as each side observed them. A man in the middle yields different codes on the two sides, so `accept` fails. |
-| A stolen member key | Remove the member (`cxd members remove`). Its fingerprint leaves every trust bundle and its links are closed. The key file is mode 600, so stealing it already requires your user account on that machine. |
-| A malicious or compromised member | Out of scope by definition: a member is you. Revoke it as above. Relays see request contents; they are members too. |
-| Replay of captured traffic | TLS prevents replay on the wire. A replayed request id inside a valid link is answered from the dedupe store and not executed again. |
-| Flooding and oversized messages | Frames are capped at 8 MiB, the join path is rate-limited, and links that send malformed frames are closed. |
-| Requests looping between relays | Each request carries a hop counter (`ttl`, 4), and relays drop requests they have already forwarded (by id). |
-| A downgrade to weak TLS | TLS 1.2 is the minimum, with only ECDHE plus AEAD cipher suites, and renegotiation and compression off. |
-| The local socket used by another user | `~/.cxd` is mode 700 and the socket is mode 600. Only your user (and root) can reach it, the same rule that protects inboxes and FIFOs today. |
-| Information in logs | Logs record ids, ops, sizes and timings only, never message text or tokens. Secrets do not belong in messages anyway (README, Security model). |
-| A US-hosted or other third-party relay | None exists: agents connect only to member addresses you configure. Pairing and traffic never leave your machines and your network. |
+| Someone on the network connects to an agent port | Mutual TLS with pinned member certificates. A connection without a certificate can only attempt a join. It gets tight frame limits, at most 4 frames, and a rate limit per address. |
+| Someone joins themselves | A join stays pending until a human, at a terminal on a member, accepts the code that the joining machine shows. The code is unguessable: 50 bits, a 10-minute expiry, at most 5 pending joins, refused rather than evicted when full. |
+| A man in the middle during pairing | The code binds both TLS certificates as each side saw them, and the nonces are committed before they are revealed. A man in the middle produces different codes on the two sides and cannot grind them into agreement. |
+| A prompt-injected Claude session pairs or edits the mesh ("run `cxd accept …`", "run `cxd join attacker:47100`") | join, accept, remove and priority require a confirmation read from `/dev/tty`. Claude Code's Bash tool has no controlling terminal, so they refuse. |
+| A stolen member key | `cxd members remove` on any member revokes the key locally at once. The revocation spreads in every hello and state message, and nothing can undo it. Lease and state messages from or naming a revoked node are ignored. The key file is mode 600, so stealing it requires your user account on that machine. |
+| A malicious or compromised member | Out of scope by definition, because a member is you. Revoke it as above. Relays see request contents; they are members too. |
+| Replay of captured traffic | TLS prevents replay on the wire. A replayed request id is answered from the dedupe store and never executed again. |
+| A late duplicate after a timeout or fallback | Claim on arrival, plus `cancel` before `accepted`. An operation never runs twice, and exit 4 keeps meaning "nothing was decided". |
+| Flooding and oversized messages | Frames are limited (64 KiB before authentication, 8 MiB after); joins are rate-limited per address; links that send malformed frames are closed. |
+| Requests looping between relays | A path list and a hop limit (`ttl`). |
+| A downgrade to weak TLS | TLS 1.2 is the minimum, with only ECDHE and AEAD cipher suites; compression and renegotiation are off. |
+| The local socket used by another user | `~/.cxd` is mode 700 and the socket is mode 600. |
+| Information in logs | Logs hold ids, ops, sizes and timings only, never message text or tokens. |
+| A third-party or US-hosted relay | None exists: agents connect only to addresses of members you paired. Pairing and traffic stay on your machines and your network. |
 
 **Residual risks.**
-- **Split brain.** During a partition, two members may each act as master. The only effect is on which member relays. Healing is deterministic (term, priority, node id).
-- **Accepting the wrong machine.** A human who accepts a code they did not verify on the joining machine admits whatever machine produced it. The `accept` output therefore shows the joiner's name and the address it connected from, and asks for confirmation.
+- **Split brain.** A partition that separates groups of members can briefly produce two masters. That only affects which member relays, and healing is deterministic.
+- **Accepting a code without checking it.** A human who confirms a code they did not check on the joining machine admits whatever machine produced it. `accept` therefore shows the joiner's name, address and fingerprint before it asks for confirmation.
 
 ## Testing and evidence
 
-- **Unit tests.** All of these run agents on localhost under separate `CXD_HOME`s, ports and identities, with the stub claude:
-  - framing limits;
-  - the dedupe store, shared with `_rpc`;
-  - the join code, including a simulated man in the middle;
-  - the lease and election: a lease that lapses, priority order, no preemption, split-brain healing by term;
-  - relaying, and retries with dedupe;
-  - the auto transport and its ssh fallback;
-  - watch resuming across a transport switch.
+**Unit tests.** All of them run agents on localhost under separate `CXD_HOME`s, ports and identities, with the stub claude:
+- certificate generation and pinning with several members;
+- framing limits;
+- the dedupe store: claim on arrival, a duplicate while running, an executor that died, cancel, and the store shared with `_rpc`;
+- the join code, including a simulated man in the middle and a grinding attempt;
+- the `/dev/tty` requirement;
+- the lease and election: a lapse, priority order, no preemption after a restart (the grace period), no promotion when alone, healing by term and by followers, sticky revocation;
+- relaying, retries through the same master, and replies by node id;
+- the `auto` transport and the ssh fallback;
+- watch resuming across a transport switch.
 
-  Every guard gets a mutation in `tests/mutate.py`.
-- **Real nodes.** These steps run on two real machines, one Linux and one macOS, with logs kept in `docs/evidence/`:
-  1. pair the two;
-  2. run start, send, watch, stop and resume through the broker;
-  3. kill the master's agent and show that the other machine promotes and the work carries on;
-  4. restart the old master and show that it does not preempt;
-  5. block the broker port and show the ssh fallback, with no operation executed twice.
+Every guard gets a mutation in `tests/mutate.py`.
+
+**Real nodes.** On two real machines, one Linux (WSL2) and one macOS, plus a third agent on one of them to show relaying through a new master. Logs go to `docs/evidence/`. The steps:
+1. Pair the machines.
+2. Run start, send, watch, stop and resume through the broker.
+3. Kill the master's agent and show that another member promotes and the work carries on: watch resumes, and runs survive.
+4. Restart the old master and show that it does not preempt.
+5. Block the broker port in both directions and show the ssh fallback, including during a long-running operation, with no operation executed twice.
 
 ## Implementation plan
 
 1. This design document.
-2. `lib/cxd/broker/identity.py`: key and certificate generation through `openssl`, fingerprints, and the two TLS contexts.
-3. `lib/cxd/broker/wire.py` (framing) and `lib/cxd/dedupe.py` (the store, wired into `cxd _rpc`, and request ids in `SshTransport`).
-4. The agent core: links, the local socket, request execution and relaying, with a static master.
-5. Pairing: `cxd join` and `cxd accept`, the code, and pending joins.
-6. The lease and election, healing, and `cxd members`.
-7. `BrokerTransport` and the `auto` transport with ssh fallback, plus doctor checks.
-8. The service unit files, the documentation, and the real-node evidence.
+2. `lib/cxd/broker/identity.py`: key and certificate generation (explicit openssl config), fingerprints, the trust bundle, and both TLS contexts, checked against LibreSSL on macOS.
+3. `lib/cxd/broker/wire.py` for framing, and `lib/cxd/dedupe.py` for the store (claim on arrival, done, cancelled), wired into `cxd _rpc`, with request ids in `SshTransport`.
+4. The agent core: the lock, the local socket, links, `hello`, executing requests, relaying by path, and replies by node id, with a static master.
+5. Pairing: `cxd join` and `cxd accept`, commit and reveal, pending joins, and the `/dev/tty` requirement.
+6. The lease and election, the restart grace, healing, sticky revocation, and `cxd members`.
+7. `BrokerTransport` and the `auto` transport with ssh fallback and `cancel`, plus doctor checks.
+8. The service unit files (`KillMode=process`, `AbandonProcessGroup`), the documentation, and the real-node evidence.
