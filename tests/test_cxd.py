@@ -140,11 +140,16 @@ class Base(unittest.TestCase):
         e = dict(self.env)
         if env:
             e.update(env)
-        out = open(os.path.join(self.tmp, "watch-%s-%s.log" % (host, name)), "w+")
-        p = subprocess.Popen([sys.executable, CXD, "watch", host, name, "--json", "--heartbeat", "3600"],
-                             stdout=out, stderr=subprocess.STDOUT, env=e, universal_newlines=True)
+        log = os.path.join(self.tmp, "watch-%s-%s.log" % (host, name))
+        with open(log, "w") as out:
+            p = subprocess.Popen([sys.executable, CXD, "watch", host, name, "--json", "--heartbeat", "3600"],
+                                 stdout=out, stderr=subprocess.STDOUT, env=e, universal_newlines=True)
         self.bg.append(p)
-        return p, out.name
+        return p, log
+
+    def log_text(self, log):
+        with open(log) as f:
+            return f.read()
 
     def read_events(self, log):
         evs = []
@@ -162,7 +167,7 @@ class Base(unittest.TestCase):
                 if pred(e):
                     return e
             time.sleep(0.1)
-        self.fail("no matching event in %s:\n%s" % (log, open(log).read()))
+        self.fail("no matching event in %s:\n%s" % (log, self.log_text(log)))
 
 
 class TestRuns(Base):
@@ -438,21 +443,35 @@ class TestWatch(Base):
         p, log = self.watch_bg("buildbox", "wr", env={"FAKE_SSH_FAIL_FILE": fail, "FAKE_SSH_DROP_AFTER": "4"})
         self.wait_event(log, lambda e: e["ev"] == "status", timeout=40)
         transport = [e for e in self.read_events(log) if e["ev"] == "transport"]
-        self.assertEqual(len(transport), 2, open(log).read())
-        self.assertFalse([e for e in self.read_events(log) if e["ev"] == "exit"], open(log).read())
-        # The stream is cut every 4 s (rc 255); keep the run busy across a cut.
-        self.ok("send", "buildbox", "wr", "SLEEP 5 MARK-ACROSSDROP")
-        self.wait_event(log, lambda e: e["ev"] == "turn" and "MARK-ACROSSDROP" in e["result"], timeout=40)
+        self.assertEqual(len(transport), 2, self.log_text(log))
+        self.assertFalse([e for e in self.read_events(log) if e["ev"] == "exit"], self.log_text(log))
+        # Each stream is cut 4 s after it connects (rc 255). The turn below
+        # takes 8 s from after this stream connected, so it ends after the cut
+        # and must arrive on a reconnected stream, exactly once.
+        self.ok("send", "buildbox", "wr", "SLEEP 8 MARK-ACROSSDROP")
+        self.wait_event(log, lambda e: e["ev"] == "turn" and "MARK-ACROSSDROP" in e["result"], timeout=60)
         evs = self.read_events(log)
-        self.assertGreaterEqual(len([e for e in evs if e["ev"] == "transport"]), 3, "the stream was never cut")
-        self.assertEqual(len([e for e in evs if e["ev"] == "turn" and "MARK-ACROSSDROP" in e["result"]]), 1)
-        self.assertFalse([e for e in evs if e["ev"] == "exit"])
+        kinds = [e["ev"] for e in evs]
+        turn_at = [i for i, e in enumerate(evs) if e["ev"] == "turn" and "MARK-ACROSSDROP" in e["result"]]
+        self.assertEqual(len(turn_at), 1, self.log_text(log))
+        self.assertGreaterEqual(kinds[:turn_at[0]].count("transport"), 3,
+                                "the turn was not delivered across a stream cut:\n" + self.log_text(log))
+        self.assertFalse([e for e in evs if e["ev"] == "exit"], self.log_text(log))
+        self.assertIsNone(p.poll(), "watch stopped while the run is alive:\n" + self.log_text(log))
         pids = self.pids("buildbox", "wr")
         self.assertTrue(proc_alive(pids["claude_pid"], pids["claude_ident"]))
         self.ok("stop", "buildbox", "wr", "--grace", "10")
         self.wait_event(log, lambda e: e["ev"] == "exit", timeout=40)
         p.wait(20)
         self.assertEqual(p.returncode, 0)
+        evs = self.read_events(log)
+        # Reconnecting from the cursor never repeated the turn.
+        self.assertEqual(len([e for e in evs if e["ev"] == "turn" and "MARK-ACROSSDROP" in e["result"]]), 1)
+        # Exactly one exit, and it is the host's: rc, gen and turns of the run, no reason.
+        exits = [e for e in evs if e["ev"] == "exit"]
+        self.assertEqual(len(exits), 1, self.log_text(log))
+        self.assertNotIn("reason", exits[0])
+        self.assertEqual((exits[0]["rc"], exits[0]["gen"], exits[0]["turns"]), (0, 1, 2), exits[0])
 
 
 class TestRemote(Base):
