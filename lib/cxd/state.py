@@ -13,7 +13,9 @@ Layout under ~/.cxd (mode 700 throughout):
         err.log         stderr
     sessions/<sid>.json registered by the SessionStart hook (any session, any account)
     inbox/<sid>/*.json  messages waiting for a hook to deliver them
-    delivered/<sid>/    messages a hook has claimed (moved here exactly once)
+    claimed/<sid>/      messages a hook has claimed and not yet handed over
+                        (<id>.claim-<pid>-<hash>.json; requeued if that hook died)
+    delivered/<sid>/    messages a hook has handed over (moved here once acked)
     outbox/<sid>.jsonl  Stop reports, `cxd notify` lines, delivery receipts
 """
 
@@ -446,11 +448,43 @@ def op_send(args):
         raise CxdError("session %s is not running (%s); refusing to send" % (
             sid, "ended " + rec["ended"] if rec.get("ended") else "process gone"), "dead")
     inbox = ensure_dir(path("inbox", sid))
-    msg = {"id": msg_id, "ts": now_iso(), "sender": sender, "text": text}
-    tmp = os.path.join(inbox, ".tmp-" + msg_id)
-    atomic_write_json(tmp, msg)
-    os.replace(tmp, os.path.join(inbox, msg_id + ".json"))
-    return {"target": sid, "via": "inbox", "id": msg_id}
+    # A hook can hand over at most ~10,000 characters at a time, so a long
+    # message is queued as numbered parts, each delivered whole, in order.
+    if len(text) > MAX_MESSAGE:
+        raise CxdError("message too long for a session (%d characters, at most %d); "
+                       "write it to a file and send the path" % (len(text), MAX_MESSAGE), "usage")
+    chunks = _split_text(text, PART_CHARS)
+    ts = now_iso()
+    ids = []
+    for k, chunk in enumerate(chunks, 1):
+        part_id = msg_id if len(chunks) == 1 else "%s-p%04d" % (msg_id, k)
+        ids.append(part_id)
+        body = chunk if len(chunks) == 1 else "[part %d/%d] %s" % (k, len(chunks), chunk)
+        msg = {"id": part_id, "ts": ts, "sender": sender, "text": body}
+        tmp = os.path.join(inbox, ".tmp-" + part_id)
+        atomic_write_json(tmp, msg)
+        os.replace(tmp, os.path.join(inbox, part_id + ".json"))
+    return {"target": sid, "via": "inbox", "id": msg_id, "parts": len(chunks), "ids": ids}
+
+
+PART_CHARS = 6000
+MAX_MESSAGE = 1000000  # 167 parts at most
+
+
+def _split_text(text, n):
+    """Chunks of at most n characters that join back to text exactly; cut after
+    a newline when there is one in the second half, else after a space."""
+    chunks = []
+    while len(text) > n:
+        cut = text.rfind("\n", n // 2, n)
+        if cut < 0:
+            cut = text.rfind(" ", n // 2, n)
+        cut = n if cut < 0 else cut + 1
+        chunks.append(text[:cut])
+        text = text[cut:]
+    if text or not chunks:
+        chunks.append(text)
+    return chunks
 
 
 def op_notify(args):
@@ -708,8 +742,10 @@ def op_list(args):
             alive = session_alive(rec)
             if not alive and not show_all:
                 continue
-            inbox = path("inbox", rec.get("session_id", ""))
-            pending = len([m for m in os.listdir(inbox) if m.endswith(".json")]) if os.path.isdir(inbox) else 0
+            pending = 0
+            for box in ("inbox", "claimed"):  # claimed: handed to a hook, not yet acknowledged
+                d = path(box, rec.get("session_id", ""))
+                pending += len([m for m in os.listdir(d) if m.endswith(".json")]) if os.path.isdir(d) else 0
             sessions.append({
                 "session_id": rec.get("session_id"), "alive": alive, "account": rec.get("account"),
                 "cwd": rec.get("cwd"), "registered": rec.get("registered"), "pid": rec.get("pid"),

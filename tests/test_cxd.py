@@ -903,6 +903,156 @@ class TestHooks(Base):
                 seen += [int(x.split("-")[1]) for x in ctx.split() if x.startswith("MSG-")]
         self.assertEqual(sorted(seen), list(range(30)))
 
+    def queue(self, sid, i, text):
+        inbox = os.path.join(self.local, "inbox", sid)
+        os.makedirs(inbox, mode=0o700, exist_ok=True)
+        mid = "%019d-%06d" % (i, i)
+        with open(os.path.join(inbox, mid + ".json"), "w") as f:
+            json.dump({"id": mid, "ts": "t", "sender": "s", "text": text}, f)
+        return mid
+
+    def run_hook(self, sid, event="PostToolUse", broken_stdout=False):
+        payload = json.dumps({"session_id": sid}).encode()
+        if not broken_stdout:
+            r = subprocess.run([HOOK, event], input=payload, stdout=subprocess.PIPE, env=self.env)
+            return r.stdout.decode()
+        # The reader is gone before the hook writes: its output can never be read.
+        p = subprocess.Popen([HOOK, event], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=self.env)
+        p.stdout.close()
+        p.stdin.write(payload)
+        p.stdin.close()
+        p.wait(10)
+        return None
+
+    def receipts(self, sid):
+        try:
+            with open(os.path.join(self.local, "outbox", sid + ".jsonl")) as f:
+                return [json.loads(l) for l in f if '"delivered"' in l]
+        except OSError:
+            return []
+
+    def test_message_a_hook_could_not_hand_over_is_delivered_by_the_next(self):
+        """GUARD ack-after-write. Mutation: a message counts as delivered when it
+        is claimed, before the hook's output is written -> a hook that cannot
+        hand it over loses it."""
+        sid = "66666666-2222-3333-4444-555555555555"
+        mid = self.queue(sid, 1, "MARK-AT-LEAST-ONCE")
+        self.assertIsNone(self.run_hook(sid, broken_stdout=True))
+        self.assertEqual(self.receipts(sid), [])  # not acknowledged
+        out = self.run_hook(sid)
+        ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("MARK-AT-LEAST-ONCE", ctx)
+        self.assertIn(mid, ctx)  # the id travels with the message (duplicates are recognisable)
+        self.assertEqual([r["id"] for r in self.receipts(sid)], [mid])
+        self.assertEqual(self.run_hook(sid), "")  # and then it is done
+        self.assertEqual(os.listdir(os.path.join(self.local, "delivered", sid)), [mid + ".json"])
+
+    def test_claim_of_a_dead_hook_is_requeued(self):
+        """GUARD redeliver. Mutation: claims are never recovered -> a message
+        claimed by a hook that died is never delivered."""
+        sid = "77777777-2222-3333-4444-555555555555"
+        mid = self.queue(sid, 2, "MARK-CLAIMED-BY-DEAD")
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        claimed = os.path.join(self.local, "claimed", sid)
+        os.makedirs(claimed, mode=0o700)
+        os.rename(os.path.join(self.local, "inbox", sid, mid + ".json"),
+                  os.path.join(claimed, "%s.claim-%d-%s.json" % (mid, gone.pid, "0" * 12)))
+        os.rmdir(os.path.join(self.local, "inbox", sid))  # only the claim is left
+        out = self.run_hook(sid, "UserPromptSubmit")
+        self.assertIn("MARK-CLAIMED-BY-DEAD", json.loads(out)["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(os.listdir(claimed), [])
+
+    def test_claim_of_a_live_hook_is_left_alone(self):
+        sid = "88888888-2222-3333-4444-555555555555"
+        mid = self.queue(sid, 3, "MARK-CLAIMED-BY-LIVE")
+        sys.path.insert(0, os.path.join(REPO, "lib"))
+        from cxd.hook import claim_token
+        live = subprocess.Popen(["sleep", "30"])
+        self.bg.append(live)
+        claimed = os.path.join(self.local, "claimed", sid)
+        os.makedirs(claimed, mode=0o700)
+        os.rename(os.path.join(self.local, "inbox", sid, mid + ".json"),
+                  os.path.join(claimed, "%s.claim-%s.json" % (mid, claim_token(live.pid))))
+        self.assertEqual(self.run_hook(sid), "")  # another hook holds it
+        self.assertEqual(len(os.listdir(claimed)), 1)
+
+    def test_claim_of_a_recycled_pid_is_requeued(self):
+        """GUARD claim-identity. Mutation: only the pid is compared -> a live
+        process that reuses a dead claimer's pid keeps the claim forever."""
+        sid = "abcdabcd-2222-3333-4444-555555555555"
+        mid = self.queue(sid, 4, "MARK-RECYCLED")
+        live = subprocess.Popen(["sleep", "30"])
+        self.bg.append(live)
+        claimed = os.path.join(self.local, "claimed", sid)
+        os.makedirs(claimed, mode=0o700)
+        os.rename(os.path.join(self.local, "inbox", sid, mid + ".json"),
+                  os.path.join(claimed, "%s.claim-%d-%s.json" % (mid, live.pid, "f" * 12)))
+        out = self.run_hook(sid)
+        self.assertIn("MARK-RECYCLED", json.loads(out)["hookSpecificOutput"]["additionalContext"])
+
+    def test_a_malformed_inbox_file_is_set_aside(self):
+        sid = "bcdebcde-2222-3333-4444-555555555555"
+        inbox = os.path.join(self.local, "inbox", sid)
+        os.makedirs(inbox, mode=0o700)
+        for name, body in (("0000000000000000001-000001.json", "[1]"), ("0000000000000000002-000002.json", "")):
+            with open(os.path.join(inbox, name), "w") as f:
+                f.write(body)
+        self.queue(sid, 3, "MARK-AFTER-BAD")
+        out = self.run_hook(sid)
+        self.assertIn("MARK-AFTER-BAD", json.loads(out)["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(sorted(os.listdir(os.path.join(self.local, "bad", sid))),
+                         ["0000000000000000001-000001.json", "0000000000000000002-000002.json"])
+        self.assertEqual(self.run_hook(sid), "")
+
+    def test_a_long_message_arrives_whole_in_parts(self):
+        sid = "cdefcdef-2222-3333-4444-555555555555"
+        p = self.fake_session(sid)
+        self.hook(p, "SessionStart")
+        words = ["w%05d" % i for i in range(3000)]  # about 21,000 characters
+        text = " ".join(words)
+        r = self.ok("send", "laptop", sid, text, "--json")
+        res = json.loads(r.stdout)
+        self.assertGreater(res["parts"], 1)
+        self.assertEqual(len(res["ids"]), res["parts"])
+        r = self.cxd("send", "laptop", sid, "-", stdin="y" * 1000001)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("too long", r.stderr)
+        got = []
+        for _ in range(10):
+            res = self.hook(p, "PostToolUse")
+            if not res["out"]:
+                break
+            ctx = json.loads(res["out"])["hookSpecificOutput"]["additionalContext"]
+            self.assertNotIn("truncated", ctx)
+            self.assertLessEqual(len(ctx), 10000)
+            got.append(ctx)
+        joined = " ".join(" ".join(c.split()) for c in got)
+        self.assertEqual([w for w in joined.split() if w.startswith("w") and w[1:].isdigit()], words)
+        self.assertIn("[part 1/", got[0])
+
+    def test_split_text_keeps_every_character(self):
+        from cxd.state import _split_text
+        cases = ["a" * 6000 + " ", ("line of text\n" * 2000), ("    indented\n" * 1500) + "end",
+                 "x" * 13000, "", "short"]
+        for text in cases:
+            parts = _split_text(text, 6000)
+            self.assertEqual("".join(parts), text)
+            self.assertTrue(all(0 < len(p) <= 6000 for p in parts) or text == "", [len(p) for p in parts])
+
+    def test_a_hook_without_its_own_identity_claims_nothing(self):
+        """GUARD claim-needs-identity. Mutation: a hook claims without being able
+        to read its own identity -> its claim could never be recovered."""
+        from cxd import hook
+        sid = "efefefef-2222-3333-4444-555555555555"
+        self.queue(sid, 5, "MARK-NO-IDENTITY")
+        with mock.patch.dict(os.environ, {"CXD_HOME": self.local}), \
+                mock.patch.object(hook, "proc_identity", return_value=None):
+            self.assertEqual(hook.claim_inbox(sid), [])
+        self.assertEqual(len(os.listdir(os.path.join(self.local, "inbox", sid))), 1)
+        self.assertFalse(os.path.exists(os.path.join(self.local, "claimed", sid)) and
+                         os.listdir(os.path.join(self.local, "claimed", sid)))
+
     def test_hook_never_breaks_a_session(self):
         cases = [b"", b"not json", b"[]", json.dumps({"session_id": "../../etc"}).encode()]
         for inp in cases:
@@ -927,6 +1077,18 @@ class TestHooks(Base):
             med = sorted(ts)[3]
             print("hook %s median %.1f ms" % (ev, med), file=sys.stderr)
             self.assertLess(med, limit)
+        # A hook that delivers (claim, write, ack) is held to the same limit.
+        sid = "44444444-bbbb"
+        ts = []
+        for i in range(7):
+            self.queue(sid, i, "MARK-FAST-%d" % i)
+            t0 = time.time()
+            out = self.run_hook(sid)
+            ts.append((time.time() - t0) * 1000)
+            self.assertIn("MARK-FAST-%d" % i, out)
+        med = sorted(ts)[3]
+        print("hook PostToolUse delivering median %.1f ms" % med, file=sys.stderr)
+        self.assertLess(med, 100)
 
     def test_notify_lands_in_outbox(self):
         r = self.ok("notify", "built it MARK-N", env={"CLAUDE_CODE_SESSION_ID": "55555555-aaaa"})

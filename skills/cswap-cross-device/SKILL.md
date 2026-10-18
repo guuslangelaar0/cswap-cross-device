@@ -70,9 +70,10 @@ cxd watch laptop 3f2a9c1e                        # delivery receipts + Stop repo
 ```
 
 The message waits in `~/.cxd/inbox/<session_id>/` until that session's next hook fires
-(after a tool call, on a prompt, or at the end of a turn) and is then delivered exactly
-once. It arrives as context reading
-`Message from the lead session <sender> at <time>: <text>`. A session that is idle
+(after a tool call, on a prompt, or at the end of a turn). Delivery is at-least-once: if a
+hook dies before handing it over, the next hook delivers it again. It arrives as context
+reading `Message from the lead session <sender> at <time> (cxd message <id>): <text>`; a
+second copy with the same id is a repeat, not a new instruction. A session that is idle
 waiting for a human only sees it on its next prompt.
 
 ## Worker: reporting back

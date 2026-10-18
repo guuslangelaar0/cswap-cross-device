@@ -68,8 +68,14 @@ flowchart LR
   `cxd watch` turns into one line per event.
 - **Other sessions.** The plugin's `SessionStart` hook registers every session in
   `~/.cxd/sessions/`. `cxd send <host> <session-id>` drops a message in that session's
-  inbox, and its next `PostToolUse`, `UserPromptSubmit` or `Stop` hook delivers it exactly
-  once as `additionalContext` (a message that reads *"Message from the lead session …"*).
+  inbox, and its next `PostToolUse`, `UserPromptSubmit` or `Stop` hook delivers it as
+  `additionalContext` (a message that reads *"Message from the lead session …"*). Delivery is
+  at-least-once: a hook claims the message, and only once it has written it out is the
+  message marked delivered. If a hook is killed, times out or cannot write in between, the
+  session's next hook delivers the message again. Each message carries its id, so the rare
+  repeat is recognisable. A long message (up to 1,000,000 characters) is queued as numbered
+  parts that each fit in one delivery; they arrive whole, in order as the session's hooks run
+  one after another.
 - **Reports.** The `Stop` hook appends the last assistant message of every turn to the
   session's outbox, and a worker can add its own lines with `cxd notify "…"`. The lead
   sees them in `cxd watch`.
@@ -263,7 +269,7 @@ by name.
   inbox has mail. The test suite requires a median under 100 ms for `PostToolUse` and
   `Stop`.
 - **Factual injection.** A delivered message arrives as context that states who sent it and
-  when (*"Message from the lead session laptop/1a2b3c4d at …: …"*), not as an imperative
+  when (*"Message from the lead session laptop/1a2b3c4d at … (cxd message …): …"*), not as an imperative
   from the system.
 - **No secrets in messages.** Messages, reports and turn results are stored as plain files.
   Do not send tokens, keys or passwords through `cxd`. The `Stop` hook stores at most
