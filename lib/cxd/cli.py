@@ -329,8 +329,10 @@ def cmd_prune(a):
         _out(json.dumps(res))
         return EXIT_OK
     verb = "would remove" if res.get("dry_run") else "removed"
-    _out("%s: %s %d ended session(s) and %d exited run(s) older than %g day(s)" % (
-        a.host, verb, len(res["sessions"]), len(res["runs"]), res["older_than_days"]))
+    age = res["older_than_days"]
+    _out("%s: %s %d ended session(s) and %d exited run(s) %s" % (
+        a.host, verb, len(res["sessions"]), len(res["runs"]),
+        "older than %g day(s)" % age if age is not None else "(pruning set to never)"))
     for sid in res["sessions"]:
         _out("  session %s" % sid)
     for name in res["runs"]:

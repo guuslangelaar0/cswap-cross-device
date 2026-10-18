@@ -20,7 +20,7 @@ import os
 import re
 import time
 
-from .common import CxdError, path, proc_state, read_json, self_label
+from .common import CxdError, path, proc_state, read_json, self_names
 
 DEFAULT_DAYS = 7.0
 AUTO_EVERY = 3600.0
@@ -46,7 +46,11 @@ def age_days(cfg, override=None):
     """The age to prune at. A bad override is an error; a bad config value
     means the default (a broken config never breaks anything)."""
     if override is not None:
-        if not _valid_days(override) or not math.isfinite(override):
+        try:
+            ok = _valid_days(override) and math.isfinite(override) and override * 86400 < 1e12
+        except OverflowError:
+            ok = False
+        if not ok:
             raise CxdError("--older-than must be a positive number of days, got %r" % override, "usage")
         return _days(override)
     v = (cfg or {}).get("prune_after_days")
@@ -129,6 +133,11 @@ def _run_alive(d):
     return False
 
 
+def _ours(host):
+    """A record or run of this machine (or with no host recorded)."""
+    return host is None or (isinstance(host, str) and host.lower() in self_names())
+
+
 def _record(sid):
     rec = read_json(path("sessions", sid + ".json"), None)
     return rec if isinstance(rec, dict) else {}
@@ -138,12 +147,16 @@ def _prunable_session(sid, cutoff):
     if _last_change(_session_paths(sid)) >= cutoff:  # GUARD:prune-age
         return False
     rec = _record(sid)
-    if rec.get("host") not in (None, self_label()):
+    if not _ours(rec.get("host")):
         return False  # another machine's session in a shared home: not ours to judge
     if rec.get("ended"):
         return True
-    if not os.path.exists(path("sessions", sid + ".json")):
+    try:
+        os.lstat(path("sessions", sid + ".json"))
+    except FileNotFoundError:
         return True  # leftovers of a session with no record at all
+    except OSError:
+        return False  # present but unreadable: keep it
     # A process (or identity) that was never recorded is "unknown", never "dead".
     return proc_state(rec.get("pid"), rec.get("pid_ident")) == "dead"  # GUARD:prune-live
 
@@ -173,7 +186,8 @@ def _remove_session(sid):
 def prune(cfg, older_than_days=None, runs=False, dry_run=False, limit=None):
     days = age_days(cfg, older_than_days)
     cutoff = 0.0 if days == NEVER else time.time() - days * 86400
-    out = {"older_than_days": days, "sessions": [], "runs": [], "dry_run": bool(dry_run)}
+    out = {"older_than_days": None if days == NEVER else days, "sessions": [], "runs": [],
+           "dry_run": bool(dry_run)}
     try:
         run_names = sorted(n for n in os.listdir(path("runs")) if os.path.isdir(path("runs", n)))
     except FileNotFoundError:
@@ -193,6 +207,9 @@ def prune(cfg, older_than_days=None, runs=False, dry_run=False, limit=None):
     if runs:
         for name in run_names:
             d = path("runs", name)
+            meta = read_json(os.path.join(d, "meta.json"), {})
+            if not _ours(meta.get("host") if isinstance(meta, dict) else None):
+                continue  # another machine's run in a shared home: its pids mean nothing here
             if _last_change([d]) < cutoff and not _run_alive(d):
                 doomed_runs.add(name)
     with_runs = {}  # session id -> its runs; it goes only once all of them are gone

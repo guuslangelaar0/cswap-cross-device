@@ -882,8 +882,14 @@ def op_prune(args):
     older = args.get("older_than_days")
     if older is not None and (isinstance(older, bool) or not isinstance(older, (int, float))):
         raise CxdError("--older-than must be a number of days", "usage")
-    return dict(prune(load_config(), older_than_days=older, runs=bool(args.get("runs")),
-                      dry_run=bool(args.get("dry_run"))), host=self_label())
+    import fcntl
+    fd = os.open(path("prune.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)  # one pass at a time (with the automatic one)
+        return dict(prune(load_config(), older_than_days=older, runs=bool(args.get("runs")),
+                          dry_run=bool(args.get("dry_run"))), host=self_label())
+    finally:
+        os.close(fd)
 
 
 OPS = {

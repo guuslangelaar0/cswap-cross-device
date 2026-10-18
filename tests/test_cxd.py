@@ -48,7 +48,7 @@ class Base(unittest.TestCase):
         os.makedirs(self.remote, mode=0o700)
         # Runs go through (fake) `cswap run work --` unless a test says otherwise.
         with open(os.path.join(self.local, "config.json"), "w") as f:
-            json.dump({"self": ["laptop"], "default_account": "work",
+            json.dump({"self": ["laptop"], "default_account": "work", "auto_prune": False,
                        "hosts": {"buildbox": {"transport": "ssh", "python": sys.executable, "cxd": CXD}}}, f)
         with open(os.path.join(self.remote, "config.json"), "w") as f:
             json.dump({"default_account": "work"}, f)
@@ -1471,6 +1471,11 @@ class TestPrune(Base):
         return self.session_files(sid)
 
     def test_session_start_prunes_at_most_hourly_in_the_background(self):
+        with open(os.path.join(self.local, "config.json")) as f:
+            cfg = json.load(f)
+        cfg.pop("auto_prune", None)  # the base test config turns it off
+        with open(os.path.join(self.local, "config.json"), "w") as f:
+            json.dump(cfg, f)
         sid = "cccc0000-2222-3333-4444-555555555555"
         self.fake_record("cccc0001-old-ended", ended=True, age_days=10)
         p = self.fake_session(sid)
@@ -1645,15 +1650,35 @@ class TestPrune(Base):
         from cxd import common
         if not shutil.which("ps"):
             self.skipTest("no ps")
+        # POSIX zone strings need no tzdata, so this works on any CI image.
         with mock.patch.object(common.sys, "platform", "darwin"):  # force the ps path
-            with mock.patch.dict(os.environ, {"TZ": "Europe/Amsterdam"}):
+            with mock.patch.dict(os.environ, {"TZ": "AAA-2"}):
                 ident = common.proc_identity(os.getpid())
+                _, legacy = common._read_identity(os.getpid(), legacy=True)
             self.assertTrue(ident.startswith("psutc:"), ident)
-            with mock.patch.dict(os.environ, {"TZ": "America/New_York"}):
+            with mock.patch.dict(os.environ, {"TZ": "BBB+5"}):
                 self.assertEqual(common.proc_state(os.getpid(), ident), "alive")
                 self.assertTrue(common.proc_alive(os.getpid(), ident))
-                # A record from before (local-time "ps:") is never judged dead by a mismatch.
-                self.assertEqual(common.proc_state(os.getpid(), "ps:Thu Jan  1 00:00:00 1970"), "unknown")
+                # A record from before ("ps:", local time) in another zone: unknown, never dead.
+                self.assertEqual(common.proc_state(os.getpid(), legacy), "unknown")
+            with mock.patch.dict(os.environ, {"TZ": "AAA-2"}):
+                # ...and in its own zone it is still recognised (cxd stop finds pre-upgrade runs).
+                self.assertEqual(common.proc_state(os.getpid(), legacy), "alive")
+
+    def test_runs_of_another_host_are_left_alone(self):
+        from cxd.common import atomic_write_json
+        d = os.path.join(self.local, "runs", "r-elsewhere")
+        os.makedirs(d, mode=0o700)
+        atomic_write_json(os.path.join(d, "meta.json"), {"name": "r-elsewhere", "host": "some-other-machine"})
+        atomic_write_json(os.path.join(d, "exit.json"), {"gen": 1, "rc": 0})
+        self.age_tree(d, time.time() - 10 * self.DAY)
+        self.assertEqual(self.prune("--runs")["runs"], [])
+
+    def test_never_prints_as_valid_json(self):
+        with open(os.path.join(self.local, "config.json"), "w") as f:
+            json.dump({"self": ["laptop"], "prune_after_days": 10 ** 400}, f)
+        res = self.prune()  # json.loads in prune() would fail on Infinity
+        self.assertIsNone(res["older_than_days"])
 
     def test_records_of_another_host_are_left_alone(self):
         from cxd.common import atomic_write_json

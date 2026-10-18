@@ -235,7 +235,8 @@ only the host that owns the run can report an exit.
 `default_account` (cswap account when `--account` is omitted), `skip_permissions`
 (`true` bypasses permission prompts for every run on this host; default `false`) and
 `prune_after_days` (how long ended sessions are kept; default 7; anything that is not a
-positive number means the default). Per peer
+positive number means the default; a huge number means never) and `auto_prune` (`false`
+stops the hourly pass that SessionStart starts; `cxd prune` still works). Per peer
 under `hosts`: `transport` (`ssh`), `alias` (ssh alias, defaults to the host name), `python`
 (remote interpreter, default `python3`), `cxd` (remote path, default
 `$HOME/.cxd/bin/cxd`), `connect_timeout` (seconds). Environment overrides: `CXD_HOME` (state directory),
