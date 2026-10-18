@@ -582,6 +582,51 @@ class TestExitRecord(Base):
         self.assertEqual((ev["rc"], ev["gen"], ev.get("error")), (None, 1, "keeper failed to open the FIFO"))
 
 
+class TestSupervisorFailure(Base):
+    def test_unexpected_failure_before_claude_records_an_exit_and_ends_the_keeper(self):
+        """GUARD supervise-record. Mutation: the supervisor's guard is gone -> an
+        unexpected error leaves no exit record (watch waits forever) and an
+        orphaned keeper holding the FIFO."""
+        import errno as _errno
+        from cxd import supervise
+        from cxd.common import atomic_write_json
+        d = os.path.join(self.local, "runs", "wx")
+        os.makedirs(d, mode=0o700)
+        atomic_write_json(os.path.join(d, "meta.json"), {"name": "wx", "gen": 1})
+        env = {"CXD_HOME": self.local, "CXD_CLAUDE": self.env["CXD_CLAUDE"]}
+        with mock.patch.dict(os.environ, env), mock.patch.object(supervise.signal, "signal"), \
+                mock.patch.object(supervise, "append_jsonl", side_effect=OSError(_errno.ENOSPC, "disk full")):
+            with self.assertRaises(OSError):
+                supervise.supervise_main(d, 1)
+        # If the guard failed, end the keeper it leaked (our own child) after the test.
+        leaked = (read_json(os.path.join(d, "keeper.ready"), {}) or {}).get("pid")
+
+        def end_leaked_keeper():
+            try:
+                os.kill(leaked, signal.SIGTERM)
+                os.waitpid(leaked, 0)
+            except (OSError, ChildProcessError, TypeError):
+                pass
+        self.addCleanup(end_leaked_keeper)
+        ex = read_json(os.path.join(d, "exit.json"))
+        self.assertEqual((ex["gen"], ex["rc"]), (1, None), ex)
+        self.assertIn("disk full", ex["error"])
+        # No writer is left on the FIFO: a non-blocking read sees EOF, not EAGAIN.
+        fd = os.open(os.path.join(d, "in.fifo"), os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            deadline = time.time() + 5
+            while True:
+                try:
+                    self.assertEqual(os.read(fd, 1), b"")
+                    break
+                except BlockingIOError:
+                    if time.time() > deadline:
+                        self.fail("the keeper still holds the FIFO open")
+                    time.sleep(0.1)
+        finally:
+            os.close(fd)
+
+
 class TestRemote(Base):
     def test_remote_start_send_stop_resume_list(self):
         self.start("buildbox", "rr", "MARK-R1")

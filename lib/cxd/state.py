@@ -584,6 +584,7 @@ def poll(target, cur):
                     wait["t"], waited = time.time(), 0.0
                 if waited < EXIT_RECORD_WAIT:  # GUARD:exit-rc-cap
                     return events, cur
+            ex = ex or _exit_record(d, gen)  # written just before the supervisor exited?
             cur.pop("exit_wait", None)
             _scan_out(out, cur, emit)  # final flush after the process ended
             cur["exit_gen"] = gen

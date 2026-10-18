@@ -71,6 +71,23 @@ MUTATIONS = [
         "expect": "red",
     },
     {
+        "name": "exit-wait-gen",
+        "what": "a wait timer left from an earlier gen cuts this gen's wait short (rc=None)",
+        "edits": [("lib/cxd/state.py",
+                   '                if not (isinstance(wait, dict) and wait.get("gen") == gen):\n',
+                   '                if not isinstance(wait, dict):  # MUTATION\n')],
+        "tests": [T + "TestExitRecord.test_a_wait_left_from_an_earlier_gen_does_not_cut_this_one"],
+        "expect": "red",
+    },
+    {
+        "name": "supervise-record",
+        "what": "an unexpected supervisor failure leaves no exit record and an orphaned keeper",
+        "edits": [("lib/cxd/supervise.py", "    except BaseException as e:  # GUARD:supervise-record\n",
+                   "    except ZeroDivisionError as e:  # MUTATION\n")],
+        "tests": [T + "TestSupervisorFailure.test_unexpected_failure_before_claude_records_an_exit_and_ends_the_keeper"],
+        "expect": "red",
+    },
+    {
         "name": "stop-alive",
         "what": "stop leaves the process alive: signals are never delivered",
         "edits": [("lib/cxd/common.py", "        os.kill(int(pid), sig)\n", "        pass  # MUTATION: no signal\n")],

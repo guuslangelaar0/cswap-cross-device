@@ -23,7 +23,7 @@ import time
 
 from .common import (
     append_jsonl, atomic_write_json, cxd_bin, find_claude, find_cswap, now_iso, proc_identity,
-    read_json, worker_env,
+    proc_parent_and_args, read_json, worker_env,
 )
 from .state import CLAUDE_HEADLESS_ARGS, SKIP_PERMISSIONS_ARGS
 
@@ -63,6 +63,34 @@ def _start_keeper(d, fifo):
 
 
 def supervise_main(d, gen, resume_sid=None):
+    """Run one gen. Whatever goes wrong, never leave the gen without an exit
+    record (watch would wait for it forever) or with an orphaned keeper (it
+    would hold the FIFO open)."""
+    try:
+        return _supervise(d, gen, resume_sid)
+    except BaseException as e:  # GUARD:supervise-record
+        _record_unexpected_exit(d, gen, e)
+        raise
+
+
+def _record_unexpected_exit(d, gen, e):
+    try:
+        p = os.path.join(d, "exit.json")
+        if (read_json(p, None) or {}).get("gen") != gen:
+            atomic_write_json(p, {"gen": gen, "rc": None, "ended": now_iso(),
+                                  "error": "supervisor failed: %s: %s" % (type(e).__name__, e)})
+    finally:
+        # The keeper is our own child; it wrote its pid to keeper.ready.
+        pid = (read_json(os.path.join(d, "keeper.ready"), {}) or {}).get("pid")
+        if pid and proc_parent_and_args(pid)[0] == os.getpid():
+            try:
+                os.kill(pid, signal.SIGTERM)
+                os.waitpid(pid, 0)
+            except (OSError, ChildProcessError):
+                pass
+
+
+def _supervise(d, gen, resume_sid):
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     meta = read_json(os.path.join(d, "meta.json"), {}) or {}
