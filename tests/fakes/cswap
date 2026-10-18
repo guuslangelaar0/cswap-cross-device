@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Fake `cswap run <account> -- <claude args>`: prints cswap's banner to
+stdout (as the real one does) and execs the claude stub."""
+import os, sys
+a = sys.argv[1:]
+assert a[0] == "run" and "--" in a, a
+rest = a[a.index("--") + 1:]
+sys.stdout.write("Launching Account-2 (%s) [session mode]\n" % a[1])
+sys.stdout.flush()
+stub = os.path.join(os.path.dirname(os.path.abspath(__file__)), "claude_stub.py")
+os.environ["STUB_ACCOUNT"] = a[1]
+os.execv(sys.executable, [sys.executable, stub] + rest)

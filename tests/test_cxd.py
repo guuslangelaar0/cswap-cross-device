@@ -1,0 +1,625 @@
+"""Plumbing tests with a stub `claude` (tests/fakes/claude_stub.py), a fake
+`cswap` and a fake `ssh`. Run: python3 -m unittest -v tests.test_cxd
+
+Each guard test names the source mutation that must turn it red; see
+tests/mutate.py, which applies each mutation to a throwaway copy and runs it.
+"""
+
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CXD = os.path.join(REPO, "bin", "cxd")
+HOOK = os.path.join(REPO, "hooks", "cxd-hook")
+FAKES = os.path.join(REPO, "tests", "fakes")
+sys.path.insert(0, os.path.join(REPO, "lib"))
+
+from cxd.common import proc_alive, read_json  # noqa: E402
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="cxd-test-")
+        self.local = os.path.join(self.tmp, "local", ".cxd")
+        self.remote = os.path.join(self.tmp, "remote", ".cxd")
+        self.work = os.path.join(self.tmp, "work")
+        os.makedirs(self.work)
+        self.env = dict(os.environ)
+        for k in list(self.env):
+            if k.startswith(("CLAUDE_CODE_", "STUB_", "FAKE_SSH_")) or k in ("CXD_HOME", "CXD_SELF"):
+                del self.env[k]
+        self.env.update({
+            "CXD_HOME": self.local, "CXD_SELF": "laptop",
+            "CXD_CSWAP": os.path.join(FAKES, "cswap"), "CXD_SSH": os.path.join(FAKES, "ssh"),
+            # Never the real claude: a run without an account execs CXD_CLAUDE.
+            "CXD_CLAUDE": os.path.join(FAKES, "claude_stub.py"),
+            "FAKE_REMOTE_CXD_HOME": self.remote,
+        })
+        os.makedirs(self.local, mode=0o700)
+        os.makedirs(self.remote, mode=0o700)
+        # Runs go through (fake) `cswap run work --` unless a test says otherwise.
+        with open(os.path.join(self.local, "config.json"), "w") as f:
+            json.dump({"self": ["laptop"], "default_account": "work",
+                       "hosts": {"buildbox": {"transport": "ssh", "python": sys.executable, "cxd": CXD}}}, f)
+        with open(os.path.join(self.remote, "config.json"), "w") as f:
+            json.dump({"default_account": "work"}, f)
+        self.bg = []
+
+    def tearDown(self):
+        for p in self.bg:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+        # Kill only processes this test's cxd recorded (verified identity).
+        for home in (self.local, self.remote):
+            rd = os.path.join(home, "runs")
+            if not os.path.isdir(rd):
+                continue
+            for name in os.listdir(rd):
+                pid_files = [f for f in os.listdir(os.path.join(rd, name)) if f.startswith("pids")]
+                for pf in pid_files:
+                    pids = read_json(os.path.join(rd, name, pf), {}) or {}
+                    for k in ("claude", "keeper", "supervisor"):
+                        if proc_alive(pids.get(k + "_pid"), pids.get(k + "_ident")):
+                            try:
+                                os.kill(pids[k + "_pid"], signal.SIGKILL)
+                            except OSError:
+                                pass
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # ---------------------------------------------------------- helpers
+    def cxd(self, *args, env=None, timeout=120, stdin=None):
+        e = dict(self.env)
+        if env:
+            e.update(env)
+        r = subprocess.run([sys.executable, CXD] + list(args), input=stdin, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, universal_newlines=True, env=e, timeout=timeout,
+                           cwd=self.work)
+        return r
+
+    def ok(self, *args, **kw):
+        r = self.cxd(*args, **kw)
+        self.assertEqual(r.returncode, 0, "cxd %s failed rc=%s\nstdout=%s\nstderr=%s" % (args, r.returncode, r.stdout, r.stderr))
+        return r
+
+    def prompt(self, text):
+        p = os.path.join(self.tmp, "prompt-%d.txt" % time.time_ns())
+        with open(p, "w") as f:
+            f.write(text)
+        return p
+
+    def home(self, host):
+        return self.local if host == "laptop" else self.remote
+
+    def pids(self, host, name):
+        return read_json(os.path.join(self.home(host), "runs", name, "pids.json"), {}) or {}
+
+    def results(self, host, name):
+        out = []
+        p = os.path.join(self.home(host), "runs", name, "out.jsonl")
+        try:
+            with open(p) as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("{"):
+                        ev = json.loads(line)
+                        if ev.get("type") == "result":
+                            out.append(ev["result"])
+        except OSError:
+            pass
+        return out
+
+    def inits(self, host, name):
+        """The stub's init event of every gen: it records the argv claude got."""
+        with open(os.path.join(self.home(host), "runs", name, "out.jsonl")) as f:
+            return [json.loads(l) for l in f if '"init"' in l]
+
+    def wait_results(self, host, name, n, timeout=30):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            res = self.results(host, name)
+            if len(res) >= n:
+                return res
+            time.sleep(0.1)
+        self.fail("run %s/%s produced %d results, wanted %d" % (host, name, len(self.results(host, name)), n))
+
+    def start(self, host, name, text, env=None):
+        r = self.ok("start", host, name, self.prompt(text), "--init-timeout", "20", env=env)
+        self.assertIn("started", r.stdout)
+        return r
+
+    def watch_bg(self, host, name, env=None):
+        e = dict(self.env)
+        if env:
+            e.update(env)
+        out = open(os.path.join(self.tmp, "watch-%s-%s.log" % (host, name)), "w+")
+        p = subprocess.Popen([sys.executable, CXD, "watch", host, name, "--json", "--heartbeat", "3600"],
+                             stdout=out, stderr=subprocess.STDOUT, env=e, universal_newlines=True)
+        self.bg.append(p)
+        return p, out.name
+
+    def read_events(self, log):
+        evs = []
+        with open(log) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("{"):
+                    evs.append(json.loads(line))
+        return evs
+
+    def wait_event(self, log, pred, timeout=30):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            for e in self.read_events(log):
+                if pred(e):
+                    return e
+            time.sleep(0.1)
+        self.fail("no matching event in %s:\n%s" % (log, open(log).read()))
+
+
+class TestRuns(Base):
+    def test_start_send_list(self):
+        self.start("laptop", "w1", "hello MARK-A")
+        res = self.wait_results("laptop", "w1", 1)
+        self.assertIn("MARK-A", res[0])
+        self.ok("send", "laptop", "w1", "second MARK-B")
+        res = self.wait_results("laptop", "w1", 2)
+        self.assertIn("MARK-B", res[1])
+        r = self.ok("list", "laptop", "--json")
+        runs = json.loads(r.stdout)[0]["runs"]
+        self.assertEqual([(x["name"], x["alive"], x["turns"]) for x in runs], [("w1", True, 2)])
+        self.assertIn("MARK-B", runs[0]["last_result"])
+        self.assertAlmostEqual(runs[0]["cost_usd"], 0.002, places=6)
+        mode = os.stat(os.path.join(self.local, "runs", "w1")).st_mode & 0o777
+        self.assertEqual(mode, 0o700)
+
+    def test_keeper_holds_session_open_between_messages(self):
+        """GUARD keeper. Mutation: supervisor starts no keeper -> EOF after the
+        first message ends the session."""
+        self.start("laptop", "w2", "first MARK-1")
+        self.wait_results("laptop", "w2", 1)
+        time.sleep(1.5)
+        pids = self.pids("laptop", "w2")
+        self.assertTrue(proc_alive(pids["claude_pid"], pids["claude_ident"]), "session died between messages")
+        self.ok("send", "laptop", "w2", "MARK-2")
+        self.assertIn("MARK-2", self.wait_results("laptop", "w2", 2)[1])
+
+    def test_mid_run_send_is_acted_on(self):
+        self.start("laptop", "w3", "SLEEP 3 MARK-FIRST")
+        time.sleep(0.5)
+        self.assertEqual(self.results("laptop", "w3"), [])  # still in turn 1
+        self.ok("send", "laptop", "w3", "also MARK-MID")
+        res = self.wait_results("laptop", "w3", 2)
+        self.assertIn("MARK-FIRST", res[0])
+        self.assertIn("MARK-MID", res[1])
+
+    def test_send_to_dead_run_is_refused(self):
+        """GUARD send-dead. Mutation: liveness check removed AND the FIFO opened
+        O_RDWR (a writer that never fails) -> the send 'succeeds' silently."""
+        self.start("laptop", "w4", "MARK-X")
+        self.wait_results("laptop", "w4", 1)
+        self.ok("stop", "laptop", "w4", "--grace", "10")
+        r = self.cxd("send", "laptop", "w4", "MARK-LATE")
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertIn("not running", r.stderr)
+        self.assertNotIn("MARK-LATE", " ".join(self.results("laptop", "w4")))
+
+    def test_stop_by_eof(self):
+        """GUARD stop-alive. Mutation: signals are never delivered -> stop
+        leaves the process alive."""
+        self.start("laptop", "w5", "MARK-S")
+        self.wait_results("laptop", "w5", 1)
+        pids = self.pids("laptop", "w5")
+        r = self.ok("stop", "laptop", "w5", "--grace", "10", "--int-wait", "2", "--term-wait", "2", "--json")
+        res = json.loads(r.stdout)
+        self.assertTrue(res["stopped"])
+        self.assertEqual(res["steps"], ["keeper-eof", "exited-on-eof"])
+        self.assertEqual(res["rc"], 0)
+        self.assertFalse(proc_alive(pids["claude_pid"], pids["claude_ident"]))
+        self.assertFalse(proc_alive(pids["keeper_pid"], pids["keeper_ident"]))
+
+    def test_stop_escalates_to_sigint_and_sigterm(self):
+        """GUARD stop-alive (escalation path)."""
+        self.start("laptop", "w6", "MARK-S", env={"STUB_IGNORE_EOF": "1", "STUB_IGNORE_INT": "1"})
+        self.wait_results("laptop", "w6", 1)
+        pids = self.pids("laptop", "w6")
+        r = self.ok("stop", "laptop", "w6", "--grace", "1", "--int-wait", "1", "--term-wait", "5", "--json")
+        res = json.loads(r.stdout)
+        self.assertEqual(res["steps"], ["keeper-eof", "grace-expired", "sigint", "sigterm"])
+        self.assertEqual(res["rc"], 143)  # SIGTERM, as the real CLI reports it
+        self.assertFalse(proc_alive(pids["claude_pid"], pids["claude_ident"]))
+
+    def test_stop_when_eof_is_ignored_interrupts_once_idle(self):
+        """macOS behaviour: claude does not exit on FIFO EOF. stop must not sit
+        out the whole grace period on an idle run."""
+        self.start("laptop", "wi", "MARK-1", env={"STUB_IGNORE_EOF": "1"})
+        self.wait_results("laptop", "wi", 1)
+        t0 = time.time()
+        r = self.ok("stop", "laptop", "wi", "--grace", "60", "--json")
+        res = json.loads(r.stdout)
+        self.assertLess(time.time() - t0, 15)
+        self.assertEqual(res["steps"], ["keeper-eof", "turn-idle", "sigint"])
+
+    def test_stop_waits_for_the_running_turn(self):
+        self.start("laptop", "wt", "SLEEP 4 MARK-FINISHED", env={"STUB_IGNORE_EOF": "1"})
+        time.sleep(0.5)
+        self.assertEqual(self.results("laptop", "wt"), [])
+        r = self.ok("stop", "laptop", "wt", "--grace", "60", "--json")
+        res = json.loads(r.stdout)
+        self.assertEqual(res["steps"], ["keeper-eof", "turn-idle", "sigint"])
+        self.assertIn("MARK-FINISHED", self.results("laptop", "wt")[0])  # the turn completed
+
+    def test_resume_refused_while_alive(self):
+        """GUARD resume-alive. Mutation: the alive check in resume is removed."""
+        self.start("laptop", "w7", "MARK-1")
+        self.wait_results("laptop", "w7", 1)
+        before = self.pids("laptop", "w7")
+        r = self.cxd("resume", "laptop", "w7", self.prompt("MARK-2"))
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertIn("still running", r.stderr)
+        after = self.pids("laptop", "w7")
+        self.assertEqual(before["claude_pid"], after["claude_pid"])
+        self.assertTrue(proc_alive(after["claude_pid"], after["claude_ident"]))
+
+    def test_resume_after_stop_adds_a_turn(self):
+        self.start("laptop", "w8", "MARK-1")
+        self.wait_results("laptop", "w8", 1)
+        sid = read_json(os.path.join(self.local, "runs", "w8", "meta.json"))["session_id"]
+        self.assertTrue(sid)
+        self.ok("stop", "laptop", "w8", "--grace", "10")
+        r = self.ok("resume", "laptop", "w8", self.prompt("MARK-RESUMED"), "--json")
+        res = json.loads(r.stdout)
+        self.assertEqual(res["gen"], 2)
+        self.assertEqual(res["session_id"], sid)
+        self.assertIn("MARK-RESUMED", self.wait_results("laptop", "w8", 2)[1])
+        self.ok("stop", "laptop", "w8", "--grace", "10")
+
+    def test_start_wires_account_cwd_and_claude_args(self):
+        cwd = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(cwd)
+        self.ok("start", "laptop", "wc", self.prompt("MARK-1"), "--account", "acct-x", "--cwd", cwd,
+                "--init-timeout", "20", "--", "--model", "sonnet",
+                env={"CLAUDE_CODE_SESSION_ID": "lead-session-should-not-leak"})
+        self.wait_results("laptop", "wc", 1)
+        with open(os.path.join(self.local, "runs", "wc", "out.jsonl")) as f:
+            init = [json.loads(l) for l in f if '"init"' in l][0]
+        self.assertEqual(init["account"], "acct-x")
+        self.assertEqual(os.path.realpath(init["cwd"]), os.path.realpath(cwd))
+        self.assertEqual(init["argv"][-2:], ["--model", "sonnet"])
+        for flag in ("-p", "--input-format", "stream-json", "--replay-user-messages"):
+            self.assertIn(flag, init["argv"])
+        self.assertIsNone(init["leaked_session_env"])
+
+    def test_start_uses_default_account_from_config(self):
+        self.start("laptop", "wdef", "MARK-1")
+        self.wait_results("laptop", "wdef", 1)
+        with open(os.path.join(self.local, "runs", "wdef", "out.jsonl")) as f:
+            init = [json.loads(l) for l in f if '"init"' in l][0]
+        self.assertEqual(init["account"], "work")  # launched through `cswap run work --`
+
+    def test_start_without_account_runs_plain_claude(self):
+        """No --account and no default_account: plain `claude`, no cswap."""
+        with open(os.path.join(self.local, "config.json"), "w") as f:
+            json.dump({"self": ["laptop"]}, f)
+        self.start("laptop", "wp", "MARK-PLAIN", env={"CXD_CSWAP": "/nonexistent/cswap"})
+        self.assertIn("MARK-PLAIN", self.wait_results("laptop", "wp", 1)[0])
+        with open(os.path.join(self.local, "runs", "wp", "out.jsonl")) as f:
+            init = [json.loads(l) for l in f if '"init"' in l][0]
+        self.assertIsNone(init["account"])  # STUB_ACCOUNT is only set by the fake cswap
+        self.assertIn("--input-format", init["argv"])
+        self.assertIsNone(read_json(os.path.join(self.local, "runs", "wp", "meta.json"))["account"])
+        r = self.ok("list", "laptop")
+        self.assertIn("acct=-", r.stdout)
+        # Asking for an account without cswap installed is refused up front.
+        r = self.cxd("start", "laptop", "wq", self.prompt("MARK-1"), "--account", "work",
+                     env={"CXD_CSWAP": "/nonexistent/cswap"})
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertIn("cswap not found", r.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.local, "runs", "wq")))
+
+    def test_default_launch_has_no_permission_bypass(self):
+        """GUARD bypass-on-by-default. Mutation: --dangerously-skip-permissions is
+        back in the default launch command."""
+        r = self.ok("start", "laptop", "wn", self.prompt("MARK-1"), "--init-timeout", "20",
+                    "--", "--permission-mode", "acceptEdits")
+        self.wait_results("laptop", "wn", 1)
+        argv = self.inits("laptop", "wn")[0]["argv"]
+        self.assertNotIn("--dangerously-skip-permissions", argv)
+        self.assertEqual(argv[-2:], ["--permission-mode", "acceptEdits"])  # args after -- still pass through
+        self.assertFalse(read_json(os.path.join(self.local, "runs", "wn", "meta.json"))["skip_permissions"])
+        # One warning on stderr that names both opt-ins; stdout stays the start line.
+        self.assertEqual(r.stderr.count("cxd: warning:"), 1, r.stderr)
+        self.assertIn("--skip-permissions", r.stderr)
+        self.assertIn('"skip_permissions": true', r.stderr)
+        self.assertNotIn("warning", r.stdout)
+
+    def test_permission_bypass_is_opt_in_by_flag_or_host_config(self):
+        # 1. `--skip-permissions` on the command line.
+        r = self.ok("start", "laptop", "wf", self.prompt("MARK-1"), "--skip-permissions", "--init-timeout", "20",
+                    "--", "--model", "sonnet")
+        self.wait_results("laptop", "wf", 1)
+        argv = self.inits("laptop", "wf")[0]["argv"]
+        self.assertIn("--dangerously-skip-permissions", argv)
+        self.assertEqual(argv[-2:], ["--model", "sonnet"])
+        self.assertNotIn("warning", r.stderr)
+        # A resumed run keeps the choice it was started with.
+        self.ok("stop", "laptop", "wf", "--grace", "10")
+        self.ok("resume", "laptop", "wf", self.prompt("MARK-2"), "--init-timeout", "20")
+        self.wait_results("laptop", "wf", 2)
+        self.assertIn("--dangerously-skip-permissions", self.inits("laptop", "wf")[1]["argv"])
+        # 2. "skip_permissions": true in the config of the host that runs the worker.
+        with open(os.path.join(self.remote, "config.json"), "w") as f:
+            json.dump({"default_account": "work", "skip_permissions": True}, f)
+        r = self.ok("start", "buildbox", "wk", self.prompt("MARK-1"), "--init-timeout", "20")
+        self.wait_results("buildbox", "wk", 1)
+        self.assertIn("--dangerously-skip-permissions", self.inits("buildbox", "wk")[0]["argv"])
+        self.assertNotIn("warning", r.stderr)
+        # It applies to that host only: the laptop's config has no key.
+        r = self.ok("start", "laptop", "wl", self.prompt("MARK-1"), "--init-timeout", "20")
+        self.wait_results("laptop", "wl", 1)
+        self.assertNotIn("--dangerously-skip-permissions", self.inits("laptop", "wl")[0]["argv"])
+        self.assertIn("cxd: warning:", r.stderr)
+        # 3. Only a JSON true opts in.
+        with open(os.path.join(self.remote, "config.json"), "w") as f:
+            json.dump({"default_account": "work", "skip_permissions": "false"}, f)
+        r = self.ok("start", "buildbox", "ws", self.prompt("MARK-1"), "--init-timeout", "20")
+        self.wait_results("buildbox", "ws", 1)
+        self.assertNotIn("--dangerously-skip-permissions", self.inits("buildbox", "ws")[0]["argv"])
+        self.assertIn("cxd: warning:", r.stderr)
+
+    def test_start_reports_a_process_that_dies_at_once(self):
+        r = self.cxd("start", "laptop", "wd", self.prompt("MARK-1"), "--init-timeout", "10",
+                     env={"STUB_FAIL_START": "1"})
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertIn("exited during start", r.stderr)
+        self.assertIn("unknown option", r.stderr)
+
+    def test_start_refuses_existing_name(self):
+        self.start("laptop", "w9", "MARK-1")
+        r = self.cxd("start", "laptop", "w9", self.prompt("again"))
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("already exists", r.stderr)
+
+
+class TestInit(Base):
+    def test_init_writes_config_and_links_cli(self):
+        home = os.path.join(self.tmp, "fresh", ".cxd")
+        env = {"CXD_HOME": home}
+        self.ok("init", "--self", "laptop", "--peer", "buildbox", "--account", "work",
+                "--account", "personal", "--account", "work", "--default-account", "work", env=env)
+        cfg = read_json(os.path.join(home, "config.json"))
+        self.assertEqual(cfg["self"], ["laptop"])
+        self.assertEqual(cfg["hosts"], {"buildbox": {"transport": "ssh"}})
+        self.assertEqual(cfg["accounts"], ["work", "personal"])
+        self.assertEqual(cfg["default_account"], "work")
+        link = os.path.join(home, "bin", "cxd")
+        self.assertEqual(os.path.realpath(link), os.path.realpath(CXD))
+        self.assertEqual(os.stat(home).st_mode & 0o777, 0o700)
+        # A bare re-run keeps the config and refreshes the link.
+        self.ok("init", env=env)
+        self.assertEqual(read_json(os.path.join(home, "config.json")), cfg)
+        self.assertEqual(os.path.realpath(link), os.path.realpath(CXD))
+        r = subprocess.run([sys.executable, link, "--version"], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, universal_newlines=True)
+        self.assertIn("cxd ", r.stdout)
+
+
+class TestWatch(Base):
+    def test_watch_local_turns_pr_exit(self):
+        self.start("laptop", "wa", "MARK-1")
+        self.wait_results("laptop", "wa", 1)
+        p, log = self.watch_bg("laptop", "wa")
+        self.wait_event(log, lambda e: e["ev"] == "status")
+        self.ok("send", "laptop", "wa", "PR MARK-2")
+        self.wait_event(log, lambda e: e["ev"] == "turn" and "MARK-2" in e["result"])
+        self.wait_event(log, lambda e: e["ev"] == "pr" and e["url"].endswith("/pull/7"))
+        self.ok("stop", "laptop", "wa", "--grace", "10")
+        e = self.wait_event(log, lambda e: e["ev"] == "exit")
+        self.assertEqual(e["rc"], 0)
+        p.wait(10)
+        self.assertEqual(p.returncode, 0)
+
+    def test_watch_survives_ssh_failures_without_reporting_exit(self):
+        """GUARD watch-transport. Mutation: watch reports 'exit' when the ssh
+        channel fails -> an exit is reported for a run that is alive."""
+        self.start("buildbox", "wr", "MARK-1")
+        self.wait_results("buildbox", "wr", 1)
+        fail = os.path.join(self.tmp, "ssh-fail")
+        with open(fail, "w") as f:
+            f.write("2")
+        p, log = self.watch_bg("buildbox", "wr", env={"FAKE_SSH_FAIL_FILE": fail, "FAKE_SSH_DROP_AFTER": "4"})
+        self.wait_event(log, lambda e: e["ev"] == "status", timeout=40)
+        transport = [e for e in self.read_events(log) if e["ev"] == "transport"]
+        self.assertEqual(len(transport), 2, open(log).read())
+        self.assertFalse([e for e in self.read_events(log) if e["ev"] == "exit"], open(log).read())
+        # The stream is cut every 4 s (rc 255); keep the run busy across a cut.
+        self.ok("send", "buildbox", "wr", "SLEEP 5 MARK-ACROSSDROP")
+        self.wait_event(log, lambda e: e["ev"] == "turn" and "MARK-ACROSSDROP" in e["result"], timeout=40)
+        evs = self.read_events(log)
+        self.assertGreaterEqual(len([e for e in evs if e["ev"] == "transport"]), 3, "the stream was never cut")
+        self.assertEqual(len([e for e in evs if e["ev"] == "turn" and "MARK-ACROSSDROP" in e["result"]]), 1)
+        self.assertFalse([e for e in evs if e["ev"] == "exit"])
+        pids = self.pids("buildbox", "wr")
+        self.assertTrue(proc_alive(pids["claude_pid"], pids["claude_ident"]))
+        self.ok("stop", "buildbox", "wr", "--grace", "10")
+        self.wait_event(log, lambda e: e["ev"] == "exit", timeout=40)
+        p.wait(20)
+        self.assertEqual(p.returncode, 0)
+
+
+class TestRemote(Base):
+    def test_remote_start_send_stop_resume_list(self):
+        self.start("buildbox", "rr", "MARK-R1")
+        self.assertIn("MARK-R1", self.wait_results("buildbox", "rr", 1)[0])
+        self.assertFalse(os.path.isdir(os.path.join(self.local, "runs")), "run state leaked to the local host")
+        self.ok("send", "buildbox", "rr", "MARK-R2")
+        self.assertIn("MARK-R2", self.wait_results("buildbox", "rr", 2)[1])
+        r = self.ok("list", "--json")
+        hosts = {h["host"]: h for h in json.loads(r.stdout)}
+        self.assertEqual(hosts["buildbox"]["runs"][0]["turns"], 2)
+        self.assertEqual(hosts["laptop"]["runs"], [])
+        self.ok("stop", "buildbox", "rr", "--grace", "10")
+        self.ok("resume", "buildbox", "rr", self.prompt("MARK-R3"))
+        self.assertIn("MARK-R3", self.wait_results("buildbox", "rr", 3)[2])
+        self.ok("stop", "buildbox", "rr", "--grace", "10")
+
+    def test_transport_failure_is_exit_4_not_a_refusal(self):
+        fail = os.path.join(self.tmp, "ssh-fail")
+        with open(fail, "w") as f:
+            f.write("1")
+        r = self.cxd("list", "buildbox", env={"FAKE_SSH_FAIL_FILE": fail})
+        self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+        self.assertIn("UNREACHABLE", r.stdout)
+
+
+FAKE_CLAUDE = r'''# A process whose argv[0] is "claude" and that runs plugin hooks as children,
+# the way Claude Code does. Commands on stdin: "<Event>" runs that hook; the
+# hook's stdout goes to $OUTDIR/<n>.out and "<n> <rc>" is printed.
+# bash, not Python: a macOS framework Python re-execs itself and loses argv[0].
+sid="$1"
+n=0
+while IFS= read -r ev; do
+  [ -n "$ev" ] || continue
+  n=$((n + 1))
+  printf '{"session_id": "%s", "hook_event_name": "%s", "cwd": "%s", "source": "startup", "last_assistant_message": "worker report MARK-STOP"}' "$sid" "$ev" "$PWD" \
+    | /bin/sh -c '"$HOOK" "$1"' sh "$ev" > "$OUTDIR/$n.out"
+  echo "$n $?"
+done
+'''
+
+
+class TestHooks(Base):
+    def fake_session(self, sid):
+        bindir = os.path.join(self.tmp, "fakebin")
+        os.makedirs(bindir, exist_ok=True)
+        script = os.path.join(bindir, "fake-claude.sh")
+        with open(script, "w") as f:
+            f.write(FAKE_CLAUDE)
+        outdir = os.path.join(self.tmp, "hook-out-" + sid[:8])
+        os.makedirs(outdir)
+        env = dict(self.env, HOOK=HOOK, OUTDIR=outdir)
+        # argv[0] "claude", like the real native binary.
+        p = subprocess.Popen(["claude", script, sid], executable="/bin/bash", stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, env=env, universal_newlines=True, bufsize=1)
+        p.outdir = outdir
+        self.bg.append(p)
+        return p
+
+    def hook(self, p, event):
+        p.stdin.write(event + "\n")
+        p.stdin.flush()
+        n, rc = p.stdout.readline().split()
+        with open(os.path.join(p.outdir, n + ".out")) as f:
+            out = f.read()
+        return {"event": event, "rc": int(rc), "out": out}
+
+    def test_hook_inbox_delivery_exactly_once_and_stop_report(self):
+        sid = "11111111-2222-3333-4444-555555555555"
+        p = self.fake_session(sid)
+        self.assertEqual(self.hook(p, "SessionStart"), {"event": "SessionStart", "rc": 0, "out": ""})
+        rec = read_json(os.path.join(self.local, "sessions", sid + ".json"))
+        self.assertEqual(rec["pid"], p.pid, "SessionStart registered the wrong pid")
+        w, log = self.watch_bg("laptop", sid)
+        self.wait_event(log, lambda e: e["ev"] == "status" and e["alive"] is True)
+        r = self.ok("send", "laptop", sid[:8], "please include MARK-HOOK")
+        self.assertIn("via inbox", r.stdout)
+        first = self.hook(p, "PostToolUse")
+        ctx = json.loads(first["out"])["hookSpecificOutput"]
+        self.assertEqual(ctx["hookEventName"], "PostToolUse")
+        self.assertTrue(ctx["additionalContext"].startswith("Message from the lead session "))
+        self.assertIn("MARK-HOOK", ctx["additionalContext"])
+        self.assertEqual(self.hook(p, "PostToolUse")["out"], "")  # delivered once
+        self.ok("send", "laptop", sid, "late MARK-AT-STOP")
+        stop = self.hook(p, "Stop")
+        self.assertIn("MARK-AT-STOP", json.loads(stop["out"])["hookSpecificOutput"]["additionalContext"])
+        self.wait_event(log, lambda e: e["ev"] == "outbox" and e["kind"] == "delivered")
+        self.wait_event(log, lambda e: e["ev"] == "outbox" and e["kind"] == "stop" and "MARK-STOP" in e["text"])
+        self.hook(p, "SessionEnd")
+        self.wait_event(log, lambda e: e["ev"] == "exit")
+        r = self.cxd("send", "laptop", sid, "too late")
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("not running", r.stderr)
+
+    def test_send_refused_when_session_process_is_gone(self):
+        sid = "22222222-2222-3333-4444-555555555555"
+        p = self.fake_session(sid)
+        self.hook(p, "SessionStart")
+        p.kill()
+        p.wait()
+        r = self.cxd("send", "laptop", sid, "hello")
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("process gone", r.stderr)
+
+    def test_concurrent_hooks_claim_each_message_once(self):
+        sid = "33333333-2222-3333-4444-555555555555"
+        inbox = os.path.join(self.local, "inbox", sid)
+        os.makedirs(inbox, mode=0o700)
+        for i in range(30):
+            with open(os.path.join(inbox, "%019d-%06d.json" % (i, i)), "w") as f:
+                json.dump({"id": str(i), "ts": "t", "sender": "s", "text": "MSG-%d-END" % i}, f)
+        outs = []
+
+        def drain():
+            r = subprocess.run([HOOK, "PostToolUse"], input=json.dumps({"session_id": sid}),
+                               stdout=subprocess.PIPE, universal_newlines=True, env=self.env)
+            outs.append(r.stdout)
+
+        ts = [threading.Thread(target=drain) for _ in range(8)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        while os.listdir(inbox):
+            drain()
+        seen = []
+        for o in outs:
+            if o.strip():
+                ctx = json.loads(o)["hookSpecificOutput"]["additionalContext"]
+                seen += [int(x.split("-")[1]) for x in ctx.split() if x.startswith("MSG-")]
+        self.assertEqual(sorted(seen), list(range(30)))
+
+    def test_hook_never_breaks_a_session(self):
+        cases = [b"", b"not json", b"[]", json.dumps({"session_id": "../../etc"}).encode()]
+        for inp in cases:
+            for ev in ("SessionStart", "PostToolUse", "Stop", "SessionEnd", "UserPromptSubmit"):
+                r = subprocess.run([HOOK, ev], input=inp, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   env=self.env)
+                self.assertEqual((r.returncode, r.stdout, r.stderr), (0, b"", b""), (ev, inp))
+        # An unwritable home must not break it either.
+        bad = dict(self.env, CXD_HOME="/nonexistent/forbidden/.cxd")
+        r = subprocess.run([HOOK, "Stop"], input=json.dumps({"session_id": "abcd1234"}).encode(),
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=bad)
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, b"", b""))
+
+    def test_hook_is_fast(self):
+        payload = json.dumps({"session_id": "44444444-aaaa", "last_assistant_message": "x"}).encode()
+        for ev, limit in (("PostToolUse", 100), ("Stop", 100)):
+            ts = []
+            for _ in range(7):
+                t0 = time.time()
+                subprocess.run([HOOK, ev], input=payload, stdout=subprocess.PIPE, env=self.env)
+                ts.append((time.time() - t0) * 1000)
+            med = sorted(ts)[3]
+            print("hook %s median %.1f ms" % (ev, med), file=sys.stderr)
+            self.assertLess(med, limit)
+
+    def test_notify_lands_in_outbox(self):
+        r = self.ok("notify", "built it MARK-N", env={"CLAUDE_CODE_SESSION_ID": "55555555-aaaa"})
+        self.assertIn("55555555-aaaa", r.stdout)
+        with open(os.path.join(self.local, "outbox", "55555555-aaaa.jsonl")) as f:
+            rec = json.loads(f.readline())
+        self.assertEqual((rec["kind"], rec["text"]), ("notify", "built it MARK-N"))
+        r = self.cxd("notify", "x")
+        self.assertEqual(r.returncode, 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

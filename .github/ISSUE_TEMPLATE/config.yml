@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/guuslangelaar0/cswap-cross-device/security/advisories/new
+    about: Please report security problems privately, never in a public issue.
+  - name: cswap (claude-swap) issues
+    url: https://github.com/realiti4/claude-swap/issues
+    about: Problems with cswap itself belong in the claude-swap repository.

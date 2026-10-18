@@ -1,0 +1,11 @@
+{
+  "name": "cswap-cross-device",
+  "displayName": "cswap cross-device",
+  "version": "0.1.0",
+  "description": "Run Claude Code sessions on another cswap account or another machine, steer them mid-run, follow their progress, and stop or resume them. Headless runs over a stream-json FIFO, other sessions through a hook inbox, reports back through the Stop hook.",
+  "author": { "name": "Guus Langelaar" },
+  "homepage": "https://github.com/guuslangelaar0/cswap-cross-device",
+  "repository": "https://github.com/guuslangelaar0/cswap-cross-device",
+  "license": "MIT",
+  "keywords": ["claude-code", "plugin", "cswap", "claude-swap", "multi-account", "remote", "headless"]
+}

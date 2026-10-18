@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+"""Fake ssh: runs the remote command locally as a different 'host'
+(CXD_HOME=$FAKE_REMOTE_CXD_HOME, CXD_SELF=<alias>).
+
+Failure injection:
+  FAKE_SSH_FAIL_FILE   holds N: the next N connections fail with rc 255
+  FAKE_SSH_DROP_AFTER  seconds after which a *stream* request is cut (rc 255)
+"""
+import os, subprocess, sys, time
+a = sys.argv[1:]
+i = 0
+while i < len(a) and a[i].startswith("-"):
+    i += 2 if a[i] in ("-o", "-p", "-i", "-l", "-F") else 1
+host, remote = a[i], " ".join(a[i + 1:])
+ff = os.environ.get("FAKE_SSH_FAIL_FILE")
+if ff and os.path.exists(ff):
+    n = int(open(ff).read().strip() or 0)
+    if n > 0:
+        open(ff, "w").write(str(n - 1))
+        sys.stderr.write("ssh: connect to host %s port 22: Connection refused\n" % host)
+        sys.exit(255)
+req = sys.stdin.buffer.read()
+env = dict(os.environ, CXD_HOME=os.environ["FAKE_REMOTE_CXD_HOME"], CXD_SELF=host)
+p = subprocess.Popen(["/bin/sh", "-c", remote], stdin=subprocess.PIPE, env=env)
+p.stdin.write(req)
+p.stdin.close()
+drop = os.environ.get("FAKE_SSH_DROP_AFTER")
+if drop and b'"op": "stream"' in req:
+    deadline = time.time() + float(drop)
+    while p.poll() is None and time.time() < deadline:
+        time.sleep(0.05)
+    if p.poll() is None:
+        p.kill(); p.wait()
+        sys.stderr.write("Connection to %s closed by remote host.\n" % host)
+        sys.exit(255)
+sys.exit(p.wait())

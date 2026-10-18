@@ -1,0 +1,19 @@
+#!/bin/sh
+# cswap-cross-device hook entry point. $1 = hook event name, hook JSON on stdin.
+# Contract: fast, silent on any error, always exit 0 - never break the session.
+ev="$1"
+d="${CXD_HOME:-$HOME/.cxd}"
+case "$ev" in
+  PostToolUse|UserPromptSubmit)
+    # Fast path: nothing queued for any session -> skip Python entirely.
+    set -- "$d"/inbox/*/*.json
+    if [ ! -e "$1" ]; then cat >/dev/null 2>&1; exit 0; fi
+    ;;
+esac
+root="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)" || exit 0
+py="${CXD_PYTHON:-}"
+if [ -z "$py" ]; then
+  if [ -x /usr/bin/python3 ]; then py=/usr/bin/python3; else py=python3; fi
+fi
+"$py" -I -S "$root/bin/cxd" _hook "$ev" 2>/dev/null
+exit 0

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.tmp-tests/
+.DS_Store
+.env
+.env.*
+!.env.example

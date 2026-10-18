@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+"""cxd - lead <-> worker messaging for Claude Code across cswap accounts and machines.
+
+Python 3 stdlib only. See README.md.
+"""
+import os
+import sys
+
+_here = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(_here), "lib"))
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "_hook":
+        # Hook fast path: import only what the hook needs.
+        from cxd.hook import main as hook_main
+        sys.exit(hook_main(sys.argv[2] if len(sys.argv) > 2 else ""))
+    from cxd.cli import main
+    sys.exit(main())

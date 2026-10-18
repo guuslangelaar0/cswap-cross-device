@@ -1,0 +1,16 @@
+{
+  "name": "cswap-cross-device",
+  "description": "Marketplace for the cswap-cross-device Claude Code plugin",
+  "owner": { "name": "Guus Langelaar" },
+  "plugins": [
+    {
+      "name": "cswap-cross-device",
+      "source": "./",
+      "description": "Run, steer, follow, stop and resume Claude Code sessions across cswap accounts and machines (cxd CLI + hooks)",
+      "version": "0.1.0",
+      "license": "MIT",
+      "homepage": "https://github.com/guuslangelaar0/cswap-cross-device",
+      "keywords": ["claude-code", "plugin", "cswap", "claude-swap", "multi-account", "remote", "headless"]
+    }
+  ]
+}

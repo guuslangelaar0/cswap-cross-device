@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: py
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit tests (stub claude, fake cswap, fake ssh)
+        env:
+          # Run the plugin hooks under the matrix Python too.
+          CXD_PYTHON: ${{ steps.py.outputs.python-path }}
+        run: python -m unittest discover -v -s tests
+      - name: Mutation proofs (every guard must go red)
+        env:
+          CXD_PYTHON: ${{ steps.py.outputs.python-path }}
+        run: python tests/mutate.py
+
+  lint:
+    name: lint and secret check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.9"
+      - name: Byte-compile on the oldest supported Python
+        run: |
+          python -m py_compile bin/cxd tests/fakes/cswap tests/fakes/ssh
+          python -m compileall -q lib tests
+      - name: Shell syntax
+        run: |
+          sh -n hooks/cxd-hook
+          bash -n scripts/check-secrets.sh
+      - name: JSON manifests parse
+        run: |
+          for f in .claude-plugin/plugin.json .claude-plugin/marketplace.json hooks/hooks.json; do
+            python -m json.tool "$f" > /dev/null
+          done
+      - name: Secret check self-test (must catch planted fake secrets)
+        run: scripts/check-secrets.sh --self-test
+      - name: Secret check over the tree
+        run: scripts/check-secrets.sh --all
