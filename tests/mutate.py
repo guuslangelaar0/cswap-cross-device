@@ -279,6 +279,14 @@ MUTATIONS = [
         "expect": "red",
     },
     {
+        "name": "npm-claude",
+        "what": "an npm-installed Claude Code (node .../@anthropic-ai/claude-code/cli.js) is not recognised",
+        "edits": [("lib/cxd/hook.py", '    return "/@anthropic-ai/claude-code/" in args  # GUARD:npm-claude\n',
+                   "    return False  # MUTATION\n")],
+        "tests": [T + "TestHooks.test_an_npm_installed_claude_is_recognised"],
+        "expect": "red",
+    },
+    {
         "name": "init-no-link",
         "what": "cxd init does not link ~/.cxd/bin/cxd, so peers cannot reach this host",
         "edits": [("lib/cxd/cli.py", "    link, target = _link_cli()\n",

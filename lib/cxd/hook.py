@@ -24,10 +24,22 @@ CONTEXT_BUDGET = 9000  # additionalContext is capped at 10k characters
 OUTBOX_TEXT = 2000
 
 
+def _is_claude(args):
+    """A Claude Code process: the native binary (`claude`, or a path under
+    .../claude/versions/), or an npm install run by node
+    (`node .../@anthropic-ai/claude-code/cli.js`)."""
+    first = args.split(" ", 1)[0]
+    if os.path.basename(first) == "claude" or "/claude/versions/" in first:
+        return True
+    return "/@anthropic-ai/claude-code/" in args  # GUARD:npm-claude
+
+
 def _claude_pid():
     """The nearest claude ancestor of this hook process. (CLAUDE_PID in the
     environment is not trusted: a session started from another session's Bash
-    tool inherits the parent's value.)"""
+    tool inherits the parent's value.) If the session's own claude were not
+    recognised, the walk would reach an outer session's claude, so recognise
+    every way Claude Code runs."""
     pid = os.getppid()
     for _ in range(6):
         if not pid or pid <= 1:
@@ -35,8 +47,7 @@ def _claude_pid():
         ppid, args = proc_parent_and_args(pid)
         if args is None:
             return None
-        first = args.split(" ", 1)[0]
-        if os.path.basename(first) == "claude" or "/claude/versions/" in first:
+        if _is_claude(args):
             return pid
         pid = ppid
     return None

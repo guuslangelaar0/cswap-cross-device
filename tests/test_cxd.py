@@ -865,6 +865,28 @@ class TestHooks(Base):
         self.assertEqual(r.returncode, 3)
         self.assertIn("not running", r.stderr)
 
+    def test_an_npm_installed_claude_is_recognised(self):
+        """GUARD npm-claude. Mutation: only a process named `claude` counts ->
+        an npm install (`node .../@anthropic-ai/claude-code/cli.js`) never gets
+        a pid, so every send to it is refused."""
+        sid = "deaddead-2222-3333-4444-555555555555"
+        pkg = os.path.join(self.tmp, "lib", "node_modules", "@anthropic-ai", "claude-code")
+        os.makedirs(pkg)
+        script = os.path.join(pkg, "cli.js")
+        with open(script, "w") as f:
+            f.write(FAKE_CLAUDE)
+        outdir = os.path.join(self.tmp, "hook-out-npm")
+        os.makedirs(outdir)
+        env = dict(self.env, HOOK=HOOK, OUTDIR=outdir)
+        p = subprocess.Popen(["node", script, sid], executable="/bin/bash", stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, env=env, universal_newlines=True, bufsize=1)
+        p.outdir = outdir
+        self.bg.append(p)
+        self.hook(p, "SessionStart")
+        rec = read_json(os.path.join(self.local, "sessions", sid + ".json"))
+        self.assertEqual(rec["pid"], p.pid)
+        self.ok("send", "laptop", sid, "MARK-NPM")
+
     def test_send_refused_when_session_process_is_gone(self):
         sid = "22222222-2222-3333-4444-555555555555"
         p = self.fake_session(sid)
