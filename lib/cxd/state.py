@@ -873,8 +873,16 @@ def op_doctor_info(args):
     return info
 
 
+def op_prune(args):
+    from .prune import prune
+    older = args.get("older_than_days")
+    return dict(prune(load_config(), older_than_days=float(older) if older is not None else None,
+                      runs=bool(args.get("runs")), dry_run=bool(args.get("dry_run"))), host=self_label())
+
+
 OPS = {
     "ping": op_ping,
+    "prune": op_prune,
     "start": op_start,
     "send": op_send,
     "stop": op_stop,

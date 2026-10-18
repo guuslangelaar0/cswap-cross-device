@@ -1369,6 +1369,122 @@ class TestMutationTable(unittest.TestCase):
                            stderr=subprocess.STDOUT, universal_newlines=True, timeout=60)
         self.assertEqual(r.returncode, 1, r.stdout)
         self.assertIn("unknown mutation", r.stdout)
+class TestPrune(Base):
+    DAY = 86400
+    fake_session = TestHooks.fake_session
+    hook = TestHooks.hook
+
+    def session_files(self, sid):
+        h = self.local
+        return [p for p in (os.path.join(h, "sessions", sid + ".json"), os.path.join(h, "outbox", sid + ".jsonl"),
+                            os.path.join(h, "inbox", sid), os.path.join(h, "claimed", sid),
+                            os.path.join(h, "delivered", sid)) if os.path.exists(p)]
+
+    def fake_record(self, sid, ended=True, age_days=10, pid=None, ident=None, run=None):
+        """A session record with mail and reports, last active age_days ago."""
+        from cxd.common import atomic_write_json
+        for d in ("sessions", "outbox", "inbox/" + sid, "delivered/" + sid):
+            os.makedirs(os.path.join(self.local, d), mode=0o700, exist_ok=True)
+        atomic_write_json(os.path.join(self.local, "sessions", sid + ".json"), {
+            "session_id": sid, "pid": pid, "pid_ident": ident, "cxd_run": run,
+            "ended": "2026-01-01T00:00:00+0000" if ended else None})
+        with open(os.path.join(self.local, "outbox", sid + ".jsonl"), "w") as f:
+            f.write('{"kind": "stop", "text": "x"}\n')
+        for sub in ("inbox", "delivered"):
+            with open(os.path.join(self.local, sub, sid, "0001-000001.json"), "w") as f:
+                f.write('{"id": "0001-000001", "text": "x"}')
+        old = time.time() - age_days * self.DAY
+        for p in self.session_files(sid):
+            for root, dirs, files in os.walk(p) if os.path.isdir(p) else [(None, [], [])]:
+                for n in files:
+                    os.utime(os.path.join(root, n), (old, old))
+            os.utime(p, (old, old))
+
+    def age_tree(self, top, when):
+        for root, dirs, files in os.walk(top):
+            for n in files + dirs:
+                os.utime(os.path.join(root, n), (when, when), follow_symlinks=False)
+        os.utime(top, (when, when))
+
+    def prune(self, *args):
+        r = self.ok("prune", "local", "--json", *args)
+        return json.loads(r.stdout)
+
+    def test_ended_sessions_are_pruned_after_the_configured_age(self):
+        """GUARD prune-age. Mutation: age is ignored -> a session that ended
+        yesterday is pruned with the old ones."""
+        self.fake_record("aaaa0000-old-ended", ended=True, age_days=10)
+        self.fake_record("aaaa0001-new-ended", ended=True, age_days=1)
+        self.fake_record("aaaa0002-old-crashed", ended=False, age_days=10, pid=999999999, ident="never")
+        res = self.prune()
+        self.assertEqual(sorted(res["sessions"]), ["aaaa0000-old-ended", "aaaa0002-old-crashed"])
+        self.assertEqual(self.session_files("aaaa0000-old-ended"), [])
+        self.assertEqual(self.session_files("aaaa0002-old-crashed"), [])
+        self.assertEqual(len(self.session_files("aaaa0001-new-ended")), 4)
+        # The age is configurable, in config.json or per call.
+        res = self.prune("--older-than", "0.5")
+        self.assertEqual(res["sessions"], ["aaaa0001-new-ended"])
+
+    def test_live_sessions_are_never_pruned(self):
+        """GUARD prune-live. Mutation: liveness is not checked -> a live session
+        that has been quiet for long is pruned."""
+        sid = "99999999-2222-3333-4444-555555555555"
+        p = self.fake_session(sid)
+        self.hook(p, "SessionStart")
+        rec = read_json(os.path.join(self.local, "sessions", sid + ".json"))
+        self.fake_record(sid, ended=False, age_days=30, pid=rec["pid"], ident=rec["pid_ident"])
+        res = self.prune("--older-than", "1")
+        self.assertEqual(res["sessions"], [])
+        self.assertEqual(len(self.session_files(sid)), 4)
+        self.ok("send", "laptop", sid, "still reachable MARK-LIVE")
+
+    def test_a_runs_session_goes_with_the_run(self):
+        self.start("laptop", "wp1", "MARK-1")
+        self.wait_results("laptop", "wp1", 1)
+        self.ok("stop", "laptop", "wp1", "--grace", "10")
+        self.fake_record("bbbb0000-run-session", ended=True, age_days=10, run="wp1")
+        old = time.time() - 10 * self.DAY
+        self.age_tree(os.path.join(self.local, "runs", "wp1"), old)
+        res = self.prune()
+        self.assertEqual((res["sessions"], res["runs"]), ([], []))  # runs only with --runs
+        res = self.prune("--runs", "--dry-run")
+        self.assertEqual((res["sessions"], res["runs"], res["dry_run"]), (["bbbb0000-run-session"], ["wp1"], True))
+        self.assertTrue(os.path.isdir(os.path.join(self.local, "runs", "wp1")))
+        res = self.prune("--runs")
+        self.assertEqual((res["sessions"], res["runs"]), (["bbbb0000-run-session"], ["wp1"]))
+        self.assertFalse(os.path.exists(os.path.join(self.local, "runs", "wp1")))
+        self.assertEqual(self.session_files("bbbb0000-run-session"), [])
+
+    def test_a_running_run_is_never_pruned(self):
+        self.start("laptop", "wp2", "MARK-1")
+        self.wait_results("laptop", "wp2", 1)
+        old = time.time() - 10 * self.DAY
+        self.age_tree(os.path.join(self.local, "runs", "wp2"), old)
+        res = self.prune("--runs", "--older-than", "1")
+        self.assertEqual(res["runs"], [])
+        self.ok("send", "laptop", "wp2", "MARK-2")
+
+    def test_session_start_prunes_at_most_hourly(self):
+        sid = "cccc0000-2222-3333-4444-555555555555"
+        self.fake_record("cccc0001-old-ended", ended=True, age_days=10)
+        p = self.fake_session(sid)
+        self.assertEqual(self.hook(p, "SessionStart")["out"], "")
+        self.assertEqual(self.session_files("cccc0001-old-ended"), [])
+        self.fake_record("cccc0002-old-ended", ended=True, age_days=10)
+        self.hook(p, "SessionStart")  # within the hour: no second pass
+        self.assertEqual(len(self.session_files("cccc0002-old-ended")), 4)
+
+    def test_a_broken_prune_setting_breaks_nothing(self):
+        for bad in ("soon", -3, None, [1]):
+            with open(os.path.join(self.local, "config.json"), "w") as f:
+                json.dump({"self": ["laptop"], "default_account": "work", "prune_after_days": bad}, f)
+            self.fake_record("dddd0000-new-ended", ended=True, age_days=1)
+            res = self.prune()  # falls back to the default (7 days)
+            self.assertEqual(res["sessions"], [], bad)
+            for ev in ("SessionStart", "Stop"):
+                r = subprocess.run([HOOK, ev], input=json.dumps({"session_id": "eeee0000-x"}).encode(),
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env)
+                self.assertEqual((r.returncode, r.stderr), (0, b""), (bad, ev))
 
 
 class TestSecretsCheck(unittest.TestCase):

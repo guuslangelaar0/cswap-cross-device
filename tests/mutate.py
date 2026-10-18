@@ -287,6 +287,23 @@ MUTATIONS = [
         "expect": "red",
     },
     {
+        "name": "prune-age",
+        "what": "pruning ignores the age: recently ended sessions are removed too",
+        "edits": [("lib/cxd/prune.py", "        if _last_change(paths) >= cutoff:  # GUARD:prune-age\n",
+                   "        if False:  # MUTATION\n")],
+        "tests": [T + "TestPrune.test_ended_sessions_are_pruned_after_the_configured_age"],
+        "expect": "red",
+    },
+    {
+        "name": "prune-live",
+        "what": "pruning removes a live session that has been quiet for long",
+        "edits": [("lib/cxd/prune.py",
+                   '        if not rec.get("ended") and proc_alive(rec.get("pid"), rec.get("pid_ident")):  # GUARD:prune-live\n',
+                   "        if False:  # MUTATION\n")],
+        "tests": [T + "TestPrune.test_live_sessions_are_never_pruned"],
+        "expect": "red",
+    },
+    {
         "name": "init-no-link",
         "what": "cxd init does not link ~/.cxd/bin/cxd, so peers cannot reach this host",
         "edits": [("lib/cxd/cli.py", "    link, target = _link_cli()\n",

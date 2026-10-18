@@ -249,6 +249,12 @@ def handle(event, data):
         return None, []
     if event == "SessionStart":
         register(data)
+        try:
+            from .common import load_config
+            from .prune import maybe_prune
+            maybe_prune(load_config())
+        except Exception:
+            pass  # pruning must never get in a session's way
     elif event == "SessionEnd":
         mark_ended(sid, data.get("reason"))
         return None, []

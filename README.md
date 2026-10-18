@@ -215,6 +215,7 @@ without the bypass.
 | `cxd resume <host> <name> <prompt-file\|->` | `--skip-permissions` or `--no-skip-permissions`, `--init-timeout S` (90), `--json` | Continue an exited run's conversation (`--resume <session id>`) with a new prompt. Refuses while the run is alive. Keeps the run's own permission choice; `--skip-permissions` opts in, `--no-skip-permissions` withdraws it. |
 | `cxd notify <text\|@file\|->` | `--session SID` | Inside a worker: add a report to its outbox (uses `CLAUDE_CODE_SESSION_ID`). |
 | `cxd doctor [host...]` | `--json` | Check every host: ssh round-trip, `cxd` home mode, cswap, claude, a hook self-test, and whether the plugin is enabled per account. |
+| `cxd prune [host]` | `--older-than DAYS`, `--runs`, `--dry-run`, `--json` | Remove sessions that ended (or whose process is gone) and have been quiet for `prune_after_days` (default 7): their record, inbox, delivered messages and reports. Live sessions are never touched. `--runs` also removes exited runs that old, with their sessions. Sessions are also pruned automatically, at most hourly, when a session starts. |
 | `cxd init` | `--self NAME`, `--peer ALIAS` (repeatable), `--account A` (repeatable), `--default-account A` | Write `~/.cxd/config.json` and link `~/.cxd/bin/cxd`. |
 | `cxd --version` | | Print the version. |
 
@@ -231,8 +232,10 @@ channel failed: watch reconnects from its cursor without losing or repeating eve
 only the host that owns the run can report an exit.
 
 **Configuration** (`~/.cxd/config.json`, written by `cxd init`). For runs on this host:
-`default_account` (cswap account when `--account` is omitted) and `skip_permissions`
-(`true` bypasses permission prompts for every run on this host; default `false`). Per peer
+`default_account` (cswap account when `--account` is omitted), `skip_permissions`
+(`true` bypasses permission prompts for every run on this host; default `false`) and
+`prune_after_days` (how long ended sessions are kept; default 7; anything that is not a
+positive number means the default). Per peer
 under `hosts`: `transport` (`ssh`), `alias` (ssh alias, defaults to the host name), `python`
 (remote interpreter, default `python3`), `cxd` (remote path, default
 `$HOME/.cxd/bin/cxd`), `connect_timeout` (seconds). Environment overrides: `CXD_HOME` (state directory),
@@ -311,6 +314,7 @@ See [SECURITY.md](SECURITY.md) to report a vulnerability.
 | `lib/cxd/state.py` | host-side operations: start, send, stop, resume, list, stream, doctor |
 | `lib/cxd/supervise.py` | per-run supervisor and FIFO keeper |
 | `lib/cxd/hook.py` | hook handler: register, inbox delivery, outbox, session end |
+| `lib/cxd/prune.py` | pruning of ended sessions and (on request) exited runs |
 | `lib/cxd/common.py` | paths, atomic files, process identity, environment scrubbing, config |
 | `hooks/hooks.json`, `hooks/cxd-hook` | `SessionStart`, `PostToolUse`, `UserPromptSubmit`, `Stop`, `SessionEnd` |
 | `skills/cswap-cross-device/SKILL.md` | how a lead uses `cxd` and how a worker reports |
