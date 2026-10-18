@@ -1113,14 +1113,27 @@ class TestHooks(Base):
         ctx = self.session_start(sid)
         tag = read_json(os.path.join(self.local, "sessions", sid + ".json"))["tag"]
         self.assertIn("[cxd:%s]" % tag, ctx)
-        self.assertIn("without", ctx)  # untagged copies are not from the user
+        self.assertIn("lacks that exact mark", ctx)  # untagged copies are not from the user
+        self.assertIn("Keep the mark to yourself", ctx)
         self.assertIn("redelivery", ctx)  # at-least-once: a repeated id is not a new instruction
         self.queue(sid, 1, "MARK-TAGGED")
         out = json.loads(self.run_hook(sid))["hookSpecificOutput"]["additionalContext"]
         self.assertIn("[cxd:%s]" % tag, out)
-        # A resume keeps the tag and does not announce again.
+        # A resume keeps the tag and does not announce again; /clear and a compaction do.
         self.assertEqual(self.session_start(sid, source="resume"), "")
         self.assertEqual(read_json(os.path.join(self.local, "sessions", sid + ".json"))["tag"], tag)
+        for source in ("clear", "compact"):
+            self.assertIn("[cxd:%s]" % tag, self.session_start(sid, source=source))
+        # A resumed session without a tag (a fork, an older record) gets one, and is told.
+        rec_p = os.path.join(self.local, "sessions", sid + ".json")
+        rec = read_json(rec_p)
+        del rec["tag"]
+        with open(rec_p, "w") as f:
+            json.dump(rec, f)
+        ctx = self.session_start(sid, source="resume")
+        new_tag = read_json(rec_p)["tag"]
+        self.assertNotEqual(new_tag, tag)
+        self.assertIn("[cxd:%s]" % new_tag, ctx)
         # Another session gets another tag.
         self.session_start("bebebebe-9999")
         self.assertNotEqual(read_json(os.path.join(self.local, "sessions", "bebebebe-9999.json"))["tag"], tag)
@@ -1140,8 +1153,27 @@ class TestHooks(Base):
         for i in range(40):
             self.queue(sid, i, "x" * 400)
         ctx = self.session_start(sid)
-        self.assertLessEqual(len(ctx), 10000)
+        # The announcement is budgeted: announcement + mail stay within the message budget.
+        self.assertLessEqual(len(ctx), 9000)
         self.assertNotIn("truncated", ctx)
+        self.assertIn("x" * 400, ctx)
+
+    def test_an_announcement_alone_creates_no_delivered_dir(self):
+        self.session_start("bebebebe-6666")
+        self.assertFalse(os.path.exists(os.path.join(self.local, "delivered", "bebebebe-6666")))
+
+    def test_a_message_a_session_sent_itself_is_not_tagged(self):
+        """GUARD self-not-tagged. Mutation: a session's message to itself gets its
+        tag -> a session (or anything it runs) can mint instructions to itself."""
+        sid = "bebebebe-7777-3333-4444-555555555555"
+        p = self.fake_session(sid)
+        self.hook(p, "SessionStart")
+        tag = read_json(os.path.join(self.local, "sessions", sid + ".json"))["tag"]
+        self.ok("send", "laptop", sid, "MARK-SELF", env={"CLAUDE_CODE_SESSION_ID": sid})
+        ctx = json.loads(self.hook(p, "PostToolUse")["out"])["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("MARK-SELF", ctx)
+        self.assertNotIn("[cxd:%s]" % tag, ctx)
+        self.assertIn("sent by this session itself", ctx)
 
     def test_session_start_is_silent_where_cxd_is_not_set_up(self):
         os.unlink(os.path.join(self.local, "config.json"))
@@ -1538,7 +1570,7 @@ class TestPrune(Base):
         self.fake_record("cccc0001-old-ended", ended=True, age_days=10)
         p = self.fake_session(sid)
         t0 = time.time()
-        self.assertEqual(self.hook(p, "SessionStart")["out"], "")
+        self.assertEqual(self.hook(p, "SessionStart")["rc"], 0)
         self.assertLess(time.time() - t0, 5)
         self.assertEqual(self.wait_gone("cccc0001-old-ended"), [])  # pruned by a detached process
         self.fake_record("cccc0002-old-ended", ended=True, age_days=10)

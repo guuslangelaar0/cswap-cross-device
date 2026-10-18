@@ -464,6 +464,8 @@ def op_send(args):
         ids.append(part_id)
         body = chunk if len(chunks) == 1 else "[part %d/%d] %s" % (k, len(chunks), chunk)
         msg = {"id": part_id, "ts": ts, "sender": sender, "text": body}
+        if isinstance(args.get("sender_sid"), str):
+            msg["sender_sid"] = args["sender_sid"]  # a message to itself is not a lead instruction
         tmp = os.path.join(inbox, ".tmp-" + part_id)
         atomic_write_json(tmp, msg)
         os.replace(tmp, os.path.join(inbox, part_id + ".json"))
