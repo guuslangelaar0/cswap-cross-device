@@ -35,12 +35,15 @@ cxd resume buildbox w1 next.md   # only after it has exited; same session id
   messages. Do not open that FIFO yourself: an extra writer keeps a stopped run alive.
 - Permission prompts are not bypassed by default. Nobody can answer them in a headless
   run, so a tool call that needs approval is refused and the worker may stall; `start`
-  warns once on stderr. Prefer granting what the task needs after `--`:
+  and `resume` warn once on stderr. Prefer granting what the task needs after `--`:
   `-- --permission-mode acceptEdits`, `-- --allowedTools "Bash(git *)"`.
 - Skipping every check (`--dangerously-skip-permissions`) is an explicit opt-in:
-  `cxd start ... --skip-permissions`, or `"skip_permissions": true` in the worker host's
-  `~/.cxd/config.json`. A bypassed worker can run any command and change any file the
-  user can, so use it only in a directory and on a machine you would let it change freely.
+  `--skip-permissions` on `cxd start` or `cxd resume` (the run keeps it), or
+  `"skip_permissions": true` in the worker host's `~/.cxd/config.json` (read at every start
+  and resume). A bypassed worker can run any command and change any file the user can, so
+  use it only in a directory and on a machine you would let it change freely. A resumed run
+  keeps the claude arguments it was started with; `cxd resume ... --no-skip-permissions`
+  withdraws its opt-in. Runs started by cxd 0.1.0 need `--skip-permissions` again on resume.
 - `send` to a headless run becomes the next user turn. A message sent mid-turn is queued
   or folded into the running turn. `send` refuses a run that is not running (exit 3).
 - `watch` prints: `status`, `turn N ended ... cost=$...: <result excerpt>`, `PR <url>`,
@@ -50,7 +53,9 @@ cxd resume buildbox w1 next.md   # only after it has exited; same session id
   line that says `EXITED` means the process ended.
 - `stop --now` skips the grace period and interrupts the current turn.
 - Exit codes: 0 ok, 2 usage, 3 refused (dead run, alive on resume, unknown name),
-  4 transport failure (the host could not be reached; nothing was decided).
+  4 transport failure (the host could not be reached; nothing was decided), 5 the run
+  started or resumed but the permission choice you asked for was not applied (it IS
+  running: read the message, stop it if needed; do not start it again).
 
 ## Lead: interactive or plain sessions (hook inbox)
 

@@ -7,7 +7,7 @@ import sys
 import time
 
 from .common import (
-    CxdError, EXIT_ERROR, EXIT_OK, EXIT_REFUSED, EXIT_TRANSPORT, EXIT_USAGE, PROTO,
+    CxdError, EXIT_ERROR, EXIT_NOT_APPLIED, EXIT_OK, EXIT_REFUSED, EXIT_TRANSPORT, EXIT_USAGE, PROTO,
     TransportError, VERSION, atomic_write_json, cxd_bin, ensure_dir, excerpt, load_config,
     path, self_label,
 )
@@ -21,7 +21,7 @@ USAGE = """cxd - lead <-> worker messaging for Claude Code sessions across cswap
   cxd watch  <host> <run-name|session-id> [--json] [--heartbeat S] [--from-start]
   cxd list   [host] [--all] [--json]
   cxd stop   <host> <name> [--now] [--grace S]
-  cxd resume <host> <name> <prompt-file|->
+  cxd resume <host> <name> <prompt-file|-> [--skip-permissions | --no-skip-permissions]
   cxd notify <text|@file|-> [--session SID]      (inside a worker session)
   cxd doctor [host...] [--json]
   cxd init   [--self NAME] [--peer HOST ...] [--account A ...] [--default-account A]
@@ -80,6 +80,24 @@ PERMISSIONS_WARNING = (
     "\"skip_permissions\": true in that host's ~/.cxd/config.json."
 )
 
+RESUME_PERMISSIONS_WARNING = (
+    "warning: %s/%s resumes without --dangerously-skip-permissions. Nobody can answer a permission prompt "
+    "in a headless run, so a tool call that needs one is refused and the work may stall. A resumed run "
+    "keeps the claude arguments it was started with. To skip every check, opt in with "
+    "`cxd resume %s %s <prompt> --skip-permissions` or \"skip_permissions\": true in that host's "
+    "~/.cxd/config.json."
+)
+
+BYPASS_NOT_APPLIED = (
+    "%s did not apply --skip-permissions (does it run an older cxd? update it and run `cxd init` there): "
+    "%s/%s is running WITHOUT the bypass"
+)
+
+BYPASS_NOT_WITHDRAWN = (
+    "%s/%s still bypasses permission prompts: --no-skip-permissions withdraws only the run's own opt-in, "
+    "and %s's ~/.cxd/config.json has \"skip_permissions\": true (or the host runs an older cxd)"
+)
+
 
 # ---------------------------------------------------------------- commands
 
@@ -92,25 +110,39 @@ def cmd_start(a):
     res = t.call("start", {"name": a.name, "prompt": prompt, "account": a.account, "cwd": cwd,
                            "skip_permissions": a.skip_permissions,
                            "claude_args": a.claude_args, "init_timeout": a.init_timeout})
-    if not res.get("skip_permissions"):
-        _err(PERMISSIONS_WARNING % (a.host, res["name"]))
     if a.json:
         _out(json.dumps(res))
     else:
         _out("started %s/%s gen=%s session=%s claude_pid=%s alive=%s" % (
             a.host, res["name"], res["gen"], res.get("session_id"), res.get("claude_pid"), res.get("alive")))
-    return EXIT_OK
+    return _bypass_outcome(a, res, PERMISSIONS_WARNING % (a.host, res["name"]))
 
 
 def cmd_resume(a):
     t = get_transport(a.host)
     prompt = _read_prompt_file(a.prompt_file)
-    res = t.call("resume", {"name": a.name, "prompt": prompt, "init_timeout": a.init_timeout})
+    res = t.call("resume", {"name": a.name, "prompt": prompt, "init_timeout": a.init_timeout,
+                            "skip_permissions": a.skip_permissions,
+                            "no_skip_permissions": a.no_skip_permissions})
     if a.json:
         _out(json.dumps(res))
     else:
         _out("resumed %s/%s gen=%s session=%s claude_pid=%s" % (
             a.host, res["name"], res["gen"], res.get("session_id"), res.get("claude_pid")))
+    return _bypass_outcome(a, res, RESUME_PERMISSIONS_WARNING % (a.host, res["name"], a.host, res["name"]))
+
+
+def _bypass_outcome(a, res, warning):
+    """After a start or resume: exit 5 if the permission choice asked for was
+    not applied (the run IS running), else warn when the run has no bypass."""
+    if a.skip_permissions and not res.get("skip_permissions"):  # GUARD:bypass-not-applied
+        _err(BYPASS_NOT_APPLIED % (a.host, a.host, res["name"]))
+        return EXIT_NOT_APPLIED
+    if getattr(a, "no_skip_permissions", False) and res.get("skip_permissions"):
+        _err(BYPASS_NOT_WITHDRAWN % (a.host, res["name"], a.host))
+        return EXIT_NOT_APPLIED
+    if not res.get("skip_permissions"):
+        _err(warning)
     return EXIT_OK
 
 
@@ -372,6 +404,8 @@ def build_parser():
 
     s = sub.add_parser("resume")
     s.add_argument("host"); s.add_argument("name"); s.add_argument("prompt_file")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--skip-permissions", action="store_true"); g.add_argument("--no-skip-permissions", action="store_true")
     s.add_argument("--init-timeout", type=float, default=90.0); s.add_argument("--json", action="store_true")
 
     s = sub.add_parser("send")
@@ -418,8 +452,9 @@ def main(argv=None):
         from .supervise import supervise_main
         ap = argparse.ArgumentParser(prog="cxd _supervise")
         ap.add_argument("rundir"); ap.add_argument("--gen", type=int, required=True); ap.add_argument("--resume")
+        ap.add_argument("--skip-permissions", action="store_true")
         ns = ap.parse_args(argv[1:])
-        return supervise_main(ns.rundir, ns.gen, ns.resume)
+        return supervise_main(ns.rundir, ns.gen, ns.resume, ns.skip_permissions)
     if argv and argv[0] == "_keeper":
         from .supervise import keeper_main
         return keeper_main(argv[1], argv[2])

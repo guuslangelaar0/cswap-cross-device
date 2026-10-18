@@ -4,7 +4,8 @@ run or session; transports only carry the request and the reply.
 Layout under ~/.cxd (mode 700 throughout):
 
     runs/<name>/        a headless run started by `cxd start`
-        meta.json       name, account, skip_permissions, cwd, claude_args, gen, session_id
+        meta.json       name, account, bypass_opt_in (the run's own opt-in to the
+                        permission bypass), cwd, claude_args, gen, session_id
         pids.json       supervisor/keeper/claude pids + start identities (current gen)
         exit.json       rc of the current gen, written by the supervisor
         in.fifo         stdin of the claude process; the keeper holds the write end
@@ -40,9 +41,18 @@ CLAUDE_HEADLESS_ARGS = [
     "-p", "--input-format", "stream-json", "--output-format", "stream-json",
     "--verbose", "--replay-user-messages",
 ]
-# Added only on an explicit opt-in: `cxd start --skip-permissions`, or
-# "skip_permissions": true in the config.json of the host that runs the worker.
+# Added only on an explicit opt-in, see bypass_opted_in().
 SKIP_PERMISSIONS_ARGS = ["--dangerously-skip-permissions"]
+
+
+def bypass_opted_in(run_opt_in):
+    """Permission prompts are bypassed only on an explicit opt-in, and only a
+    JSON true counts: the run's own (`--skip-permissions` on start or resume,
+    kept as bypass_opt_in in meta.json) or "skip_permissions" in this host's
+    config.json, read at every launch so that switching it off takes effect.
+    (cxd 0.1.0 wrote "skip_permissions" into meta.json mixed with the host
+    setting; that key is ignored.)"""
+    return run_opt_in is True or load_config().get("skip_permissions") is True  # GUARD:bypass-json-true
 
 
 # ================================================================ runs
@@ -110,11 +120,13 @@ def user_message(text):
     return (json.dumps({"type": "user", "message": {"role": "user", "content": text}}) + "\n").encode("utf-8")
 
 
-def _spawn_supervisor(d, gen, resume_sid):
+def _spawn_supervisor(d, gen, resume_sid, skip_permissions):
     log = os.open(os.path.join(d, "supervisor.log"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     args = [sys.executable, cxd_bin(), "_supervise", d, "--gen", str(gen)]
     if resume_sid:
         args += ["--resume", resume_sid]
+    if skip_permissions:
+        args += ["--skip-permissions"]
     try:
         subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                          close_fds=True, start_new_session=True, env=worker_env())
@@ -196,21 +208,24 @@ def op_start(args):
         raise CxdError("cswap not found on %s (needed for account %r)" % (self_label(), account), "missing_cswap")
     if not account and not find_claude():
         raise CxdError("claude not found on %s" % self_label(), "missing_claude")
-    # Permission prompts are bypassed only on an explicit opt-in (a JSON true).
-    skip_permissions = args.get("skip_permissions") is True or load_config().get("skip_permissions") is True
+    # meta.json keeps only this run's own opt-in; the host's setting is read at each launch.
+    opt_in = args.get("skip_permissions") is True
     ensure_dir(path("runs"))
     ensure_dir(d)
     meta = {
-        "name": name, "host": self_label(), "account": account, "skip_permissions": skip_permissions,
+        "name": name, "host": self_label(), "account": account, "bypass_opt_in": opt_in,  # GUARD:host-not-kept
         "cwd": cwd, "claude_args": list(args.get("claude_args") or []), "gen": 1,
         "created": now_iso(), "session_id": None, "cxd_version": VERSION,
     }
     atomic_write_json(os.path.join(d, "meta.json"), meta)
-    return _launch(d, meta, 1, None, prompt, float(args.get("init_timeout") or 90))
+    return _launch(d, meta, 1, None, prompt, float(args.get("init_timeout") or 90), opt_in)
 
 
-def _launch(d, meta, gen, resume_sid, prompt, init_timeout):
-    _spawn_supervisor(d, gen, resume_sid)
+def _launch(d, meta, gen, resume_sid, prompt, init_timeout, opt_in):
+    """Start gen of a run. The run's opt-in is saved with its session id, once
+    the gen has started; a launch that fails does not save an opt-in."""
+    skip_permissions = bypass_opted_in(opt_in)
+    _spawn_supervisor(d, gen, resume_sid, skip_permissions)
     pids = _wait_pids(d, gen)
     try:
         fifo_write(os.path.join(d, "in.fifo"), user_message(prompt))
@@ -232,11 +247,12 @@ def _launch(d, meta, gen, resume_sid, prompt, init_timeout):
     meta = read_json(os.path.join(d, "meta.json"), meta)
     if sid:
         meta["session_id"] = sid
-        atomic_write_json(os.path.join(d, "meta.json"), meta)
+    meta["bypass_opt_in"] = opt_in
+    meta.pop("skip_permissions", None)  # cxd 0.1.0's key, never trusted
+    atomic_write_json(os.path.join(d, "meta.json"), meta)
     return {"name": meta["name"], "host": self_label(), "gen": gen, "session_id": sid,
             "claude_pid": pids.get("claude_pid"), "keeper_pid": pids.get("keeper_pid"),
-            "alive": claude_alive(pids), "run_dir": d,
-            "skip_permissions": meta.get("skip_permissions") is True}
+            "alive": claude_alive(pids), "run_dir": d, "skip_permissions": skip_permissions}
 
 
 def _tail(p, n=400):
@@ -271,8 +287,16 @@ def op_resume(args):
         os.replace(os.path.join(d, "exit.json"), os.path.join(d, "exit.%d.json" % ex.get("gen", gen - 1)))
     meta["gen"] = gen
     meta["session_id"] = sid
+    # A resumed run keeps its own opt-in; `cxd resume --skip-permissions` adds
+    # one (saved once the gen started) and `--no-skip-permissions` withdraws it
+    # (saved right away, whatever happens to the launch).
+    opt_in = meta.get("bypass_opt_in") is True or args.get("skip_permissions") is True  # GUARD:resume-bypass
+    if args.get("no_skip_permissions") is True:
+        opt_in = False
+        meta["bypass_opt_in"] = False  # GUARD:withdraw-now
+        meta.pop("skip_permissions", None)
     atomic_write_json(os.path.join(d, "meta.json"), meta)
-    return _launch(d, meta, gen, sid, prompt, float(args.get("init_timeout") or 90))
+    return _launch(d, meta, gen, sid, prompt, float(args.get("init_timeout") or 90), opt_in)
 
 
 def run_idle(d, quiet=2.0):

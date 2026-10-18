@@ -4,8 +4,8 @@ supervisor (one per gen, detached, own session):
     mkfifo in.fifo; open its read end non-blocking; start the keeper, which
     opens the write end and holds it; hand the read end to `cswap run <acct>
     -- -p --input-format stream-json ...` (or plain `claude -p ...` when the
-    run has no account; plus --dangerously-skip-permissions only when the run
-    opted in) as stdin; record pids; wait for the
+    run has no account; plus --dangerously-skip-permissions only when the
+    launcher passed --skip-permissions) as stdin; record pids; wait for the
     claude process; write exit.json; reap the keeper.
 
 keeper: opens the FIFO for writing and sleeps. It is the ONLY long-lived
@@ -62,12 +62,12 @@ def _start_keeper(d, fifo):
     raise RuntimeError("keeper failed to open the FIFO")
 
 
-def supervise_main(d, gen, resume_sid=None):
+def supervise_main(d, gen, resume_sid=None, skip_permissions=False):
     """Run one gen. Whatever goes wrong, never leave the gen without an exit
     record (watch would wait for it forever) or with an orphaned keeper (it
     would hold the FIFO open)."""
     try:
-        return _supervise(d, gen, resume_sid)
+        return _supervise(d, gen, resume_sid, skip_permissions)
     except BaseException as e:  # GUARD:supervise-record
         _record_unexpected_exit(d, gen, e)
         raise
@@ -90,7 +90,7 @@ def _record_unexpected_exit(d, gen, e):
                 pass
 
 
-def _supervise(d, gen, resume_sid):
+def _supervise(d, gen, resume_sid, skip_permissions):
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     meta = read_json(os.path.join(d, "meta.json"), {}) or {}
@@ -129,7 +129,7 @@ def _supervise(d, gen, resume_sid):
         keeper.wait()
         return fail("%s not found" % ("cswap" if account else "claude"))
     cmd = prefix + CLAUDE_HEADLESS_ARGS
-    if meta.get("skip_permissions") is True:
+    if skip_permissions:
         cmd += SKIP_PERMISSIONS_ARGS
     if resume_sid:
         cmd += ["--resume", resume_sid]
@@ -157,7 +157,7 @@ def _supervise(d, gen, resume_sid):
         "supervisor_pid": os.getpid(), "supervisor_ident": proc_identity(os.getpid()),
         "keeper_pid": keeper.pid, "keeper_ident": proc_identity(keeper.pid),
         "claude_pid": claude.pid, "claude_ident": proc_identity(claude.pid),
-        "cmd": cmd[:4] + ["..."],
+        "cmd": cmd[:4] + ["..."], "skip_permissions": bool(skip_permissions),
     }
     atomic_write_json(os.path.join(d, "pids.gen%d.json" % gen), pids)  # history, for audits/cleanup
     atomic_write_json(os.path.join(d, "pids.json"), pids)

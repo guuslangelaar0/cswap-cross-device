@@ -37,6 +37,7 @@ EXIT_ERROR = 1
 EXIT_USAGE = 2
 EXIT_REFUSED = 3
 EXIT_TRANSPORT = 4
+EXIT_NOT_APPLIED = 5  # the run started, but the permission choice asked for was not applied
 
 
 class CxdError(Exception):
