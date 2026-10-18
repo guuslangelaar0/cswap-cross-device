@@ -844,7 +844,8 @@ def op_doctor_info(args):
     st = hook_selftest()
     check("hook self-test (empty inbox silent, message delivered once)", st["ok"],
           "empty %.0f ms, delivery %.0f ms" % (st["empty_inbox_ms"], st["delivery_ms"]))
-    regs = {}
+    regs = read_json(path("registrations.json"), {})  # kept by the SessionStart hook
+    regs = dict(regs) if isinstance(regs, dict) else {}
     sd = path("sessions")
     if os.path.isdir(sd):
         for n in os.listdir(sd):
@@ -876,8 +877,10 @@ def op_doctor_info(args):
 def op_prune(args):
     from .prune import prune
     older = args.get("older_than_days")
-    return dict(prune(load_config(), older_than_days=float(older) if older is not None else None,
-                      runs=bool(args.get("runs")), dry_run=bool(args.get("dry_run"))), host=self_label())
+    if older is not None and (isinstance(older, bool) or not isinstance(older, (int, float))):
+        raise CxdError("--older-than must be a number of days", "usage")
+    return dict(prune(load_config(), older_than_days=older, runs=bool(args.get("runs")),
+                      dry_run=bool(args.get("dry_run"))), host=self_label())
 
 
 OPS = {

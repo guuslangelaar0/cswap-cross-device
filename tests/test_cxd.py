@@ -1474,6 +1474,64 @@ class TestPrune(Base):
         self.hook(p, "SessionStart")  # within the hour: no second pass
         self.assertEqual(len(self.session_files("cccc0002-old-ended")), 4)
 
+    def test_a_session_whose_process_is_unknown_is_kept_until_it_ends(self):
+        """GUARD prune-unknown. Mutation: a session that never recorded its pid
+        counts as dead -> a live session (e.g. an npm-installed claude) is pruned."""
+        self.fake_record("ffff0000-no-pid-open", ended=False, age_days=30, pid=None, ident=None)
+        self.fake_record("ffff0001-no-pid-ended", ended=True, age_days=30, pid=None, ident=None)
+        res = self.prune()
+        self.assertEqual(res["sessions"], ["ffff0001-no-pid-ended"])
+        self.assertEqual(len(self.session_files("ffff0000-no-pid-open")), 4)
+
+    def test_configured_age_and_invalid_overrides(self):
+        with open(os.path.join(self.local, "config.json"), "w") as f:
+            json.dump({"self": ["laptop"], "default_account": "work", "prune_after_days": 20}, f)
+        self.fake_record("abab0000-15-days", ended=True, age_days=15)
+        self.fake_record("abab0001-25-days", ended=True, age_days=25)
+        res = self.prune()
+        self.assertEqual((res["older_than_days"], res["sessions"]), (20.0, ["abab0001-25-days"]))
+        for bad in ("0", "-1", "nan", "inf"):
+            r = self.cxd("prune", "local", "--older-than", bad)
+            self.assertEqual(r.returncode, 2, (bad, r.stdout, r.stderr))
+        self.assertEqual(len(self.session_files("abab0000-15-days")), 4)
+
+    def test_run_sessions_are_protected_by_the_run_itself(self):
+        # The worker's session may have no record (plugin not enabled there):
+        # meta.json's session_id still ties it to the run.
+        self.start("laptop", "wp3", "MARK-1")
+        self.wait_results("laptop", "wp3", 1)
+        sid = read_json(os.path.join(self.local, "runs", "wp3", "meta.json"))["session_id"]
+        self.fake_record(sid, ended=True, age_days=10)
+        os.unlink(os.path.join(self.local, "sessions", sid + ".json"))
+        self.assertEqual(self.prune()["sessions"], [])
+        self.assertTrue(os.path.exists(os.path.join(self.local, "outbox", sid + ".jsonl")))
+
+    def test_a_run_resumed_during_the_pass_is_kept(self):
+        """GUARD prune-run-recheck. Mutation: no re-check before removing a run
+        -> a run resumed between the scan and the removal is deleted."""
+        from cxd import prune as prune_mod
+        from cxd.common import load_config
+        d = os.path.join(self.local, "runs", "wp4")
+        os.makedirs(d, mode=0o700)
+        with open(os.path.join(d, "meta.json"), "w") as f:
+            json.dump({"name": "wp4", "gen": 1}, f)
+        self.age_tree(d, time.time() - 10 * self.DAY)
+        with mock.patch.dict(os.environ, {"CXD_HOME": self.local}), \
+                mock.patch.object(prune_mod, "_run_alive", side_effect=[False, True]):
+            res = prune_mod.prune(load_config(), runs=True)
+        self.assertEqual(res["runs"], [])
+        self.assertTrue(os.path.isdir(d))
+
+    def test_malformed_records_do_not_stop_the_pass(self):
+        self.fake_record("acac0000-list-record", ended=True, age_days=10)
+        with open(os.path.join(self.local, "sessions", "acac0000-list-record.json"), "w") as f:
+            f.write("[1]")
+        os.utime(os.path.join(self.local, "sessions", "acac0000-list-record.json"),
+                 (time.time() - 10 * self.DAY,) * 2)
+        self.fake_record("acac0001-old-ended", ended=True, age_days=10)
+        res = self.prune()
+        self.assertIn("acac0001-old-ended", res["sessions"])
+
     def test_a_broken_prune_setting_breaks_nothing(self):
         for bad in ("soon", -3, None, [1]):
             with open(os.path.join(self.local, "config.json"), "w") as f:

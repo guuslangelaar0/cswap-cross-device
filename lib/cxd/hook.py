@@ -86,6 +86,13 @@ def register(data, event_source=None):
         "ended": None,
     })
     atomic_write_json(p, rec)
+    try:
+        regs = read_json(path("registrations.json"), {})
+        regs = regs if isinstance(regs, dict) else {}
+        regs[rec["account"]] = rec["registered"]
+        atomic_write_json(path("registrations.json"), regs)
+    except Exception:
+        pass
 
 
 def mark_ended(sid, reason):
@@ -249,12 +256,6 @@ def handle(event, data):
         return None, []
     if event == "SessionStart":
         register(data)
-        try:
-            from .common import load_config
-            from .prune import maybe_prune
-            maybe_prune(load_config())
-        except Exception:
-            pass  # pruning must never get in a session's way
     elif event == "SessionEnd":
         mark_ended(sid, data.get("reason"))
         return None, []
@@ -274,6 +275,15 @@ def handle(event, data):
     if ctx:
         return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": ctx}}, claims
     return None, claims
+
+
+def _prune_after_session_start():
+    try:
+        from .common import load_config
+        from .prune import maybe_prune
+        maybe_prune(load_config())
+    except Exception:
+        pass  # pruning must never get in a session's way
 
 
 def main(event):
@@ -305,4 +315,6 @@ def main(event):
             ack(sid, claims, event)  # GUARD:ack-after-write
         except Exception:
             pass
+    if event == "SessionStart":
+        _prune_after_session_start()  # after any mail has gone out
     return 0
