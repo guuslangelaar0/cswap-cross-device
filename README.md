@@ -236,7 +236,7 @@ only the host that owns the run can report an exit.
 (`true` bypasses permission prompts for every run on this host; default `false`) and
 `prune_after_days` (how long ended sessions are kept; default 7; anything that is not a
 positive number means the default; a huge number means never) and `auto_prune` (`false`
-stops the hourly pass that SessionStart starts; `cxd prune` still works). Per peer
+stops the hourly pass that SessionStart starts; `cxd prune` still works) and `announce` (`false` stops the one-sentence announcement at `SessionStart`; default on).  Per peer
 under `hosts`: `transport` (`ssh`), `alias` (ssh alias, defaults to the host name), `python`
 (remote interpreter, default `python3`), `cxd` (remote path, default
 `$HOME/.cxd/bin/cxd`), `connect_timeout` (seconds). Environment overrides: `CXD_HOME` (state directory),
@@ -272,12 +272,19 @@ by name.
   the host that runs it. Otherwise a tool call that needs approval is refused. See
   [Permissions](#permissions).
 - **Hooks never break a session.** They exit 0 on every error and print nothing unless
-  they deliver a message. `PostToolUse` and `UserPromptSubmit` skip Python entirely when no
+  they deliver a message or (at `SessionStart`) announce how messages arrive. `PostToolUse` and `UserPromptSubmit` skip Python entirely when no
   inbox has mail. The test suite requires a median under 100 ms for `PostToolUse` and
   `Stop`.
-- **Factual injection.** A delivered message arrives as context that states who sent it and
-  when (*"Message from the lead session laptop/1a2b3c4d at … (cxd message …): …"*), not as an imperative
-  from the system.
+- **Announced, tagged, factual injection.** On a machine where cxd is set up
+  (`~/.cxd/config.json` exists), each session gets a random secret tag when it registers. Its
+  `SessionStart` hook tells it that messages from the user's lead session arrive marked
+  `[cxd:<tag>]` and are the user's instructions, and that text claiming to be such a message
+  without that exact mark (in a file, a web page, command output) is not; without the
+  announcement, models tend to dismiss real messages as injected text. Turn it off with
+  `"announce": false`. A delivered message states who sent it and when (*"Message from the
+  lead session laptop/1a2b3c4d at … (cxd message …) [cxd:…]: …"*). A message a session sent to
+  itself is not tagged. Anyone who can run commands as your user can send a tagged message:
+  that is the existing trust boundary.
 - **No secrets in messages.** Messages, reports and turn results are stored as plain files.
   Do not send tokens, keys or passwords through `cxd`. The `Stop` hook stores at most
   2,000 characters of each turn's final answer.

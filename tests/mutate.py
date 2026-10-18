@@ -344,6 +344,23 @@ MUTATIONS = [
         "expect": "red",
     },
     {
+        "name": "announce-tag",
+        "what": "delivered messages lack the session's secret tag (indistinguishable from injected copies)",
+        "edits": [("lib/cxd/hook.py", '    mark = " [cxd:%s]" % tag if tag else ""  # GUARD:announce-tag\n',
+                   '    mark = ""  # MUTATION\n')],
+        "tests": [T + "TestHooks.test_the_announcement_names_a_secret_tag_and_messages_carry_it"],
+        "expect": "red",
+    },
+    {
+        "name": "self-not-tagged",
+        "what": "a message a session sent to itself carries its tag (it can mint instructions to itself)",
+        "edits": [("lib/cxd/hook.py",
+                   '            mark = " (sent by this session itself; not a lead instruction)"  # GUARD:self-not-tagged\n',
+                   "            pass  # MUTATION\n")],
+        "tests": [T + "TestHooks.test_a_message_a_session_sent_itself_is_not_tagged"],
+        "expect": "red",
+    },
+    {
         "name": "init-no-link",
         "what": "cxd init does not link ~/.cxd/bin/cxd, so peers cannot reach this host",
         "edits": [("lib/cxd/cli.py", "    link, target = _link_cli()\n",

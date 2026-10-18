@@ -150,7 +150,8 @@ def _bypass_outcome(a, res, warning):
 def cmd_send(a):
     t = get_transport(a.host)
     text = _read_text(a.text)
-    res = t.call("send", {"target": a.target, "text": text, "sender": _sender()})
+    res = t.call("send", {"target": a.target, "text": text, "sender": _sender(),
+                          "sender_sid": os.environ.get("CLAUDE_CODE_SESSION_ID")})
     parts = " in %d parts" % res["parts"] if res.get("parts", 1) > 1 else ""
     _out(json.dumps(res) if a.json else "sent to %s/%s via %s id=%s%s" % (a.host, res["target"], res["via"], res["id"], parts))
     return EXIT_OK
