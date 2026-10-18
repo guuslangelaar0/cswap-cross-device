@@ -86,14 +86,24 @@ def register(data, event_source=None):
         "ended": None,
     })
     atomic_write_json(p, rec)
-    try:  # the last registration per account, for `cxd doctor` (outlives pruning)
+    try:  # the last registration per account, for `cxd doctor` (outlives pruning); best effort
         import fcntl
-        with open(path("registrations.lock"), "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        fd = os.open(path("registrations.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            for _ in range(20):  # never block a session start for long
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    time.sleep(0.01)
+            else:
+                return
             regs = read_json(path("registrations.json"), {})
             regs = regs if isinstance(regs, dict) else {}
             regs[rec["account"]] = rec["registered"]
             atomic_write_json(path("registrations.json"), regs)
+        finally:
+            os.close(fd)
     except Exception:
         pass
 

@@ -20,13 +20,14 @@ import os
 import re
 import time
 
-from .common import CxdError, path, proc_state, read_json
+from .common import CxdError, path, proc_state, read_json, self_label
 
 DEFAULT_DAYS = 7.0
 AUTO_EVERY = 3600.0
 AUTO_LIMIT = 200
+# The record comes first: it is removed last, so a partial removal is retried.
 _SESSION_PARTS = (("sessions", "%s.json"), ("outbox", "%s.jsonl"), ("inbox", "%s"),
-                  ("claimed", "%s"), ("delivered", "%s"))
+                  ("claimed", "%s"), ("delivered", "%s"), ("bad", "%s"), ("wake", "%s.lock"))
 
 
 NEVER = float("inf")
@@ -36,9 +37,9 @@ def _valid_days(v):
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         return False
     try:
-        return v > 0 and not math.isnan(v)
+        return v > 0 and not math.isnan(float(v))
     except OverflowError:
-        return False
+        return v > 0  # a huge integer: valid, and it means never
 
 
 def age_days(cfg, override=None):
@@ -137,6 +138,8 @@ def _prunable_session(sid, cutoff):
     if _last_change(_session_paths(sid)) >= cutoff:  # GUARD:prune-age
         return False
     rec = _record(sid)
+    if rec.get("host") not in (None, self_label()):
+        return False  # another machine's session in a shared home: not ours to judge
     if rec.get("ended"):
         return True
     if not os.path.exists(path("sessions", sid + ".json")):
@@ -163,7 +166,8 @@ def _stale_temp_files(cutoff):
 
 
 def _remove_session(sid):
-    return all([_remove(p) for p in _session_paths(sid)])
+    paths = _session_paths(sid)
+    return all([_remove(p) for p in paths[1:]]) and _remove(paths[0])  # the record last
 
 
 def prune(cfg, older_than_days=None, runs=False, dry_run=False, limit=None):
@@ -239,8 +243,7 @@ def auto_prune_due(cfg=None):
     except OSError:
         pass
     try:
-        with open(stamp, "a"):
-            pass
+        os.close(os.open(stamp, os.O_WRONLY | os.O_CREAT, 0o600))
         os.utime(stamp, None)
     except OSError:
         return False
@@ -251,10 +254,17 @@ def spawn_auto_prune(cxd_bin, python):
     """From the SessionStart hook: prune in a detached process, so the session
     never waits for it."""
     import subprocess
+    from .common import cxd_home
     devnull = os.open(os.devnull, os.O_RDWR)
     try:
         subprocess.Popen([python, "-I", "-S", cxd_bin, "_prune-auto"], stdin=devnull, stdout=devnull,
-                         stderr=devnull, close_fds=True, start_new_session=True, cwd="/")
+                         stderr=devnull, close_fds=True, start_new_session=True, cwd="/",
+                         env=dict(os.environ, CXD_HOME=os.path.abspath(cxd_home())))
+    except OSError:
+        try:
+            os.unlink(path("prune.stamp"))  # not started: let the next session try
+        except OSError:
+            pass
     finally:
         os.close(devnull)
 
@@ -263,9 +273,12 @@ def auto_pass(cfg):
     """`cxd _prune-auto`: one pass at a time (concurrent SessionStarts may each
     start one)."""
     import fcntl
-    with open(path("prune.lock"), "a") as lock:
+    fd = os.open(path("prune.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return None
         return prune(cfg, limit=AUTO_LIMIT)
+    finally:
+        os.close(fd)

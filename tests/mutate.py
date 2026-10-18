@@ -337,6 +337,13 @@ MUTATIONS = [
         "expect": "red",
     },
     {
+        "name": "identity-utc",
+        "what": "the ps-based process identity (macOS) is read in local time: a time-zone change makes a live process look dead",
+        "edits": [("lib/cxd/common.py", '        env["TZ"] = "UTC0"  # GUARD:identity-utc\n', "        pass  # MUTATION\n")],
+        "tests": [T + "TestPrune.test_process_identity_does_not_depend_on_the_time_zone"],
+        "expect": "red",
+    },
+    {
         "name": "init-no-link",
         "what": "cxd init does not link ~/.cxd/bin/cxd, so peers cannot reach this host",
         "edits": [("lib/cxd/cli.py", "    link, target = _link_cli()\n",

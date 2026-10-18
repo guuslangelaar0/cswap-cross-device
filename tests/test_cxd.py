@@ -1624,8 +1624,7 @@ class TestPrune(Base):
         self.assertEqual(meta["session_ids"], [meta["session_id"]])
         meta["session_ids"].insert(0, "c2c2c2c2-earlier-gen")
         atomic_write_json(meta_p, meta)
-        self.fake_record("c2c2c2c2-earlier-gen", ended=True, age_days=10)
-        os.unlink(os.path.join(self.local, "sessions", "c2c2c2c2-earlier-gen.json"))
+        self.fake_record("c2c2c2c2-earlier-gen", ended=True, age_days=10)  # its record says nothing of the run
         self.assertEqual(self.prune()["sessions"], [])
         self.assertTrue(os.path.exists(os.path.join(self.local, "outbox", "c2c2c2c2-earlier-gen.jsonl")))
 
@@ -1639,6 +1638,32 @@ class TestPrune(Base):
         res = self.prune()
         self.assertIn("c3c3c3c4-old-ended", res["sessions"])
         self.assertNotIn("c3c3c3c3-odd-pid", res["sessions"])  # unknown: kept
+
+    def test_process_identity_does_not_depend_on_the_time_zone(self):
+        """GUARD identity-utc. Mutation: the ps-based identity (macOS) is read in
+        local time -> after a time-zone change a live process looks dead."""
+        from cxd import common
+        if not shutil.which("ps"):
+            self.skipTest("no ps")
+        with mock.patch.object(common.sys, "platform", "darwin"):  # force the ps path
+            with mock.patch.dict(os.environ, {"TZ": "Europe/Amsterdam"}):
+                ident = common.proc_identity(os.getpid())
+            self.assertTrue(ident.startswith("psutc:"), ident)
+            with mock.patch.dict(os.environ, {"TZ": "America/New_York"}):
+                self.assertEqual(common.proc_state(os.getpid(), ident), "alive")
+                self.assertTrue(common.proc_alive(os.getpid(), ident))
+                # A record from before (local-time "ps:") is never judged dead by a mismatch.
+                self.assertEqual(common.proc_state(os.getpid(), "ps:Thu Jan  1 00:00:00 1970"), "unknown")
+
+    def test_records_of_another_host_are_left_alone(self):
+        from cxd.common import atomic_write_json
+        self.fake_record("c4c4c4c4-other-host", ended=False, age_days=10, pid=999999999, ident="linux:1")
+        rec_p = os.path.join(self.local, "sessions", "c4c4c4c4-other-host.json")
+        rec = read_json(rec_p)
+        rec["host"] = "some-other-machine"
+        atomic_write_json(rec_p, rec)
+        os.utime(rec_p, (time.time() - 10 * self.DAY,) * 2)
+        self.assertEqual(self.prune()["sessions"], [])
 
     def test_malformed_records_do_not_stop_the_pass(self):
         self.fake_record("acac0000-list-record", ended=True, age_days=10)
