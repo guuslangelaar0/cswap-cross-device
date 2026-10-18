@@ -182,8 +182,10 @@ def proc_alive(pid, ident):
     return proc_identity(pid) == ident
 
 
-def proc_parent_and_args(pid):
-    """(ppid, args) for pid, or (None, None)."""
+def proc_parent_and_argv(pid):
+    """(ppid, [argv...]) for pid, or (None, None). On Linux argv is exact
+    (/proc/<pid>/cmdline); elsewhere it comes from `ps -ww -o args=`, split on
+    whitespace (-ww: BSD ps truncates args without a terminal)."""
     import subprocess
     pid = int(pid)
     if sys.platform.startswith("linux"):
@@ -191,13 +193,16 @@ def proc_parent_and_args(pid):
             with open("/proc/%d/stat" % pid, "r") as f:
                 ppid = int(f.read().rsplit(")", 1)[-1].split()[1])
             with open("/proc/%d/cmdline" % pid, "rb") as f:
-                args = f.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
-            return ppid, args
+                raw = f.read()
         except (OSError, ValueError, IndexError):
             return None, None
+        argv = [a.decode("utf-8", "replace") for a in raw.rstrip(b"\0").split(b"\0")] if raw else []
+        if len(argv) == 1 and " " in argv[0]:
+            argv = argv[0].split()  # a process that rewrote its title into argv[0]
+        return ppid, argv
     try:
         r = subprocess.run(
-            ["ps", "-o", "ppid=,args=", "-p", str(pid)],
+            ["ps", "-ww", "-o", "ppid=,args=", "-p", str(pid)],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             universal_newlines=True, env=dict(os.environ, LC_ALL="C"), timeout=5,
         )
@@ -208,9 +213,15 @@ def proc_parent_and_args(pid):
         return None, None
     ppid, _, args = line.partition(" ")
     try:
-        return int(ppid), args.strip()
+        return int(ppid), args.split()
     except ValueError:
         return None, None
+
+
+def proc_parent_and_args(pid):
+    """(ppid, args as one string) for pid, or (None, None)."""
+    ppid, argv = proc_parent_and_argv(pid)
+    return (ppid, " ".join(argv)) if argv is not None else (None, None)
 
 
 def signal_verified(pid, ident, sig):

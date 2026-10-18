@@ -17,26 +17,50 @@ import time
 
 from .common import (
     SID_RE, append_jsonl, atomic_write_json, ensure_dir, now_iso, path,
-    proc_identity, proc_parent_and_args, read_json, self_label,
+    proc_identity, proc_parent_and_argv, read_json, self_label,
 )
 
 CONTEXT_BUDGET = 9000  # additionalContext is capped at 10k characters
 OUTBOX_TEXT = 2000
 
 
+_CLAUDE_NAMES = ("claude", "claude.exe")
+_RUNTIMES = ("node", "nodejs", "bun")
+
+
+def _is_claude(argv):
+    """A Claude Code process, judged by its program, not by a substring:
+    - the native binary: `claude` or `claude.exe` (the npm package installs the
+      native binary as bin/claude.exe), or a path under .../claude/versions/;
+    - a JS runtime running Claude Code: `node|bun <...>/claude[.exe]` (the npm
+      bin script, before Claude Code renames its process title to `claude`) or
+      `node .../@anthropic-ai/claude-code/cli.js` (older packages)."""
+    if not argv:
+        return False
+    prog = os.path.basename(argv[0])
+    if prog in _CLAUDE_NAMES or "/claude/versions/" in argv[0]:
+        return True
+    if prog in _RUNTIMES and len(argv) > 1:  # GUARD:npm-claude
+        script = argv[1].replace("\\", "/")
+        return (os.path.basename(script) in _CLAUDE_NAMES
+                or script.endswith(("/@anthropic-ai/claude-code/cli.js", "/@anthropic-ai/claude-code/cli.mjs")))
+    return False
+
+
 def _claude_pid():
     """The nearest claude ancestor of this hook process. (CLAUDE_PID in the
     environment is not trusted: a session started from another session's Bash
-    tool inherits the parent's value.)"""
+    tool inherits the parent's value.) If the session's own claude were not
+    recognised, the walk would reach an outer session's claude and register
+    that pid, so this recognises every way Claude Code is launched."""
     pid = os.getppid()
     for _ in range(6):
         if not pid or pid <= 1:
             return None
-        ppid, args = proc_parent_and_args(pid)
-        if args is None:
+        ppid, argv = proc_parent_and_argv(pid)
+        if argv is None:
             return None
-        first = args.split(" ", 1)[0]
-        if os.path.basename(first) == "claude" or "/claude/versions/" in first:
+        if _is_claude(argv):
             return pid
         pid = ppid
     return None

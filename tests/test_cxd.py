@@ -865,6 +865,44 @@ class TestHooks(Base):
         self.assertEqual(r.returncode, 3)
         self.assertIn("not running", r.stderr)
 
+    def session_as(self, sid, argv0, script_path, extra=()):
+        """A fake session whose process looks like a given Claude Code launch."""
+        os.makedirs(os.path.dirname(script_path), exist_ok=True)
+        with open(script_path, "w") as f:
+            f.write(FAKE_CLAUDE)
+        outdir = os.path.join(self.tmp, "hook-out-" + sid[:8])
+        os.makedirs(outdir)
+        env = dict(self.env, HOOK=HOOK, OUTDIR=outdir)
+        p = subprocess.Popen([argv0, script_path, sid] + list(extra), executable="/bin/bash",
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env,
+                             universal_newlines=True, bufsize=1)
+        p.outdir = outdir
+        self.bg.append(p)
+        self.hook(p, "SessionStart")
+        return p, read_json(os.path.join(self.local, "sessions", sid + ".json"))
+
+    def test_every_claude_code_launch_is_recognised(self):
+        """GUARD npm-claude. Mutation: a JS runtime running Claude Code is not
+        recognised -> such a session gets no pid of its own (or an outer
+        session's), so sends to it are refused or go by the wrong liveness."""
+        npm = os.path.join(self.tmp, "lib", "node_modules", "@anthropic-ai", "claude-code")
+        cases = [
+            ("dddd0001-2222-3333-4444-555555555555", "node", os.path.join(self.tmp, "prefix", "bin", "claude")),
+            ("dddd0002-2222-3333-4444-555555555555", "node", os.path.join(npm, "cli.js")),
+            ("dddd0003-2222-3333-4444-555555555555", os.path.join(npm, "bin", "claude.exe"),
+             os.path.join(self.tmp, "fake-claude-exe.sh")),
+        ]
+        for sid, argv0, script in cases:
+            p, rec = self.session_as(sid, argv0, script)
+            self.assertEqual(rec["pid"], p.pid, (argv0, script))
+            self.ok("send", "laptop", sid, "MARK-LAUNCH")
+
+    def test_an_ancestor_that_only_mentions_claude_code_is_not_it(self):
+        sid = "dddd0004-2222-3333-4444-555555555555"
+        p, rec = self.session_as(sid, "sh", os.path.join(self.tmp, "wrapper.sh"),
+                                 extra=["/x/node_modules/@anthropic-ai/claude-code/cli.js"])
+        self.assertNotEqual(rec["pid"], p.pid)
+
     def test_send_refused_when_session_process_is_gone(self):
         sid = "22222222-2222-3333-4444-555555555555"
         p = self.fake_session(sid)

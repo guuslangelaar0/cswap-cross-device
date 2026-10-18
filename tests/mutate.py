@@ -279,6 +279,14 @@ MUTATIONS = [
         "expect": "red",
     },
     {
+        "name": "npm-claude",
+        "what": "a JS runtime running Claude Code (node .../bin/claude, node .../claude-code/cli.js) is not recognised",
+        "edits": [("lib/cxd/hook.py", "    if prog in _RUNTIMES and len(argv) > 1:  # GUARD:npm-claude\n",
+                   "    if False:  # MUTATION\n")],
+        "tests": [T + "TestHooks.test_every_claude_code_launch_is_recognised"],
+        "expect": "red",
+    },
+    {
         "name": "init-no-link",
         "what": "cxd init does not link ~/.cxd/bin/cxd, so peers cannot reach this host",
         "edits": [("lib/cxd/cli.py", "    link, target = _link_cli()\n",
