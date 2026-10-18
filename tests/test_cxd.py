@@ -58,6 +58,9 @@ class Base(unittest.TestCase):
             if p.poll() is None:
                 p.kill()
                 p.wait()
+            for f in (p.stdin, p.stdout, p.stderr):
+                if f:
+                    f.close()
         # Kill only processes this test's cxd recorded (verified identity).
         for home in (self.local, self.remote):
             rd = os.path.join(home, "runs")
@@ -155,6 +158,8 @@ class Base(unittest.TestCase):
         evs = []
         with open(log) as f:
             for line in f:
+                if not line.endswith("\n"):
+                    break  # still being written; the next read sees it whole
                 line = line.strip()
                 if line.startswith("{"):
                     evs.append(json.loads(line))
@@ -450,26 +455,26 @@ class TestWatch(Base):
         # and must arrive on a reconnected stream, exactly once.
         self.ok("send", "buildbox", "wr", "SLEEP 8 MARK-ACROSSDROP")
         self.wait_event(log, lambda e: e["ev"] == "turn" and "MARK-ACROSSDROP" in e["result"], timeout=60)
-        evs = self.read_events(log)
+        evs, text = self.read_events(log), self.log_text(log)
         kinds = [e["ev"] for e in evs]
         turn_at = [i for i, e in enumerate(evs) if e["ev"] == "turn" and "MARK-ACROSSDROP" in e["result"]]
-        self.assertEqual(len(turn_at), 1, self.log_text(log))
+        self.assertEqual(len(turn_at), 1, text)
         self.assertGreaterEqual(kinds[:turn_at[0]].count("transport"), 3,
-                                "the turn was not delivered across a stream cut:\n" + self.log_text(log))
-        self.assertFalse([e for e in evs if e["ev"] == "exit"], self.log_text(log))
-        self.assertIsNone(p.poll(), "watch stopped while the run is alive:\n" + self.log_text(log))
+                                "the turn was not delivered across a stream cut:\n" + text)
+        self.assertFalse([e for e in evs if e["ev"] == "exit"], text)
+        self.assertIsNone(p.poll(), "watch stopped while the run is alive:\n" + text)
         pids = self.pids("buildbox", "wr")
         self.assertTrue(proc_alive(pids["claude_pid"], pids["claude_ident"]))
         self.ok("stop", "buildbox", "wr", "--grace", "10")
         self.wait_event(log, lambda e: e["ev"] == "exit", timeout=40)
         p.wait(20)
         self.assertEqual(p.returncode, 0)
-        evs = self.read_events(log)
+        evs, text = self.read_events(log), self.log_text(log)
         # Reconnecting from the cursor never repeated the turn.
-        self.assertEqual(len([e for e in evs if e["ev"] == "turn" and "MARK-ACROSSDROP" in e["result"]]), 1)
+        self.assertEqual(len([e for e in evs if e["ev"] == "turn" and "MARK-ACROSSDROP" in e["result"]]), 1, text)
         # Exactly one exit, and it is the host's: rc, gen and turns of the run, no reason.
         exits = [e for e in evs if e["ev"] == "exit"]
-        self.assertEqual(len(exits), 1, self.log_text(log))
+        self.assertEqual(len(exits), 1, text)
         self.assertNotIn("reason", exits[0])
         self.assertEqual((exits[0]["rc"], exits[0]["gen"], exits[0]["turns"]), (0, 1, 2), exits[0])
 
