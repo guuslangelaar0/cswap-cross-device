@@ -154,19 +154,21 @@ unique prefix of 8+ characters) as the target: `cxd send laptop 3f2a9c1e "…"`.
 A headless worker has nobody to answer a permission prompt. `cxd` does not bypass them
 unless you ask: a tool call that needs approval is refused (with Claude Code 2.1.302 the
 call is denied and the turn carries on without it), so a worker can stall on work it is not
-allowed to do. `cxd start` warns once on stderr when a run has no bypass.
+allowed to do. `cxd start` and `cxd resume` warn once on stderr when a run has no bypass.
 
 Where you can, grant what the task needs with Claude Code's own flags after `--`:
 `-- --permission-mode acceptEdits` accepts file edits, and
 `-- --allowedTools "Bash(git *)"` allows matching commands. Both pass straight through.
 
 Skipping every check (`--dangerously-skip-permissions`) is opt-in, per run with
-`cxd start … --skip-permissions` or per host with `"skip_permissions": true` in the
-`~/.cxd/config.json` of the host that runs the worker (any other value counts as false). It
-is opt-in because a bypassed worker can run any command and change any file your user can,
-without asking. Use it only in directories and on machines you would let it change freely.
-`cxd resume` keeps the choice the run was started with, and adds the bypass only on the same
-opt-ins: `cxd resume … --skip-permissions`, or `"skip_permissions": true` on the host.
+`cxd start … --skip-permissions` or `cxd resume … --skip-permissions` (the run keeps that
+choice), or per host with `"skip_permissions": true` in the `~/.cxd/config.json` of the host
+that runs the worker (any other value counts as false). The host setting is read each time a
+run starts or resumes, so turning it off stops the bypass for runs that did not opt in
+themselves. It is opt-in because a bypassed worker can run any command and change any file
+your user can, without asking. Use it only in directories and on machines you would let it
+change freely. If a host does not apply a `--skip-permissions` you asked for (it runs an
+older `cxd`), the command says so and exits 3.
 
 ## Commands
 
@@ -229,8 +231,9 @@ by name.
   `600`. Only your user (and root) can write to an inbox or a FIFO, so only your user can
   steer your sessions.
 - **No permission bypass by default.** A worker gets `--dangerously-skip-permissions` only
-  with `cxd start … --skip-permissions` or `"skip_permissions": true` on the host that runs
-  it. Otherwise a tool call that needs approval is refused. See [Permissions](#permissions).
+  with `--skip-permissions` on `cxd start` or `cxd resume`, or `"skip_permissions": true` on
+  the host that runs it. Otherwise a tool call that needs approval is refused. See
+  [Permissions](#permissions).
 - **Hooks never break a session.** They exit 0 on every error and print nothing unless
   they deliver a message. `PostToolUse` and `UserPromptSubmit` skip Python entirely when no
   inbox has mail. The test suite requires a median under 100 ms for `PostToolUse` and

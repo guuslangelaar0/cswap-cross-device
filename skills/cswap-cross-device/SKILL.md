@@ -35,13 +35,14 @@ cxd resume buildbox w1 next.md   # only after it has exited; same session id
   messages. Do not open that FIFO yourself: an extra writer keeps a stopped run alive.
 - Permission prompts are not bypassed by default. Nobody can answer them in a headless
   run, so a tool call that needs approval is refused and the worker may stall; `start`
-  warns once on stderr. Prefer granting what the task needs after `--`:
+  and `resume` warn once on stderr. Prefer granting what the task needs after `--`:
   `-- --permission-mode acceptEdits`, `-- --allowedTools "Bash(git *)"`.
 - Skipping every check (`--dangerously-skip-permissions`) is an explicit opt-in:
-  `cxd start ... --skip-permissions`, or `"skip_permissions": true` in the worker host's
-  `~/.cxd/config.json`. A bypassed worker can run any command and change any file the
-  user can, so use it only in a directory and on a machine you would let it change freely.
-  `resume` keeps the run's choice; `cxd resume ... --skip-permissions` opts a run in.
+  `--skip-permissions` on `cxd start` or `cxd resume` (the run keeps it), or
+  `"skip_permissions": true` in the worker host's `~/.cxd/config.json` (read at every start
+  and resume). A bypassed worker can run any command and change any file the user can, so
+  use it only in a directory and on a machine you would let it change freely. A resumed run
+  keeps the claude arguments it was started with.
 - `send` to a headless run becomes the next user turn. A message sent mid-turn is queued
   or folded into the running turn. `send` refuses a run that is not running (exit 3).
 - `watch` prints: `status`, `turn N ended ... cost=$...: <result excerpt>`, `PR <url>`,

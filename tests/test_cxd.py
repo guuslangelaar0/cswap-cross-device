@@ -398,11 +398,13 @@ class TestRuns(Base):
         with open(meta_p, "w") as f:
             json.dump(meta, f)
         self.ok("stop", "laptop", "wr1", "--grace", "10")
-        # 1. No opt-in: no bypass, and the same warning as start.
+        # 1. No opt-in: no bypass, and one warning that names resume's own opt-in.
         r = self.ok("resume", "laptop", "wr1", self.prompt("MARK-2"), "--init-timeout", "20")
         self.wait_results("laptop", "wr1", 2)
         self.assertNotIn("--dangerously-skip-permissions", self.inits("laptop", "wr1")[1]["argv"])
         self.assertEqual(r.stderr.count("cxd: warning:"), 1, r.stderr)
+        self.assertIn("cxd resume laptop wr1 <prompt> --skip-permissions", r.stderr)
+        self.assertNotIn("cxd start", r.stderr)
         self.ok("stop", "laptop", "wr1", "--grace", "10")
         # 2. --skip-permissions on resume opts in, and the run keeps it.
         r = self.ok("resume", "laptop", "wr1", self.prompt("MARK-3"), "--skip-permissions", "--init-timeout", "20")
@@ -416,18 +418,59 @@ class TestRuns(Base):
         self.assertIn("--dangerously-skip-permissions", self.inits("laptop", "wr1")[3]["argv"])
         self.ok("stop", "laptop", "wr1", "--grace", "10")
 
+    def remote_bypass(self, value):
+        with open(os.path.join(self.remote, "config.json"), "w") as f:
+            json.dump({"default_account": "work", "skip_permissions": value}, f)
+
     def test_resume_honours_the_host_bypass_setting(self):
+        """GUARD bypass-json-true. Mutation: any truthy host setting opts in ->
+        "skip_permissions": "false" bypasses."""
         self.start("buildbox", "wr2", "MARK-1")
         self.wait_results("buildbox", "wr2", 1)
         self.assertNotIn("--dangerously-skip-permissions", self.inits("buildbox", "wr2")[0]["argv"])
+        steps = [("false", False), (True, True), (False, False)]  # only a JSON true; the host's current setting
+        for n, (value, bypass) in enumerate(steps, start=2):
+            self.ok("stop", "buildbox", "wr2", "--grace", "10")
+            self.remote_bypass(value)
+            r = self.ok("resume", "buildbox", "wr2", self.prompt("MARK-%d" % n), "--init-timeout", "20")
+            self.wait_results("buildbox", "wr2", n)
+            argv = self.inits("buildbox", "wr2")[n - 1]["argv"]
+            self.assertEqual("--dangerously-skip-permissions" in argv, bypass, (value, argv))
+            self.assertEqual("cxd: warning:" in r.stderr, not bypass, (value, r.stderr))
         self.ok("stop", "buildbox", "wr2", "--grace", "10")
-        with open(os.path.join(self.remote, "config.json"), "w") as f:
-            json.dump({"default_account": "work", "skip_permissions": True}, f)
-        r = self.ok("resume", "buildbox", "wr2", self.prompt("MARK-2"), "--init-timeout", "20")
-        self.wait_results("buildbox", "wr2", 2)
-        self.assertIn("--dangerously-skip-permissions", self.inits("buildbox", "wr2")[1]["argv"])
-        self.assertNotIn("warning", r.stderr)
-        self.ok("stop", "buildbox", "wr2", "--grace", "10")
+
+    def test_failed_resume_does_not_keep_the_opt_in(self):
+        self.start("laptop", "wr3", "MARK-1")
+        self.wait_results("laptop", "wr3", 1)
+        self.ok("stop", "laptop", "wr3", "--grace", "10")
+        r = self.cxd("resume", "laptop", "wr3", self.prompt("MARK-2"), "--skip-permissions",
+                     "--init-timeout", "10", env={"STUB_FAIL_START": "1"})
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertIsNot(read_json(os.path.join(self.local, "runs", "wr3", "meta.json")).get("skip_permissions"), True)
+        self.ok("resume", "laptop", "wr3", self.prompt("MARK-3"), "--init-timeout", "20")
+        self.wait_results("laptop", "wr3", 2)
+        self.assertNotIn("--dangerously-skip-permissions", self.inits("laptop", "wr3")[-1]["argv"])
+        self.ok("stop", "laptop", "wr3", "--grace", "10")
+
+    def test_opt_in_a_host_ignores_is_an_error(self):
+        """A host on an older cxd drops --skip-permissions: say so loudly."""
+        shim = os.path.join(self.tmp, "old-cxd")
+        with open(shim, "w") as f:
+            f.write("import json, subprocess, sys\n"
+                    "req = json.loads(sys.stdin.read())\n"
+                    "req['args'].pop('skip_permissions', None)\n"
+                    "sys.exit(subprocess.run([sys.executable, %r, '_rpc'], input=json.dumps(req),\n"
+                    "                        universal_newlines=True).returncode)\n" % CXD)
+        with open(os.path.join(self.local, "config.json")) as f:
+            cfg = json.load(f)
+        cfg["hosts"]["oldbox"] = {"transport": "ssh", "python": sys.executable, "cxd": shim}
+        with open(os.path.join(self.local, "config.json"), "w") as f:
+            json.dump(cfg, f)
+        r = self.cxd("start", "oldbox", "wo", self.prompt("MARK-1"), "--skip-permissions", "--init-timeout", "20")
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertIn("did not apply --skip-permissions", r.stderr)
+        self.assertIn("is running WITHOUT", r.stderr)
+        self.ok("stop", "oldbox", "wo", "--grace", "10")
 
     def test_start_reports_a_process_that_dies_at_once(self):
         r = self.cxd("start", "laptop", "wd", self.prompt("MARK-1"), "--init-timeout", "10",

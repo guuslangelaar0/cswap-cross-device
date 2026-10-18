@@ -80,6 +80,19 @@ PERMISSIONS_WARNING = (
     "\"skip_permissions\": true in that host's ~/.cxd/config.json."
 )
 
+RESUME_PERMISSIONS_WARNING = (
+    "warning: %s/%s resumes without --dangerously-skip-permissions. Nobody can answer a permission prompt "
+    "in a headless run, so a tool call that needs one is refused and the work may stall. A resumed run "
+    "keeps the claude arguments it was started with. To skip every check, opt in with "
+    "`cxd resume %s %s <prompt> --skip-permissions` or \"skip_permissions\": true in that host's "
+    "~/.cxd/config.json."
+)
+
+BYPASS_NOT_APPLIED = (
+    "%s did not apply --skip-permissions (does it run an older cxd? update it and run `cxd init` there): "
+    "%s/%s is running WITHOUT the bypass"
+)
+
 
 # ---------------------------------------------------------------- commands
 
@@ -92,13 +105,16 @@ def cmd_start(a):
     res = t.call("start", {"name": a.name, "prompt": prompt, "account": a.account, "cwd": cwd,
                            "skip_permissions": a.skip_permissions,
                            "claude_args": a.claude_args, "init_timeout": a.init_timeout})
-    if not res.get("skip_permissions"):
-        _err(PERMISSIONS_WARNING % (a.host, res["name"]))
     if a.json:
         _out(json.dumps(res))
     else:
         _out("started %s/%s gen=%s session=%s claude_pid=%s alive=%s" % (
             a.host, res["name"], res["gen"], res.get("session_id"), res.get("claude_pid"), res.get("alive")))
+    if a.skip_permissions and not res.get("skip_permissions"):
+        _err(BYPASS_NOT_APPLIED % (a.host, a.host, res["name"]))
+        return EXIT_REFUSED
+    if not res.get("skip_permissions"):
+        _err(PERMISSIONS_WARNING % (a.host, res["name"]))
     return EXIT_OK
 
 
@@ -107,13 +123,16 @@ def cmd_resume(a):
     prompt = _read_prompt_file(a.prompt_file)
     res = t.call("resume", {"name": a.name, "prompt": prompt, "init_timeout": a.init_timeout,
                             "skip_permissions": a.skip_permissions})
-    if not res.get("skip_permissions"):
-        _err(PERMISSIONS_WARNING % (a.host, res["name"]))
     if a.json:
         _out(json.dumps(res))
     else:
         _out("resumed %s/%s gen=%s session=%s claude_pid=%s" % (
             a.host, res["name"], res["gen"], res.get("session_id"), res.get("claude_pid")))
+    if a.skip_permissions and not res.get("skip_permissions"):
+        _err(BYPASS_NOT_APPLIED % (a.host, a.host, res["name"]))
+        return EXIT_REFUSED
+    if not res.get("skip_permissions"):
+        _err(RESUME_PERMISSIONS_WARNING % (a.host, res["name"], a.host, res["name"]))
     return EXIT_OK
 
 
@@ -422,8 +441,9 @@ def main(argv=None):
         from .supervise import supervise_main
         ap = argparse.ArgumentParser(prog="cxd _supervise")
         ap.add_argument("rundir"); ap.add_argument("--gen", type=int, required=True); ap.add_argument("--resume")
+        ap.add_argument("--skip-permissions", action="store_true")
         ns = ap.parse_args(argv[1:])
-        return supervise_main(ns.rundir, ns.gen, ns.resume)
+        return supervise_main(ns.rundir, ns.gen, ns.resume, ns.skip_permissions)
     if argv and argv[0] == "_keeper":
         from .supervise import keeper_main
         return keeper_main(argv[1], argv[2])

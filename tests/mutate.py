@@ -129,9 +129,20 @@ MUTATIONS = [
     {
         "name": "resume-bypass",
         "what": "resume adds --dangerously-skip-permissions without an opt-in",
-        "edits": [("lib/cxd/state.py", '    meta["skip_permissions"] = (meta.get("skip_permissions") is True  # GUARD:resume-bypass\n',
-                   '    meta["skip_permissions"] = (True  # MUTATION\n')],
+        "edits": [("lib/cxd/state.py",
+                   '    opt_in = meta.get("skip_permissions") is True or args.get("skip_permissions") is True  # GUARD:resume-bypass\n',
+                   '    opt_in = True  # MUTATION\n')],
         "tests": [T + "TestRuns.test_resume_opts_in_to_bypass_only_when_asked"],
+        "expect": "red",
+    },
+    {
+        "name": "bypass-json-true",
+        "what": "any truthy skip_permissions (e.g. the string \"false\") opts in to the bypass",
+        "edits": [("lib/cxd/state.py",
+                   '    return run_opt_in is True or load_config().get("skip_permissions") is True  # GUARD:bypass-json-true\n',
+                   '    return bool(run_opt_in) or bool(load_config().get("skip_permissions"))  # MUTATION\n')],
+        "tests": [T + "TestRuns.test_resume_honours_the_host_bypass_setting",
+                  T + "TestRuns.test_permission_bypass_is_opt_in_by_flag_or_host_config"],
         "expect": "red",
     },
     {
