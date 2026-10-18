@@ -344,6 +344,14 @@ MUTATIONS = [
         "expect": "red",
     },
     {
+        "name": "announce-tag",
+        "what": "delivered messages lack the session's secret tag (indistinguishable from injected copies)",
+        "edits": [("lib/cxd/hook.py", '    mark = " [cxd:%s]" % tag if tag else ""  # GUARD:announce-tag\n',
+                   '    mark = ""  # MUTATION\n')],
+        "tests": [T + "TestHooks.test_the_announcement_names_a_secret_tag_and_messages_carry_it"],
+        "expect": "red",
+    },
+    {
         "name": "init-no-link",
         "what": "cxd init does not link ~/.cxd/bin/cxd, so peers cannot reach this host",
         "edits": [("lib/cxd/cli.py", "    link, target = _link_cli()\n",

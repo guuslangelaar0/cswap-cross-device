@@ -35,7 +35,7 @@ class Base(unittest.TestCase):
         os.makedirs(self.work)
         self.env = dict(os.environ)
         for k in list(self.env):
-            if k.startswith(("CLAUDE_CODE_", "STUB_", "FAKE_SSH_")) or k in ("CXD_HOME", "CXD_SELF"):
+            if k.startswith(("CLAUDE_CODE_", "STUB_", "FAKE_SSH_")) or k in ("CXD_HOME", "CXD_SELF", "CXD_RUN"):
                 del self.env[k]
         self.env.update({
             "CXD_HOME": self.local, "CXD_SELF": "laptop",
@@ -844,7 +844,9 @@ class TestHooks(Base):
         start = self.hook(p, "SessionStart")
         self.assertEqual(start["rc"], 0)
         ctx = json.loads(start["out"])["hookSpecificOutput"]["additionalContext"]
-        self.assertIn('"Message from the lead session"', ctx)  # the session learns how lead messages arrive
+        tag = read_json(os.path.join(self.local, "sessions", sid + ".json"))["tag"]
+        self.assertGreaterEqual(len(tag), 16)
+        self.assertIn("[cxd:%s]" % tag, ctx)  # the session learns how ITS lead messages are marked
         rec = read_json(os.path.join(self.local, "sessions", sid + ".json"))
         self.assertEqual(rec["pid"], p.pid, "SessionStart registered the wrong pid")
         w, log = self.watch_bg("laptop", sid)
@@ -856,6 +858,7 @@ class TestHooks(Base):
         self.assertEqual(ctx["hookEventName"], "PostToolUse")
         self.assertTrue(ctx["additionalContext"].startswith("Message from the lead session "))
         self.assertIn("MARK-HOOK", ctx["additionalContext"])
+        self.assertIn("[cxd:%s]" % tag, ctx["additionalContext"])
         self.assertEqual(self.hook(p, "PostToolUse")["out"], "")  # delivered once
         self.ok("send", "laptop", sid, "late MARK-AT-STOP")
         stop = self.hook(p, "Stop")
@@ -1093,6 +1096,52 @@ class TestHooks(Base):
         self.assertEqual(len(os.listdir(os.path.join(self.local, "inbox", sid))), 1)
         self.assertFalse(os.path.exists(os.path.join(self.local, "claimed", sid)) and
                          os.listdir(os.path.join(self.local, "claimed", sid)))
+
+    def session_start(self, sid, source="startup", env=None):
+        e = dict(self.env)
+        e.update(env or {})
+        r = subprocess.run([HOOK, "SessionStart"], input=json.dumps({"session_id": sid, "source": source}).encode(),
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=e)
+        self.assertEqual((r.returncode, r.stderr), (0, b""))
+        return json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"] if r.stdout else ""
+
+    def test_the_announcement_names_a_secret_tag_and_messages_carry_it(self):
+        """GUARD announce-tag. Mutation: messages go out without the session's
+        tag -> the session cannot tell them from the same words in a file or
+        web page, which the announcement tells it to ignore."""
+        sid = "bebebebe-2222-3333-4444-555555555555"
+        ctx = self.session_start(sid)
+        tag = read_json(os.path.join(self.local, "sessions", sid + ".json"))["tag"]
+        self.assertIn("[cxd:%s]" % tag, ctx)
+        self.assertIn("without", ctx)  # untagged copies are not from the user
+        self.assertIn("redelivery", ctx)  # at-least-once: a repeated id is not a new instruction
+        self.queue(sid, 1, "MARK-TAGGED")
+        out = json.loads(self.run_hook(sid))["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("[cxd:%s]" % tag, out)
+        # A resume keeps the tag and does not announce again.
+        self.assertEqual(self.session_start(sid, source="resume"), "")
+        self.assertEqual(read_json(os.path.join(self.local, "sessions", sid + ".json"))["tag"], tag)
+        # Another session gets another tag.
+        self.session_start("bebebebe-9999")
+        self.assertNotEqual(read_json(os.path.join(self.local, "sessions", "bebebebe-9999.json"))["tag"], tag)
+
+    def test_no_announcement_in_headless_runs_or_when_turned_off(self):
+        self.assertEqual(self.session_start("bebebebe-3333", env={"CXD_RUN": "w1"}), "")
+        with open(os.path.join(self.local, "config.json")) as f:
+            cfg = json.load(f)
+        cfg["announce"] = False
+        with open(os.path.join(self.local, "config.json"), "w") as f:
+            json.dump(cfg, f)
+        self.assertEqual(self.session_start("bebebebe-4444"), "")
+        self.assertFalse(os.path.exists(os.path.join(self.local, "delivered", "bebebebe-4444")))
+
+    def test_announcement_and_mail_fit_the_context_cap(self):
+        sid = "bebebebe-5555-3333-4444-555555555555"
+        for i in range(40):
+            self.queue(sid, i, "x" * 400)
+        ctx = self.session_start(sid)
+        self.assertLessEqual(len(ctx), 10000)
+        self.assertNotIn("truncated", ctx)
 
     def test_session_start_is_silent_where_cxd_is_not_set_up(self):
         os.unlink(os.path.join(self.local, "config.json"))
