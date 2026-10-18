@@ -93,6 +93,11 @@ BYPASS_NOT_APPLIED = (
     "%s/%s is running WITHOUT the bypass"
 )
 
+BYPASS_NOT_WITHDRAWN = (
+    "%s/%s still bypasses permission prompts: --no-skip-permissions withdraws only the run's own opt-in, "
+    "and %s's ~/.cxd/config.json has \"skip_permissions\": true (or the host runs an older cxd)"
+)
+
 
 # ---------------------------------------------------------------- commands
 
@@ -128,11 +133,13 @@ def cmd_resume(a):
 
 
 def _bypass_outcome(a, res, warning):
-    """After a start or resume: exit 5 if the host did not apply a requested
-    --skip-permissions (the run IS running, without it), else warn when the run
-    has no bypass."""
+    """After a start or resume: exit 5 if the permission choice asked for was
+    not applied (the run IS running), else warn when the run has no bypass."""
     if a.skip_permissions and not res.get("skip_permissions"):  # GUARD:bypass-not-applied
         _err(BYPASS_NOT_APPLIED % (a.host, a.host, res["name"]))
+        return EXIT_NOT_APPLIED
+    if getattr(a, "no_skip_permissions", False) and res.get("skip_permissions"):
+        _err(BYPASS_NOT_WITHDRAWN % (a.host, res["name"], a.host))
         return EXIT_NOT_APPLIED
     if not res.get("skip_permissions"):
         _err(warning)

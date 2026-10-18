@@ -167,7 +167,8 @@ that runs the worker (any other value counts as false). The host setting is read
 run starts or resumes, so turning it off stops the bypass for runs that did not opt in
 themselves. It is opt-in because a bypassed worker can run any command and change any file
 your user can, without asking. Use it only in directories and on machines you would let it
-change freely. `cxd resume … --no-skip-permissions` withdraws a run's own opt-in. Runs
+change freely. `cxd resume … --no-skip-permissions` withdraws a run's own opt-in (not the
+host's: if the host still opts in, the command says so and exits 5). Runs
 started by cxd 0.1.0 resume without the bypass unless you opt in again (0.1.0 stored the
 choice mixed with the host setting). If a host does not apply a `--skip-permissions` you
 asked for (it runs an older `cxd`), the command says so and exits 5: the run is running,
@@ -192,7 +193,8 @@ without the bypass.
 
 Exit codes: `0` ok, `2` usage, `3` refused (dead run, alive on resume, unknown target, start
 failure), `4` transport failure (the host could not be reached, so nothing was decided), `5`
-started or resumed, but without a `--skip-permissions` you asked for (the run is running).
+started or resumed, but the permission choice you asked for (`--skip-permissions` or
+`--no-skip-permissions`) was not applied: the run is running.
 
 **`watch` lines:** `status`, `session … started`, `turn N ended cost=$…: <result>`,
 `PR <url>`, `delivered message <id> via <Hook> hook`, `report (stop|notify): …`,

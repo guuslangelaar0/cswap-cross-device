@@ -54,8 +54,8 @@ cxd resume buildbox w1 next.md   # only after it has exited; same session id
 - `stop --now` skips the grace period and interrupts the current turn.
 - Exit codes: 0 ok, 2 usage, 3 refused (dead run, alive on resume, unknown name),
   4 transport failure (the host could not be reached; nothing was decided), 5 the run
-  started or resumed but WITHOUT a `--skip-permissions` you asked for (it is running: stop
-  it or let it work with prompts refused; do not start it again).
+  started or resumed but the permission choice you asked for was not applied (it IS
+  running: read the message, stop it if needed; do not start it again).
 
 ## Lead: interactive or plain sessions (hook inbox)
 

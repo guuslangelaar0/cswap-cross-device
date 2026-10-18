@@ -136,6 +136,14 @@ MUTATIONS = [
         "expect": "red",
     },
     {
+        "name": "withdraw-now",
+        "what": "a withdrawal is saved only after a good launch (a failed resume keeps the opt-in)",
+        "edits": [("lib/cxd/state.py", '        meta["bypass_opt_in"] = False  # GUARD:withdraw-now\n',
+                   "        pass  # MUTATION\n")],
+        "tests": [T + "TestRuns.test_a_withdrawal_is_kept_even_if_the_resume_fails"],
+        "expect": "red",
+    },
+    {
         "name": "legacy-opt-in",
         "what": "cxd 0.1.0's meta skip_permissions (flag OR host setting) is trusted as the run's opt-in",
         "edits": [("lib/cxd/state.py",

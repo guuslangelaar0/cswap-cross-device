@@ -451,6 +451,32 @@ class TestRuns(Base):
             self.assertEqual("--dangerously-skip-permissions" in argv, bypass, (value, argv))
             self.assertEqual("cxd: warning:" in r.stderr, not bypass, (value, r.stderr))
         self.ok("stop", "buildbox", "wr2", "--grace", "10")
+        # Withdrawing the run's opt-in cannot undo the host's: say so (exit 5).
+        self.remote_bypass(True)
+        r = self.cxd("resume", "buildbox", "wr2", self.prompt("MARK-5"), "--no-skip-permissions", "--init-timeout", "20")
+        self.assertEqual(r.returncode, 5, r.stdout + r.stderr)
+        self.assertIn("still bypasses permission prompts", r.stderr)
+        self.wait_results("buildbox", "wr2", 5)
+        self.assertIn("--dangerously-skip-permissions", self.inits("buildbox", "wr2")[4]["argv"])
+        self.ok("stop", "buildbox", "wr2", "--grace", "10")
+
+    def test_a_withdrawal_is_kept_even_if_the_resume_fails(self):
+        """GUARD withdraw-now. Mutation: a withdrawal is saved only after a good
+        launch -> a failed `resume --no-skip-permissions` leaves the opt-in, and
+        the next plain resume bypasses again."""
+        self.ok("start", "laptop", "wr6", self.prompt("MARK-1"), "--skip-permissions", "--init-timeout", "20")
+        self.wait_results("laptop", "wr6", 1)
+        self.ok("stop", "laptop", "wr6", "--grace", "10")
+        r = self.cxd("resume", "laptop", "wr6", self.prompt("MARK-2"), "--no-skip-permissions",
+                     "--init-timeout", "10", env={"STUB_FAIL_START": "1"})
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        meta = read_json(os.path.join(self.local, "runs", "wr6", "meta.json"))
+        self.assertIs(meta["bypass_opt_in"], False)
+        self.assertNotIn("skip_permissions", meta)  # the legacy key is gone too
+        self.ok("resume", "laptop", "wr6", self.prompt("MARK-3"), "--init-timeout", "20")
+        self.wait_results("laptop", "wr6", 2)
+        self.assertNotIn("--dangerously-skip-permissions", self.inits("laptop", "wr6")[-1]["argv"])
+        self.ok("stop", "laptop", "wr6", "--grace", "10")
 
     def test_host_bypass_at_start_is_not_kept_by_the_run(self):
         """GUARD host-not-kept. Mutation: start saves the host's setting as the

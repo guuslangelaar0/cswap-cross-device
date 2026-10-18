@@ -223,7 +223,7 @@ def op_start(args):
 
 def _launch(d, meta, gen, resume_sid, prompt, init_timeout, opt_in):
     """Start gen of a run. The run's opt-in is saved with its session id, once
-    the gen has started; a launch that fails leaves meta.json as it was."""
+    the gen has started; a launch that fails does not save an opt-in."""
     skip_permissions = bypass_opted_in(opt_in)
     _spawn_supervisor(d, gen, resume_sid, skip_permissions)
     pids = _wait_pids(d, gen)
@@ -248,6 +248,7 @@ def _launch(d, meta, gen, resume_sid, prompt, init_timeout, opt_in):
     if sid:
         meta["session_id"] = sid
     meta["bypass_opt_in"] = opt_in
+    meta.pop("skip_permissions", None)  # cxd 0.1.0's key, never trusted
     atomic_write_json(os.path.join(d, "meta.json"), meta)
     return {"name": meta["name"], "host": self_label(), "gen": gen, "session_id": sid,
             "claude_pid": pids.get("claude_pid"), "keeper_pid": pids.get("keeper_pid"),
@@ -286,12 +287,15 @@ def op_resume(args):
         os.replace(os.path.join(d, "exit.json"), os.path.join(d, "exit.%d.json" % ex.get("gen", gen - 1)))
     meta["gen"] = gen
     meta["session_id"] = sid
-    atomic_write_json(os.path.join(d, "meta.json"), meta)
     # A resumed run keeps its own opt-in; `cxd resume --skip-permissions` adds
-    # one and `--no-skip-permissions` withdraws it.
+    # one (saved once the gen started) and `--no-skip-permissions` withdraws it
+    # (saved right away, whatever happens to the launch).
     opt_in = meta.get("bypass_opt_in") is True or args.get("skip_permissions") is True  # GUARD:resume-bypass
     if args.get("no_skip_permissions") is True:
         opt_in = False
+        meta["bypass_opt_in"] = False  # GUARD:withdraw-now
+        meta.pop("skip_permissions", None)
+    atomic_write_json(os.path.join(d, "meta.json"), meta)
     return _launch(d, meta, gen, sid, prompt, float(args.get("init_timeout") or 90), opt_in)
 
 
