@@ -21,7 +21,7 @@ USAGE = """cxd - lead <-> worker messaging for Claude Code sessions across cswap
   cxd watch  <host> <run-name|session-id> [--json] [--heartbeat S] [--from-start]
   cxd list   [host] [--all] [--json]
   cxd stop   <host> <name> [--now] [--grace S]
-  cxd resume <host> <name> <prompt-file|->
+  cxd resume <host> <name> <prompt-file|-> [--skip-permissions]
   cxd notify <text|@file|-> [--session SID]      (inside a worker session)
   cxd doctor [host...] [--json]
   cxd init   [--self NAME] [--peer HOST ...] [--account A ...] [--default-account A]
@@ -105,7 +105,10 @@ def cmd_start(a):
 def cmd_resume(a):
     t = get_transport(a.host)
     prompt = _read_prompt_file(a.prompt_file)
-    res = t.call("resume", {"name": a.name, "prompt": prompt, "init_timeout": a.init_timeout})
+    res = t.call("resume", {"name": a.name, "prompt": prompt, "init_timeout": a.init_timeout,
+                            "skip_permissions": a.skip_permissions})
+    if not res.get("skip_permissions"):
+        _err(PERMISSIONS_WARNING % (a.host, res["name"]))
     if a.json:
         _out(json.dumps(res))
     else:
@@ -372,6 +375,7 @@ def build_parser():
 
     s = sub.add_parser("resume")
     s.add_argument("host"); s.add_argument("name"); s.add_argument("prompt_file")
+    s.add_argument("--skip-permissions", action="store_true")
     s.add_argument("--init-timeout", type=float, default=90.0); s.add_argument("--json", action="store_true")
 
     s = sub.add_parser("send")

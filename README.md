@@ -165,7 +165,8 @@ Skipping every check (`--dangerously-skip-permissions`) is opt-in, per run with
 `~/.cxd/config.json` of the host that runs the worker (any other value counts as false). It
 is opt-in because a bypassed worker can run any command and change any file your user can,
 without asking. Use it only in directories and on machines you would let it change freely.
-`cxd resume` keeps the choice the run was started with.
+`cxd resume` keeps the choice the run was started with, and adds the bypass only on the same
+opt-ins: `cxd resume … --skip-permissions`, or `"skip_permissions": true` on the host.
 
 ## Commands
 
@@ -178,7 +179,7 @@ without asking. Use it only in directories and on machines you would let it chan
 | `cxd watch <host> <run\|session>` | `--json`, `--heartbeat S` (60), `--from-start` | Stream events, one line each, until the target exits. |
 | `cxd list [host]` | `--all`, `--json` | Runs and live sessions on one host, or on every configured host. `--all` includes ended sessions. |
 | `cxd stop <host> <name>` | `--now`, `--grace S` (120), `--int-wait S` (15), `--term-wait S` (10), `--json` | Stop a run (see [Stop semantics](#stop-semantics)) and report its exit code. |
-| `cxd resume <host> <name> <prompt-file\|->` | `--init-timeout S` (90), `--json` | Continue an exited run's conversation (`--resume <session id>`) with a new prompt. Refuses while the run is alive. |
+| `cxd resume <host> <name> <prompt-file\|->` | `--skip-permissions`, `--init-timeout S` (90), `--json` | Continue an exited run's conversation (`--resume <session id>`) with a new prompt. Refuses while the run is alive. Keeps the run's permission choice; `--skip-permissions` opts in. |
 | `cxd notify <text\|@file\|->` | `--session SID` | Inside a worker: add a report to its outbox (uses `CLAUDE_CODE_SESSION_ID`). |
 | `cxd doctor [host...]` | `--json` | Check every host: ssh round-trip, `cxd` home mode, cswap, claude, a hook self-test, and whether the plugin is enabled per account. |
 | `cxd init` | `--self NAME`, `--peer ALIAS` (repeatable), `--account A` (repeatable), `--default-account A` | Write `~/.cxd/config.json` and link `~/.cxd/bin/cxd`. |

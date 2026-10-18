@@ -127,6 +127,14 @@ MUTATIONS = [
         "expect": "red",
     },
     {
+        "name": "resume-bypass",
+        "what": "resume adds --dangerously-skip-permissions without an opt-in",
+        "edits": [("lib/cxd/state.py", '    meta["skip_permissions"] = (meta.get("skip_permissions") is True  # GUARD:resume-bypass\n',
+                   '    meta["skip_permissions"] = (True  # MUTATION\n')],
+        "tests": [T + "TestRuns.test_resume_opts_in_to_bypass_only_when_asked"],
+        "expect": "red",
+    },
+    {
         "name": "init-no-link",
         "what": "cxd init does not link ~/.cxd/bin/cxd, so peers cannot reach this host",
         "edits": [("lib/cxd/cli.py", "    link, target = _link_cli()\n",

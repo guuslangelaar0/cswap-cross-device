@@ -271,6 +271,11 @@ def op_resume(args):
         os.replace(os.path.join(d, "exit.json"), os.path.join(d, "exit.%d.json" % ex.get("gen", gen - 1)))
     meta["gen"] = gen
     meta["session_id"] = sid
+    # A resumed run keeps the bypass it was started with. It gains one only on
+    # an explicit opt-in: `cxd resume --skip-permissions` or the host's config.
+    meta["skip_permissions"] = (meta.get("skip_permissions") is True  # GUARD:resume-bypass
+                                or args.get("skip_permissions") is True
+                                or load_config().get("skip_permissions") is True)
     atomic_write_json(os.path.join(d, "meta.json"), meta)
     return _launch(d, meta, gen, sid, prompt, float(args.get("init_timeout") or 90))
 

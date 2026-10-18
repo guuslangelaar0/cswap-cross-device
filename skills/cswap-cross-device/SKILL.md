@@ -41,6 +41,7 @@ cxd resume buildbox w1 next.md   # only after it has exited; same session id
   `cxd start ... --skip-permissions`, or `"skip_permissions": true` in the worker host's
   `~/.cxd/config.json`. A bypassed worker can run any command and change any file the
   user can, so use it only in a directory and on a machine you would let it change freely.
+  `resume` keeps the run's choice; `cxd resume ... --skip-permissions` opts a run in.
 - `send` to a headless run becomes the next user turn. A message sent mid-turn is queued
   or folded into the running turn. `send` refuses a run that is not running (exit 3).
 - `watch` prints: `status`, `turn N ended ... cost=$...: <result excerpt>`, `PR <url>`,
