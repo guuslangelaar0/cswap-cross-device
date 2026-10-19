@@ -1012,6 +1012,7 @@ class TestSupervisorFailure(Base):
                 pass
         self.addCleanup(end_leaked_keeper)
         ex = read_json(os.path.join(d, "exit.json"))
+        self.assertIsNotNone(ex, "no exit record")
         self.assertEqual((ex["gen"], ex["rc"]), (1, None), ex)
         self.assertIn("disk full", ex["error"])
         # No writer is left on the FIFO: a non-blocking read sees EOF, not EAGAIN.
@@ -1028,6 +1029,244 @@ class TestSupervisorFailure(Base):
                     time.sleep(0.1)
         finally:
             os.close(fd)
+
+
+class TestPendingGen(Base):
+    """watch over a gen that has no pids yet (issue #10, part 2)."""
+
+    def make_run(self, name, gen, pids_gen=None, supervisor=None, meta_age=0):
+        from cxd.common import atomic_write_json, proc_identity
+        d = os.path.join(self.local, "runs", name)
+        os.makedirs(d, mode=0o700)
+        atomic_write_json(os.path.join(d, "meta.json"), {"name": name, "gen": gen})
+        if meta_age:
+            old = time.time() - meta_age
+            os.utime(os.path.join(d, "meta.json"), (old, old))
+        if pids_gen:
+            gone = subprocess.Popen(["true"])
+            gone.wait()
+            atomic_write_json(os.path.join(d, "pids.json"), {"gen": pids_gen, "claude_pid": gone.pid,
+                                                             "claude_ident": "never", "supervisor_pid": gone.pid,
+                                                             "supervisor_ident": "never"})
+            atomic_write_json(os.path.join(d, "exit.%d.json" % pids_gen), {"gen": pids_gen, "rc": 0})
+        if supervisor == "dead":
+            gone = subprocess.Popen(["true"])
+            gone.wait()
+            atomic_write_json(os.path.join(d, "supervisor.json"), {"gen": gen, "pid": gone.pid, "ident": "never"})
+        elif supervisor == "alive":
+            p = subprocess.Popen(["sleep", "60"])
+            self.bg.append(p)
+            atomic_write_json(os.path.join(d, "supervisor.json"), {"gen": gen, "pid": p.pid,
+                                                                   "ident": proc_identity(p.pid)})
+        with open(os.path.join(d, "out.jsonl"), "w"):
+            pass
+        return d
+
+    def poll(self, name, cur=None):
+        from cxd import state
+        with mock.patch.dict(os.environ, {"CXD_HOME": self.local}):
+            return state.poll(name, cur or {})[0]
+
+    def test_a_resumed_gen_that_failed_before_pids_reports_its_own_exit(self):
+        """GUARD pending-gen. Mutation: only a missing pids file counts -> while
+        pids.json still holds gen 1, a failed gen 2 is reported with gen 1's
+        exit code (or never)."""
+        from cxd.common import atomic_write_json
+        d = self.make_run("wp", gen=2, pids_gen=1, supervisor="dead")
+        atomic_write_json(os.path.join(d, "exit.json"), {"gen": 2, "rc": None, "error": "supervisor failed: boom"})
+        evs = self.poll("wp")
+        self.assertEqual([(e["ev"], e["gen"], e.get("error")) for e in evs],
+                         [("exit", 2, "supervisor failed: boom")])
+
+    def test_a_supervisor_that_died_without_a_record_ends_the_watch(self):
+        """GUARD supervisor-gone. Mutation: a dead supervisor is not noticed ->
+        a supervisor killed (SIGKILL) before it started claude leaves watch
+        waiting forever."""
+        self.make_run("wk", gen=1, supervisor="dead")
+        evs = self.poll("wk")
+        self.assertEqual([e["ev"] for e in evs], ["exit"])
+        self.assertIn("died before it started claude", evs[0]["error"])
+
+    def test_a_starting_supervisor_is_waited_for(self):
+        self.make_run("wl", gen=1, supervisor="alive")
+        self.assertEqual(self.poll("wl"), [])
+        self.make_run("wm", gen=2, pids_gen=1)  # the new supervisor has not written anything yet
+        self.assertEqual(self.poll("wm"), [])
+
+    def test_a_gen_whose_supervisor_never_started_ends_the_watch(self):
+        self.make_run("wn", gen=2, pids_gen=1, meta_age=60)
+        evs = self.poll("wn")
+        self.assertEqual([(e["ev"], e["gen"]) for e in evs], [("exit", 2)])
+        self.assertIn("never started", evs[0]["error"])
+
+    def test_an_error_recorded_for_a_gen_with_pids_is_shown(self):
+        from cxd.common import atomic_write_json
+        d = self.make_run("we", gen=1, pids_gen=1)
+        atomic_write_json(os.path.join(d, "exit.json"), {"gen": 1, "rc": None, "error": "supervisor failed: x"})
+        evs = self.poll("we")
+        self.assertEqual([(e["ev"], e.get("error")) for e in evs], [("exit", "supervisor failed: x")])
+
+    def test_an_exit_record_written_just_before_the_supervisor_exited_is_read(self):
+        """GUARD exit-reread. Mutation: the record is read once, before the
+        supervisor's liveness -> a record written in between is missed and
+        the exit is reported with rc=None."""
+        from cxd import state
+        from cxd.common import atomic_write_json
+        d = self.make_run("wr", gen=1, pids_gen=1)
+        os.unlink(os.path.join(d, "exit.1.json"))
+        real = state._exit_record
+        calls = []
+
+        def late(dd, gen):
+            calls.append(gen)
+            if len(calls) == 1:
+                return {}  # not yet written at the first read...
+            atomic_write_json(os.path.join(d, "exit.json"), {"gen": 1, "rc": 7})
+            return real(dd, gen)  # ...written by the time the supervisor is gone
+        with mock.patch.object(state, "_exit_record", late):
+            evs = self.poll("wr")
+        self.assertEqual([(e["ev"], e["rc"]) for e in evs], [("exit", 7)])
+
+
+class TestSupervisorRobust(Base):
+    """The supervisor ends what it started and records why, however it fails
+    (issue #10)."""
+
+    def setUp(self):
+        Base.setUp(self)
+        self.addCleanup(self.end_strays)
+
+    def end_strays(self):
+        """Stop any process whose arguments name this test's temp dir (when a
+        guard fails, a keeper or claude outlives the test)."""
+        ps = subprocess.run(["ps", "-eo", "pid=,args="], stdout=subprocess.PIPE, universal_newlines=True).stdout
+        for line in ps.splitlines():
+            pid, _, args = line.strip().partition(" ")
+            if self.tmp in args and int(pid) != os.getpid():
+                try:
+                    os.kill(int(pid), signal.SIGTERM)
+                except OSError:
+                    pass
+
+    def run_dir(self, name, account=None):
+        from cxd.common import atomic_write_json
+        d = os.path.join(self.local, "runs", name)
+        os.makedirs(d, mode=0o700)
+        atomic_write_json(os.path.join(d, "meta.json"), {"name": name, "gen": 1, "account": account,
+                                                         "cwd": self.work})
+        return d
+
+    def fifo_has_no_writer(self, d, timeout=5):
+        fd = os.open(os.path.join(d, "in.fifo"), os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            deadline = time.time() + timeout
+            while True:
+                try:
+                    return os.read(fd, 1) == b""
+                except BlockingIOError:
+                    if time.time() > deadline:
+                        return False
+                    time.sleep(0.1)
+        finally:
+            os.close(fd)
+
+    def in_child(self, d, patch):
+        """supervise_main(d, 1) in a child process, after `patch` (Python code
+        run with `supervise` imported). Returns its exit status."""
+        code = ("import os, signal, sys, time; sys.path.insert(0, %r); from cxd import supervise\n%s\n"
+                "supervise.supervise_main(%r, 1)") % (os.path.join(REPO, "lib"), patch, d)
+        env = dict(self.env)
+        p = subprocess.run([sys.executable, "-c", code], env=env, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, timeout=60)
+        return p.returncode
+
+    def test_sigterm_before_claude_runs_is_recorded_and_ends_the_keeper(self):
+        """GUARD supervise-sigterm. Mutation: SIGTERM keeps its default action
+        -> a supervisor terminated before claude runs leaves no exit record
+        (watch waits forever) and an orphaned keeper holding the FIFO."""
+        d = self.run_dir("ws")
+        rc = self.in_child(d, "supervise.find_claude = lambda: (os.kill(os.getpid(), signal.SIGTERM), time.sleep(5))")
+        ex = read_json(os.path.join(d, "exit.json"))
+        self.assertIsNotNone(ex, "no exit record (rc %s)" % rc)
+        self.assertEqual((ex["gen"], ex["rc"]), (1, None))
+        self.assertIn("terminated", ex["error"])
+        self.assertTrue(self.fifo_has_no_writer(d), "the keeper still holds the FIFO open")
+        self.assertEqual(read_json(os.path.join(d, "supervisor.json"))["gen"], 1)
+
+    def test_a_failure_after_claude_started_ends_claude_too(self):
+        """GUARD supervise-children. Mutation: the guard ends only the keeper ->
+        claude, started a moment before the failure, runs on with no pids
+        record (on macOS it ignores the FIFO's EOF)."""
+        from cxd import supervise
+        d = self.run_dir("wc")
+        started = []
+        real_popen = supervise.subprocess.Popen
+
+        def popen(cmd, *a, **kw):
+            p = real_popen(cmd, *a, **kw)
+            if cmd and cmd[0] == self.env["CXD_CLAUDE"]:  # claude itself (on macOS `ps -p` comes here too)
+                started.append(p)
+            return p
+        real_ident = supervise.proc_identity
+
+        def ident(pid):
+            if started and pid == started[0].pid:
+                raise RuntimeError("cannot read claude's identity")
+            return real_ident(pid)
+        # Like Claude Code on macOS, this claude ignores the FIFO's EOF: only the guard can end it.
+        env = {"CXD_HOME": self.local, "CXD_CLAUDE": self.env["CXD_CLAUDE"], "PATH": self.env["PATH"],
+               "STUB_IGNORE_EOF": "1"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(supervise.signal, "signal"), \
+                mock.patch.object(supervise.subprocess, "Popen", popen), \
+                mock.patch.object(supervise, "proc_identity", ident):
+            with self.assertRaises(RuntimeError):
+                supervise.supervise_main(d, 1)
+        self.assertTrue(started, "claude was not started")
+        self.addCleanup(lambda: started[0].poll() is None and started[0].kill())
+        try:
+            started[0].wait(10)
+        except subprocess.TimeoutExpired:
+            self.fail("claude was left running")
+        self.assertIn("identity", read_json(os.path.join(d, "exit.json"))["error"])
+        self.assertTrue(self.fifo_has_no_writer(d))
+
+    def test_a_full_disk_does_not_hide_the_first_error(self):
+        """GUARD supervise-record-safe. Mutation: the guard's own write is not
+        protected -> on a full disk its error replaces the real one, and the
+        keeper is not ended."""
+        import errno as _errno
+        from cxd import supervise
+        d = self.run_dir("wd")
+        real_write = supervise.atomic_write_json
+
+        def write(p, obj):
+            if p.endswith("exit.json"):
+                raise OSError(_errno.ENOSPC, "no space for the record")
+            return real_write(p, obj)
+        env = {"CXD_HOME": self.local, "CXD_CLAUDE": self.env["CXD_CLAUDE"]}
+        with mock.patch.dict(os.environ, env), mock.patch.object(supervise.signal, "signal"), \
+                mock.patch.object(supervise, "append_jsonl", side_effect=OSError(_errno.ENOSPC, "disk full")), \
+                mock.patch.object(supervise, "atomic_write_json", write):
+            with self.assertRaises(OSError) as cm:
+                supervise.supervise_main(d, 1)
+        self.assertIn("disk full", str(cm.exception))
+        self.assertTrue(self.fifo_has_no_writer(d))
+
+    def test_a_failure_leaks_no_file_descriptor(self):
+        """GUARD supervise-fds. Mutation: the FIFO's read end is closed only on
+        the normal path -> every failed start leaks a descriptor (and holds the
+        FIFO's read end open)."""
+        import errno as _errno
+        from cxd import supervise
+        d = self.run_dir("wf")
+        fds = lambda: len(os.listdir("/dev/fd"))
+        env = {"CXD_HOME": self.local, "CXD_CLAUDE": self.env["CXD_CLAUDE"]}
+        before = fds()
+        with mock.patch.dict(os.environ, env), mock.patch.object(supervise.signal, "signal"), \
+                mock.patch.object(supervise, "append_jsonl", side_effect=OSError(_errno.ENOSPC, "disk full")):
+            with self.assertRaises(OSError):
+                supervise.supervise_main(d, 1)
+        self.assertEqual(fds(), before)
 
 
 class TestRemote(Base):
