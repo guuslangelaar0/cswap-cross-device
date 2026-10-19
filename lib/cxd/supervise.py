@@ -102,10 +102,11 @@ def _supervise(d, gen, resume_sid, skip_permissions):
                           {"gen": gen, "rc": None, "error": msg, "ended": now_iso()})
         return 1
 
-    try:
-        os.unlink(fifo)
-    except OSError:
-        pass
+    for stale in (fifo, fifo + ".lock"):  # a new gen: a writer still waiting on the old lock must not block it
+        try:
+            os.unlink(stale)
+        except OSError:
+            pass
     os.mkfifo(fifo, 0o600)
     rfd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
     try:

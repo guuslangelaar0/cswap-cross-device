@@ -9,6 +9,7 @@ Layout under ~/.cxd (mode 700 throughout):
         pids.json       supervisor/keeper/claude pids + start identities (current gen)
         exit.json       rc of the current gen, written by the supervisor
         in.fifo         stdin of the claude process; the keeper holds the write end
+        in.fifo.lock    held by whoever writes a message to in.fifo (one at a time)
         out.jsonl       stream-json output (all gens, separated by cxd gen-start lines)
         err.log         stderr
     sessions/<sid>.json registered by the SessionStart hook (any session, any account)
@@ -96,22 +97,54 @@ def _run_accepts_input(d):
     return claude_alive(pids) and keeper_alive(pids)
 
 
-def fifo_write(fifo, data):
+# How long a message waits for another one to the same run to be written.
+FIFO_LOCK_WAIT = 30.0
+
+
+def fifo_write(fifo, data, still_ok=None):
     """Write one complete message to a FIFO. Raises CxdError('dead') if no
-    process is reading it. Never holds the FIFO open after returning.
+    process is reading it, CxdError('busy') if another message to it is still
+    being written after FIFO_LOCK_WAIT. Never holds the FIFO open after
+    returning.
 
     One writer at a time (<fifo>.lock): a write larger than the pipe's atomic
     size (PIPE_BUF: 512 bytes on macOS, 4096 on Linux) goes in pieces, and two
-    senders' pieces would mix into a line claude cannot parse."""
+    senders' pieces would mix into a line claude cannot parse. Once it holds
+    the lock, the writer checks again that the FIFO is the one it meant (a
+    resume recreates it) and that still_ok() (the run takes input). SIGINT and
+    SIGTERM wait until the message is written whole (SIGKILL cannot)."""
+    try:
+        ino = os.stat(fifo).st_ino
+    except OSError:
+        raise CxdError("no process is reading %s: the run is not running" % fifo, "dead")
     lock = os.open(fifo + ".lock", os.O_WRONLY | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX)  # GUARD:fifo-one-writer
+        deadline = time.monotonic() + FIFO_LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)  # GUARD:fifo-one-writer
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:  # GUARD:fifo-lock-bounded
+                    raise CxdError("another message to this run is still being written; try again", "busy")
+                time.sleep(0.05)
+        try:
+            same = os.stat(fifo).st_ino == ino
+        except OSError:
+            same = False
+        if not same:  # GUARD:fifo-same-gen
+            raise CxdError("the run was restarted while this message waited; send it again", "dead")
+        if still_ok is not None and not still_ok():  # GUARD:fifo-recheck
+            raise CxdError("the run is not running: it stopped taking input while this message waited", "dead")
         try:
             fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)  # GUARD:fifo-open
         except OSError as e:
             if e.errno in (errno.ENXIO, errno.ENOENT):
                 raise CxdError("no process is reading %s: the run is not running" % fifo, "dead")
             raise
+        masked = hasattr(signal, "pthread_sigmask")
+        if masked:
+            old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})  # GUARD:fifo-whole
         try:
             fl = fcntl.fcntl(fd, fcntl.F_GETFL)
             fcntl.fcntl(fd, fcntl.F_SETFL, fl & ~os.O_NONBLOCK)
@@ -123,6 +156,8 @@ def fifo_write(fifo, data):
             raise CxdError("the run's reader went away while writing", "dead")
         finally:
             os.close(fd)
+            if masked:
+                signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
     finally:
         os.close(lock)
 
@@ -452,7 +487,7 @@ def op_send(args):
             _, _, ex = _run_files(ref)
             raise CxdError("run %r is not running%s; refusing to send" % (
                 target, "" if not ex else " (exited rc=%s at %s)" % (ex.get("rc"), ex.get("ended"))), "dead")
-        fifo_write(os.path.join(ref, "in.fifo"), user_message(text))
+        fifo_write(os.path.join(ref, "in.fifo"), user_message(text), still_ok=lambda: _run_accepts_input(ref))
         return {"target": target, "via": "fifo", "id": msg_id}
     rec = ref
     sid = rec["session_id"]
