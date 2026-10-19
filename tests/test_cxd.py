@@ -673,11 +673,11 @@ class TestExitRecord(Base):
                                 "total_cost_usd": 0.01}) + "\n")
         atomic_write_json(os.path.join(d, "exit.json"), {"gen": 1, "rc": 0})
         with self.home_env():
-            msgs = []
+            msgs, t0 = [], time.time()
             for m in state.stream({"target": "wb", "interval": 0.1, "heartbeat": 3600, "keepalive": 0.2,
                                    "from_start": True}):
                 msgs.append(m)
-                if m.get("type") == "end":
+                if m.get("type") == "end" or time.time() - t0 > 10:
                     break
             turn = [m for m in msgs if m.get("type") == "event" and m["event"]["ev"] == "turn"][0]
             # The client dropped right after `turn`: resume from its cursor.
@@ -690,6 +690,86 @@ class TestExitRecord(Base):
                     break
         evs = [m["event"]["ev"] for m in resumed if m.get("type") == "event"]
         self.assertEqual(evs, ["exit"], resumed)
+
+    SID = "77777777-1111-2222-3333-444444444444"
+
+    def run_with_lines(self, name, lines):
+        from cxd.common import atomic_write_json
+        d = self.fake_run(name, supervisor_alive=False)
+        with open(os.path.join(d, "out.jsonl"), "a") as f:
+            for line in lines:
+                f.write(json.dumps(line) + "\n")
+        atomic_write_json(os.path.join(d, "exit.json"), {"gen": 1, "rc": 0})
+        return d
+
+    def notify(self, text):
+        os.makedirs(os.path.join(self.local, "outbox"), mode=0o700, exist_ok=True)
+        with open(os.path.join(self.local, "outbox", self.SID + ".jsonl"), "a") as f:
+            f.write(json.dumps({"kind": "notify", "session_id": self.SID, "text": text}) + "\n")
+
+    def test_resuming_after_any_event_delivers_exactly_the_rest(self):
+        """GUARD event-line-start. Mutation: every event of a line carries the
+        cursor from after the line -> a client that drops after the first PR of
+        a line (or after the PR of a final result) never gets the rest of it."""
+        from cxd import state
+        text = lambda t: {"type": "assistant", "message": {"content": [{"type": "text", "text": t}]}}
+        self.run_with_lines("wl", [
+            {"type": "system", "subtype": "init", "session_id": self.SID, "model": "m"},
+            text("see https://github.com/o/r/pull/1 and https://github.com/o/r/pull/2"),
+            text("MARK-NO-EVENT"),
+            {"type": "result", "subtype": "success", "result": "opened https://github.com/o/r/pull/3",
+             "total_cost_usd": 0.01, "session_id": self.SID},
+            {"type": "result", "subtype": "success", "result": "MARK-LAST", "total_cost_usd": 0.03,
+             "session_id": self.SID},
+        ])
+        self.notify("MARK-NOTIFY")
+        strip = lambda evs: [{k: v for k, v in e.items() if k != "_cursor"} for e in evs]
+        with self.home_env():
+            events, _ = state.poll("wl", {})
+            self.assertEqual([e["ev"] for e in events],
+                             ["init", "pr", "pr", "pr", "turn", "turn", "outbox", "exit"], events)
+            self.assertEqual((events[-1]["turns"], events[-1]["cost_usd"]), (2, 0.03))
+            for i, e in enumerate(events[:-1]):
+                rest, _ = state.poll("wl", json.loads(json.dumps(e["_cursor"])))
+                self.assertEqual(strip(rest), strip(events[i + 1:]), "resumed after event %d (%s)" % (i, e))
+
+    def test_a_notify_written_as_the_run_exits_comes_before_the_exit(self):
+        """GUARD exit-flush-outbox. Mutation: the final flush re-reads out.jsonl
+        but not the outbox -> a report written just before the exit is lost (the
+        watch ends at the exit)."""
+        from cxd import state
+        self.run_with_lines("wn", [{"type": "system", "subtype": "init", "session_id": self.SID}])
+        real = state._exit_record
+
+        def late_notify(d, gen):  # the worker reports while the run exits
+            self.notify("MARK-LATE")
+            return real(d, gen)
+        with self.home_env(), mock.patch.object(state, "_exit_record", late_notify):
+            events, _ = state.poll("wn", {})
+        self.assertEqual([e["ev"] for e in events], ["init", "outbox", "exit"], events)
+        self.assertEqual(events[1]["text"], "MARK-LATE")
+
+    def test_events_of_the_poll_that_starts_the_exit_wait_carry_it(self):
+        """A break right after such an event does not start the wait again."""
+        from cxd import state
+        d = self.fake_run("ww", supervisor_alive=True)
+        with open(os.path.join(d, "out.jsonl"), "a") as f:
+            f.write(json.dumps({"type": "result", "subtype": "success", "result": "x"}) + "\n")
+        with self.home_env():
+            events, cur = state.poll("ww", {})
+        self.assertEqual([e["ev"] for e in events], ["turn"])
+        self.assertEqual(events[0]["_cursor"]["exit_wait"], cur["exit_wait"])
+
+    def test_a_poll_never_changes_the_cursor_it_was_given(self):
+        from cxd import state
+        self.run_with_lines("wc", [{"type": "system", "subtype": "init", "session_id": self.SID}])
+        self.notify("MARK-1")
+        with self.home_env():
+            _, cur = state.poll("wc", {"exit_gen": 1})
+            before = json.loads(json.dumps(cur))
+            self.notify("MARK-2")
+            state.poll("wc", cur)
+        self.assertEqual(cur, before)
 
     def test_watch_waits_for_the_recorded_exit_code(self):
         """GUARD exit-rc. Mutation: the exit is reported as soon as claude is

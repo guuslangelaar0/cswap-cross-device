@@ -508,7 +508,12 @@ def op_notify(args):
 # ================================================================ events (watch)
 
 def _scan_out(out, cur, emit):
-    """Scan new complete lines of out.jsonl from cur['out'] and emit events."""
+    """Scan new complete lines of out.jsonl from cur['out'] and emit events.
+
+    A line can give several events (PR links, then the turn). All but the last
+    carry a cursor at the start of the line, the last one a cursor after it: a
+    client that resumes inside a line reads it again and skips the PRs it got.
+    emit returns the cursor it gave the event (or None)."""
     try:
         size = os.path.getsize(out)
     except OSError:
@@ -525,12 +530,20 @@ def _scan_out(out, cur, emit):
     seen_pr = set(cur.get("prs", []))
     pos = off
     for raw in chunk[: end + 1].split(b"\n")[:-1]:
-        pos += len(raw) + 1
-        cur["out"] = pos  # per line: an event's cursor resumes right after it
-        cur["prs"] = sorted(seen_pr)
-        ev = _parse(raw.decode("utf-8", "replace"))
-        if not ev:
-            continue
+        start, pos = pos, pos + len(raw) + 1
+        cur["out"] = start  # GUARD:event-line-start
+        last = _scan_line(raw, cur, seen_pr, emit)
+        cur["out"] = pos
+        if isinstance(last, dict):
+            last["out"] = pos  # the line's last event resumes after it
+    cur["prs"] = sorted(seen_pr)
+
+
+def _scan_line(raw, cur, seen_pr, emit):
+    """The events of one line of out.jsonl; returns the last one's cursor."""
+    last = None
+    ev = _parse(raw.decode("utf-8", "replace"))
+    if ev:
         t = ev.get("type")
         if t == "cxd" and ev.get("event") == "gen-start":
             cur["gen"] = ev.get("gen")
@@ -540,7 +553,7 @@ def _scan_out(out, cur, emit):
                 cur.setdefault("sids", [])
                 if sid not in cur["sids"]:
                     cur["sids"].append(sid)
-            emit({"ev": "init", "session_id": sid, "model": ev.get("model"), "gen": cur.get("gen")})
+            last = emit({"ev": "init", "session_id": sid, "model": ev.get("model"), "gen": cur.get("gen")})
         elif t == "assistant":
             for block in (ev.get("message") or {}).get("content") or []:
                 if isinstance(block, dict) and block.get("type") == "text":
@@ -548,24 +561,25 @@ def _scan_out(out, cur, emit):
                         if url not in seen_pr:
                             seen_pr.add(url)
                             cur["prs"] = sorted(seen_pr)
-                            emit({"ev": "pr", "url": url})
+                            last = emit({"ev": "pr", "url": url})
         elif t == "result":
-            cur["turns"] = cur.get("turns", 0) + 1
-            cost = ev.get("total_cost_usd")
-            if isinstance(cost, (int, float)):
-                # total_cost_usd is cumulative within one process; keep the last per gen.
-                cur.setdefault("gen_costs", {})[str(cur.get("gen"))] = cost
             res = ev.get("result")
             for url in PR_RE.findall(res or ""):
                 if url not in seen_pr:
                     seen_pr.add(url)
                     cur["prs"] = sorted(seen_pr)
-                    emit({"ev": "pr", "url": url})
-            emit({"ev": "turn", "turn": cur["turns"], "is_error": bool(ev.get("is_error")),
-                  "subtype": ev.get("subtype"), "num_turns": ev.get("num_turns"),
-                  "cost_usd": cost, "duration_ms": ev.get("duration_ms"),
-                  "result": excerpt(res, 400), "session_id": ev.get("session_id")})
-    cur["prs"] = sorted(seen_pr)
+                    last = emit({"ev": "pr", "url": url})
+            # Counted after the line's PRs: a resume after one of them reads it again.
+            cur["turns"] = cur.get("turns", 0) + 1
+            cost = ev.get("total_cost_usd")
+            if isinstance(cost, (int, float)):
+                # total_cost_usd is cumulative within one process; keep the last per gen.
+                cur.setdefault("gen_costs", {})[str(cur.get("gen"))] = cost
+            last = emit({"ev": "turn", "turn": cur["turns"], "is_error": bool(ev.get("is_error")),
+                         "subtype": ev.get("subtype"), "num_turns": ev.get("num_turns"),
+                         "cost_usd": cost, "duration_ms": ev.get("duration_ms"),
+                         "result": excerpt(res, 400), "session_id": ev.get("session_id")})
+    return last
 
 
 def _scan_outbox(sid, cur, emit, skip_kinds=()):
@@ -612,6 +626,13 @@ def _exit_record(d, gen):
     return {}
 
 
+def _scan_run(d, meta, cur, emit):
+    """A run's events: its output, then its sessions' reports."""
+    _scan_out(os.path.join(d, "out.jsonl"), cur, emit)
+    for sid in list(cur.get("sids", [])) or ([meta["session_id"]] if meta.get("session_id") else []):
+        _scan_outbox(sid, cur, emit, skip_kinds=("stop",))  # turn events already carry results
+
+
 def run_cost(cur):
     return round(sum((cur.get("gen_costs") or {}).values()), 6)
 
@@ -623,19 +644,17 @@ def poll(target, cur):
     resumes exactly after the last one it received."""
     events = []
     kind, ref = _resolve(target)
-    cur = dict(cur or {})
+    cur = json.loads(json.dumps(cur or {}))  # never change the caller's cursor
 
     def emit(e):
         e["_cursor"] = json.loads(json.dumps(cur))  # GUARD:event-cursor
         events.append(e)
+        return e["_cursor"]
     cur["kind"] = kind
     if kind == "run":
         d = ref
         meta, pids, _ = _run_files(d)
-        out = os.path.join(d, "out.jsonl")
-        _scan_out(out, cur, emit)
-        for sid in list(cur.get("sids", [])) or ([meta["session_id"]] if meta.get("session_id") else []):
-            _scan_outbox(sid, cur, emit, skip_kinds=("stop",))  # turn events already carry results
+        _scan_run(d, meta, cur, emit)
         gen = pids.get("gen")
         if not pids:
             # No pids at all: the supervisor of the first gen failed before it
@@ -659,10 +678,13 @@ def poll(target, cur):
                 if waited < 0:  # the clock stepped back: start the wait again
                     wait["t"], waited = time.time(), 0.0
                 if waited < EXIT_RECORD_WAIT:  # GUARD:exit-rc-cap
+                    for e in events:  # resuming after one of them continues this wait
+                        e["_cursor"]["exit_wait"] = dict(wait)
                     return events, cur
             ex = ex or _exit_record(d, gen)  # written just before the supervisor exited?
             cur.pop("exit_wait", None)
-            _scan_out(out, cur, emit)  # final flush after the process ended
+            # Final flush after the process ended, reports included: watch ends at the exit.
+            _scan_run(d, meta, cur, emit)  # GUARD:exit-flush-outbox
             cur["exit_gen"] = gen
             emit({"ev": "exit", "rc": ex.get("rc"), "gen": gen, "turns": cur.get("turns", 0),
                   "cost_usd": run_cost(cur)})
