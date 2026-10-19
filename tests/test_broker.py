@@ -131,10 +131,12 @@ class TestIdentity(unittest.TestCase):
         id (a hash of garbage) -> a join message carrying a bundle is accepted."""
         a, b = self.make("a"), self.make("b")
         self.assertEqual(ident.node_id_of_pem(a.cert_pem), a.node_id)
-        for bad in (a.cert_pem + b.cert_pem, "", "hello", None):
-            with self.assertRaises(ident.IdentityError):
+        # Refused for the count, not by luck: with two certificates, decoding
+        # the base64 between the markers fails or not depending on padding.
+        for bad in (a.cert_pem + b.cert_pem, b.cert_pem + a.cert_pem, "", "hello", None):
+            with self.assertRaisesRegex(ident.IdentityError, "exactly one"):
                 ident.node_id_of_pem(bad)
-        with self.assertRaises(ident.IdentityError):
+        with self.assertRaisesRegex(ident.IdentityError, "exactly one"):
             ident.write_trust(os.path.join(self.tmp, "trust.pem"), [a.cert_pem + b.cert_pem])
 
     def test_the_trust_bundle_is_private_and_written_whole(self):
