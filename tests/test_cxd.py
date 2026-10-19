@@ -629,7 +629,9 @@ class TestExitRecord(Base):
     """watch reports a run's exit with the rc its supervisor records. claude
     is reaped (and so already gone) a moment before exit.json is written."""
 
-    def fake_run(self, name, supervisor_alive, gen=1, pids=True):
+    def fake_run(self, name, supervisor_alive, gen=1, pids=True, claude=None):
+        """A run directory; claude is a live process standing in for claude, or
+        None for one that is gone."""
         from cxd.common import atomic_write_json, proc_identity
         d = os.path.join(self.local, "runs", name)
         os.makedirs(d, mode=0o700)
@@ -637,6 +639,8 @@ class TestExitRecord(Base):
         gone.wait()
         rec = {"gen": gen, "claude_pid": gone.pid, "claude_ident": "never:" + name,
                "keeper_pid": gone.pid, "keeper_ident": "never:" + name}
+        if claude is not None:
+            rec.update(claude_pid=claude.pid, claude_ident=proc_identity(claude.pid))
         if supervisor_alive:
             sup = subprocess.Popen(["sleep", "60"])
             self.bg.append(sup)
@@ -660,6 +664,260 @@ class TestExitRecord(Base):
                     return msg["event"], time.time() - t0
                 if time.time() - t0 > timeout:
                     self.fail("no exit event within %ss" % timeout)
+
+    def test_a_break_between_two_events_of_one_batch_loses_neither(self):
+        """GUARD event-cursor. Mutation: every message of a batch carries the
+        cursor from after the batch -> a client that drops after `turn`
+        resumes past `exit` and waits forever."""
+        from cxd import state
+        from cxd.common import atomic_write_json
+        d = self.fake_run("wb", supervisor_alive=False)
+        with open(os.path.join(d, "out.jsonl"), "a") as f:
+            f.write(json.dumps({"type": "result", "subtype": "success", "result": "MARK-LAST",
+                                "total_cost_usd": 0.01}) + "\n")
+        atomic_write_json(os.path.join(d, "exit.json"), {"gen": 1, "rc": 0})
+        with self.home_env():
+            msgs, t0 = [], time.time()
+            for m in state.stream({"target": "wb", "interval": 0.1, "heartbeat": 3600, "keepalive": 0.2,
+                                   "from_start": True}):
+                msgs.append(m)
+                if m.get("type") == "end" or time.time() - t0 > 10:
+                    break
+            turn = [m for m in msgs if m.get("type") == "event" and m["event"]["ev"] == "turn"][0]
+            # The client dropped right after `turn`: resume from its cursor.
+            t0 = time.time()
+            resumed = []
+            for m in state.stream({"target": "wb", "interval": 0.1, "heartbeat": 3600, "keepalive": 0.2,
+                                   "cursor": json.loads(json.dumps(turn["cursor"]))}):
+                resumed.append(m)
+                if m.get("type") == "end" or time.time() - t0 > 5:
+                    break
+        evs = [m["event"]["ev"] for m in resumed if m.get("type") == "event"]
+        self.assertEqual(evs, ["exit"], resumed)
+
+    SID = "77777777-1111-2222-3333-444444444444"
+
+    def run_with_lines(self, name, lines, claude=None):
+        d = self.fake_run(name, supervisor_alive=False, claude=claude)
+        self.add_lines(d, lines)
+        if claude is None:
+            self.exited(d)
+        return d
+
+    def add_lines(self, d, lines):
+        with open(os.path.join(d, "out.jsonl"), "a") as f:
+            for line in lines:
+                f.write(json.dumps(line) + "\n")
+
+    def exited(self, d, rc=0):
+        from cxd.common import atomic_write_json
+        atomic_write_json(os.path.join(d, "exit.json"), {"gen": 1, "rc": rc})
+
+    def live_claude(self):
+        p = subprocess.Popen(["sleep", "60"])
+        self.bg.append(p)
+        return p
+
+    @staticmethod
+    def text(t):
+        return {"type": "assistant", "message": {"content": [{"type": "text", "text": t}]}}
+
+    def assert_resumes_exactly(self, target, events, rest_after_poll=()):
+        """From every event's cursor, a poll gives exactly the events after it:
+        in the same order within one poll; across polls a resumed poll may give
+        the output's events before the reports', but none lost, none twice, and
+        the exit last."""
+        from cxd import state
+        strip = lambda evs: [{k: v for k, v in e.items() if k != "_cursor"} for e in evs]
+        for i, e in enumerate(events):
+            rest, _ = state.poll(target, json.loads(json.dumps(e["_cursor"])))
+            want = strip(list(events[i + 1:]) + list(rest_after_poll))
+            got = strip(rest)
+            if rest_after_poll:
+                key = lambda x: json.dumps(x, sort_keys=True)
+                self.assertEqual(sorted(got, key=key), sorted(want, key=key), "resumed after event %d (%s)" % (i, e))
+                self.assertEqual(got[-1:], want[-1:])
+            else:
+                self.assertEqual(got, want, "resumed after event %d (%s)" % (i, e))
+
+    def notify(self, text):
+        os.makedirs(os.path.join(self.local, "outbox"), mode=0o700, exist_ok=True)
+        with open(os.path.join(self.local, "outbox", self.SID + ".jsonl"), "a") as f:
+            f.write(json.dumps({"kind": "notify", "session_id": self.SID, "text": text}) + "\n")
+
+    def test_resuming_after_any_event_delivers_exactly_the_rest(self):
+        """GUARD event-line-skip. Mutation: every event of a line carries the
+        cursor from after the line -> a client that drops after the first PR of
+        a line (or after the PR of a final result) never gets the rest of it."""
+        from cxd import state
+        text = self.text
+        self.run_with_lines("wl", [
+            {"type": "system", "subtype": "init", "session_id": self.SID, "model": "m"},
+            text("see https://github.com/o/r/pull/1 and https://github.com/o/r/pull/2"),
+            text("MARK-NO-EVENT"),
+            {"type": "result", "subtype": "success", "result": "opened https://github.com/o/r/pull/3",
+             "total_cost_usd": 0.01, "session_id": self.SID},
+            {"type": "result", "subtype": "success", "result": "MARK-LAST", "total_cost_usd": 0.03,
+             "session_id": self.SID},
+        ])
+        self.notify("MARK-NOTIFY")
+        with self.home_env():
+            events, _ = state.poll("wl", {})
+            self.assertEqual([e["ev"] for e in events],
+                             ["init", "pr", "pr", "pr", "turn", "turn", "outbox", "exit"], events)
+            self.assertEqual((events[-1]["turns"], events[-1]["cost_usd"]), (2, 0.03))
+            self.assert_resumes_exactly("wl", events)
+
+    def test_resuming_across_polls_delivers_exactly_the_rest(self):
+        """GUARD event-cursor-deep. Mutation: an event's cursor is a shallow copy
+        -> the outbox offsets in it move on with the rest of the poll, and a
+        client that drops after an output event loses the reports after it."""
+        from cxd import state
+        claude = self.live_claude()
+        d = self.run_with_lines("wx", [{"type": "system", "subtype": "init", "session_id": self.SID}], claude=claude)
+        self.notify("MARK-1")
+        with self.home_env():
+            first, cur = state.poll("wx", {})
+            self.assertEqual([e["ev"] for e in first], ["init", "outbox"])
+            self.add_lines(d, [self.text("https://github.com/o/r/pull/7 https://github.com/o/r/pull/8"),
+                               {"type": "result", "subtype": "success", "result": "MARK-T1"}])
+            self.notify("MARK-2")
+            claude.kill()
+            claude.wait()
+            self.exited(d)
+            second, _ = state.poll("wx", cur)
+            self.assertEqual([e["ev"] for e in second], ["pr", "pr", "turn", "outbox", "exit"], second)
+            self.assert_resumes_exactly("wx", second)
+            self.assert_resumes_exactly("wx", first, rest_after_poll=second)
+
+    def test_a_live_claude_clears_an_earlier_wait_from_every_event(self):
+        """GUARD exit-wait-alive. Mutation: a live claude leaves an earlier exit
+        wait in the cursor -> a client that resumes from such an event later
+        cuts the wait for the exit code short (rc=None)."""
+        from cxd import state
+        d = self.run_with_lines("wa", [], claude=self.live_claude())
+        self.add_lines(d, [{"type": "result", "subtype": "success", "result": "x"}])
+        stale = {"exit_wait": {"gen": 1, "t": time.time() - 9}}  # a check that once failed
+        with self.home_env():
+            events, cur = state.poll("wa", stale)
+        self.assertEqual([e["ev"] for e in events], ["turn"])
+        self.assertNotIn("exit_wait", events[0]["_cursor"])
+        self.assertNotIn("exit_wait", cur)
+
+    def test_the_scan_before_the_exit_reads_to_the_end(self):
+        """GUARD exit-drain. Mutation: the scan before the exit reads one chunk
+        like any other -> after a long run the exit comes with too few turns and
+        the rest of its events are never sent."""
+        from cxd import state
+        self.run_with_lines("wd", [{"type": "result", "subtype": "success", "result": "MARK-%d" % i,
+                                    "total_cost_usd": 0.01 * (i + 1)} for i in range(10)])
+        with self.home_env(), mock.patch.object(state, "SCAN_CHUNK", 300):
+            events, _ = state.poll("wd", {})
+        self.assertEqual([e["ev"] for e in events], ["turn"] * 10 + ["exit"])
+        self.assertEqual((events[-1]["turns"], events[-1]["cost_usd"]), (10, 0.1))
+
+    def test_the_poll_that_ends_the_wait_keeps_it_in_its_events(self):
+        """GUARD exit-wait-kept. Mutation: the wait is dropped before the scan
+        -> a client that drops after a turn from the poll whose wait ran out
+        starts the whole wait again before it hears of the exit."""
+        from cxd import state
+        d = self.fake_run("wv", supervisor_alive=True)  # it hangs: never writes exit.json
+        with self.home_env(), mock.patch.object(state, "EXIT_RECORD_WAIT", 0.3):
+            events, cur = state.poll("wv", {})
+            self.assertEqual(events, [])
+            self.add_lines(d, [{"type": "result", "subtype": "success", "result": "MARK-LAST"}])
+            time.sleep(0.4)
+            events, cur = state.poll("wv", cur)
+            self.assertEqual([e["ev"] for e in events], ["turn", "exit"])
+            rest, _ = state.poll("wv", json.loads(json.dumps(events[0]["_cursor"])))
+        self.assertEqual([e["ev"] for e in rest], ["exit"])
+
+    def test_a_line_longer_than_a_chunk_is_read_or_skipped(self):
+        """GUARD long-line. Mutation: a line longer than the chunk stops the
+        scan -> the cursor never moves past it: later events are never sent,
+        and the exit comes with too few turns."""
+        from cxd import state
+        big_user = {"type": "user", "message": {"content": "x" * 1500}}
+        big_result = {"type": "result", "subtype": "success", "result": "MARK-BIG " + "y" * 1500}
+        self.run_with_lines("wg", [{"type": "result", "subtype": "success", "result": "MARK-1"}, big_user,
+                                   big_result, {"type": "result", "subtype": "success", "result": "MARK-2"}])
+        with self.home_env(), mock.patch.object(state, "SCAN_CHUNK", 300):
+            events, _ = state.poll("wg", {})
+        self.assertEqual([(e["ev"], str(e.get("result", ""))[:8]) for e in events],
+                         [("turn", "MARK-1"), ("turn", "MARK-BIG"), ("turn", "MARK-2"), ("exit", "")])
+        self.assertEqual(events[-1]["turns"], 3)
+
+    def test_a_watch_started_late_skips_everything_already_written(self):
+        """GUARD watch-start-drain. Mutation: positioning reads one chunk -> a
+        watch started on a long live run replays old turns as new."""
+        from cxd import state
+        d = self.run_with_lines("wl2", [{"type": "result", "subtype": "success", "result": "MARK-OLD-%d" % i}
+                                        for i in range(10)], claude=self.live_claude())
+        seen = []
+        with self.home_env(), mock.patch.object(state, "SCAN_CHUNK", 300):
+            t0 = time.time()
+            for m in state.stream({"target": "wl2", "interval": 0.1, "heartbeat": 3600, "keepalive": 0.2}):
+                if m.get("type") == "event" and m["event"]["ev"] == "turn":
+                    seen.append(m["event"]["result"])
+                    if "MARK-NEW" in m["event"]["result"]:
+                        break
+                if time.time() - t0 > 1.0 and not os.path.exists(os.path.join(d, "added")):
+                    open(os.path.join(d, "added"), "w").close()
+                    self.add_lines(d, [{"type": "result", "subtype": "success", "result": "MARK-NEW"}])
+                if time.time() - t0 > 10:
+                    break
+        self.assertEqual(seen, ["MARK-NEW"])
+
+    def test_a_long_run_is_read_a_chunk_per_poll_while_it_lives(self):
+        from cxd import state
+        self.run_with_lines("wk", [{"type": "result", "subtype": "success", "result": "MARK-%d" % i}
+                                   for i in range(10)], claude=self.live_claude())
+        with self.home_env(), mock.patch.object(state, "SCAN_CHUNK", 300):
+            events, cur = state.poll("wk", {})
+            self.assertLess(len(events), 10)
+            while len(events) < 10:
+                more, cur = state.poll("wk", cur)
+                self.assertTrue(more)
+                events += more
+        self.assertEqual([e["turn"] for e in events], list(range(1, 11)))
+
+    def test_a_notify_written_as_the_run_exits_comes_before_the_exit(self):
+        """The exit is decided before the scan, so a report written while the
+        run exits is read before the exit (the watch ends there)."""
+        from cxd import state
+        self.run_with_lines("wn", [{"type": "system", "subtype": "init", "session_id": self.SID}])
+        real = state._exit_record
+
+        def late_notify(d, gen):  # the worker reports while the run exits
+            self.notify("MARK-LATE")
+            return real(d, gen)
+        with self.home_env(), mock.patch.object(state, "_exit_record", late_notify):
+            events, _ = state.poll("wn", {})
+        self.assertEqual([e["ev"] for e in events], ["init", "outbox", "exit"], events)
+        self.assertEqual(events[1]["text"], "MARK-LATE")
+
+    def test_events_of_the_poll_that_starts_the_exit_wait_carry_it(self):
+        """A break right after such an event does not start the wait again."""
+        # (the wait is decided before the scan)
+        from cxd import state
+        d = self.fake_run("ww", supervisor_alive=True)
+        with open(os.path.join(d, "out.jsonl"), "a") as f:
+            f.write(json.dumps({"type": "result", "subtype": "success", "result": "x"}) + "\n")
+        with self.home_env():
+            events, cur = state.poll("ww", {})
+        self.assertEqual([e["ev"] for e in events], ["turn"])
+        self.assertEqual(events[0]["_cursor"]["exit_wait"], cur["exit_wait"])
+
+    def test_a_poll_never_changes_the_cursor_it_was_given(self):
+        from cxd import state
+        self.run_with_lines("wc", [{"type": "system", "subtype": "init", "session_id": self.SID}])
+        self.notify("MARK-1")
+        with self.home_env():
+            _, cur = state.poll("wc", {"exit_gen": 1})
+            before = json.loads(json.dumps(cur))
+            self.notify("MARK-2")
+            state.poll("wc", cur)
+        self.assertEqual(cur, before)
 
     def test_watch_waits_for_the_recorded_exit_code(self):
         """GUARD exit-rc. Mutation: the exit is reported as soon as claude is
