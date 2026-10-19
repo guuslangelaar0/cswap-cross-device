@@ -238,5 +238,70 @@ class TestIdentity(unittest.TestCase):
         self.assertIsNone(out["class"])  # ...the pin does not
 
 
+class TestWire(unittest.TestCase):
+    """Framing: one JSON object per line, with limits that hold before a
+    single newline arrives."""
+
+    def setUp(self):
+        from cxd.broker import wire
+        self.wire = wire
+
+    def test_frames_round_trip_whatever_the_chunking(self):
+        msgs = [{"t": "hello", "name": "été ✓", "n": 1}, {"t": "ping", "id": "x"}, {"t": "rep", "text": "a\nb"}]
+        data = b"".join(self.wire.encode(m) for m in msgs)
+        self.assertEqual(data.count(b"\n"), 3)  # a newline inside a value is escaped
+        for size in (1, 2, 7, len(data)):
+            r, got = self.wire.Reader(authenticated=True), []
+            for i in range(0, len(data), size):
+                got += r.feed(data[i:i + size])
+            self.assertEqual(got, msgs, size)
+
+    def test_encode_refuses_what_is_not_a_frame(self):
+        for bad in ([], {"x": 1}, {"t": 5}, "hello"):
+            with self.assertRaises(self.wire.FrameError):
+                self.wire.encode(bad)
+        with self.assertRaises(self.wire.FrameError):
+            self.wire.encode({"t": "big", "s": "x" * self.wire.FRAME_LIMIT})
+
+    def test_a_frame_without_its_newline_is_refused_once_it_is_too_long(self):
+        """GUARD frame-limit. Mutation: only complete lines are measured -> a
+        peer that never sends a newline fills the agent's memory."""
+        r = self.wire.Reader()
+        self.assertEqual(r.feed(b"{" + b" " * (self.wire.PRE_AUTH_LIMIT - 10)), [])
+        with self.assertRaises(self.wire.FrameError):
+            r.feed(b" " * 20)
+        r = self.wire.Reader(authenticated=True)
+        r.feed(b" " * (self.wire.PRE_AUTH_LIMIT * 2))  # a member may send more
+        with self.assertRaises(self.wire.FrameError):
+            r.feed(b" " * self.wire.FRAME_LIMIT)
+
+    def test_a_complete_line_over_the_limit_is_refused(self):
+        r = self.wire.Reader()
+        line = self.wire.encode({"t": "join", "pad": "x" * self.wire.PRE_AUTH_LIMIT})
+        with self.assertRaises(self.wire.FrameError):
+            r.feed(line)
+        self.assertEqual(len(self.wire.Reader(authenticated=True).feed(line)), 1)
+
+    def test_an_unauthenticated_peer_gets_a_few_frames_only(self):
+        """GUARD preauth-frames. Mutation: no frame count before authentication
+        -> a joiner can keep a connection busy forever."""
+        r = self.wire.Reader()
+        ping = self.wire.encode({"t": "join"})
+        self.assertEqual(len(r.feed(ping * self.wire.PRE_AUTH_FRAMES)), self.wire.PRE_AUTH_FRAMES)
+        with self.assertRaises(self.wire.FrameError):
+            r.feed(ping)
+        r = self.wire.Reader()
+        r.feed(ping)
+        r.authenticate()
+        self.assertEqual(len(r.feed(ping * 50)), 50)
+
+    def test_a_frame_must_be_a_json_object_with_a_type(self):
+        """GUARD frame-object. Mutation: any JSON value is a frame -> code that
+        reads msg["t"] crashes on a peer's list or string."""
+        for bad in (b"[1, 2]\n", b'"t"\n', b'{"t": 1}\n', b"{nope\n", b"\xff\xfe\n", b"{}\n"):
+            with self.assertRaises(self.wire.FrameError, msg=bad):
+                self.wire.Reader(authenticated=True).feed(bad)
+
+
 if __name__ == "__main__":
     unittest.main()
