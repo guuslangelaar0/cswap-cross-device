@@ -238,5 +238,98 @@ class TestIdentity(unittest.TestCase):
         self.assertIsNone(out["class"])  # ...the pin does not
 
 
+class TestWire(unittest.TestCase):
+    """Framing: one JSON object per line, with limits that hold before a
+    single newline arrives."""
+
+    def setUp(self):
+        from cxd.broker import wire
+        self.wire = wire
+
+    def test_frames_round_trip_whatever_the_chunking(self):
+        msgs = [{"t": "hello", "name": "été ✓", "n": 1}, {"t": "ping", "id": "x"}, {"t": "rep", "text": "a\nb"}]
+        data = b"".join(self.wire.encode(m) for m in msgs)
+        self.assertEqual(data.count(b"\n"), 3)  # a newline inside a value is escaped
+        for size in (1, 2, 7, len(data)):
+            r, got = self.wire.Reader(authenticated=True), []
+            for i in range(0, len(data), size):
+                got += r.feed(data[i:i + size])
+            self.assertEqual(got, msgs, size)
+
+    def test_encode_refuses_what_is_not_a_frame(self):
+        for bad in ([], {"x": 1}, {"t": 5}, "hello"):
+            with self.assertRaises(self.wire.FrameError):
+                self.wire.encode(bad)
+        with self.assertRaises(self.wire.FrameError):
+            self.wire.encode({"t": "big", "s": "x" * self.wire.FRAME_LIMIT})
+
+    def test_a_frame_without_its_newline_is_refused_once_it_is_too_long(self):
+        """GUARD frame-limit. Mutation: only complete lines are measured -> a
+        peer that never sends a newline fills the agent's memory."""
+        r = self.wire.Reader()
+        self.assertEqual(r.feed(b"{" + b" " * (self.wire.PRE_AUTH_LIMIT - 10)), [])
+        with self.assertRaises(self.wire.FrameError):
+            r.feed(b" " * 20)
+        r = self.wire.Reader(authenticated=True)
+        r.feed(b" " * (self.wire.PRE_AUTH_LIMIT * 2))  # a member may send more
+        with self.assertRaises(self.wire.FrameError):
+            r.feed(b" " * self.wire.FRAME_LIMIT)
+
+    def test_a_complete_line_over_the_limit_is_refused(self):
+        r = self.wire.Reader()
+        line = self.wire.encode({"t": "join", "pad": "x" * self.wire.PRE_AUTH_LIMIT})
+        with self.assertRaises(self.wire.FrameError):
+            r.feed(line)
+        self.assertEqual(len(self.wire.Reader(authenticated=True).feed(line)), 1)
+
+    def test_an_unauthenticated_peer_gets_a_few_frames_only(self):
+        """GUARD preauth-frames. Mutation: no frame count before authentication
+        -> a joiner can keep a connection busy forever."""
+        r = self.wire.Reader()
+        ping = self.wire.encode({"t": "join"})
+        self.assertEqual(len(r.feed(ping * self.wire.PRE_AUTH_FRAMES)), self.wire.PRE_AUTH_FRAMES)
+        with self.assertRaises(self.wire.FrameError):
+            r.feed(ping)
+        r = self.wire.Reader()
+        r.feed(ping)
+        r.authenticate()
+        self.assertEqual(len(r.feed(ping * 50)), 50)
+
+    def test_a_frame_must_be_a_json_object_with_a_type(self):
+        """GUARD frame-object. Mutation: any JSON value is a frame -> code that
+        reads msg["t"] crashes on a peer's list or string."""
+        for bad in (b"[1, 2]\n", b'"t"\n', b'{"t": 1}\n', b"{nope\n", b"\xff\xfe\n", b"{}\n"):
+            with self.assertRaises(self.wire.FrameError, msg=bad):
+                self.wire.Reader(authenticated=True).feed(bad)
+
+
+class TestWireHostileInput(unittest.TestCase):
+    """What a peer sends must end as FrameError, never as another exception."""
+
+    def setUp(self):
+        from cxd.broker import wire
+        self.wire = wire
+
+    def test_deep_nesting_is_a_frame_error(self):
+        """GUARD frame-decode. Mutation: only ValueError is caught -> a joiner's
+        60,000 nested brackets raise RecursionError out of the reader."""
+        line = b'{"t":"x","a":' + b"[" * 60000 + b"\n"
+        self.assertLess(len(line), self.wire.PRE_AUTH_LIMIT)
+        with self.assertRaises(self.wire.FrameError):
+            self.wire.Reader().feed(line)
+
+    def test_nan_infinity_and_huge_numbers_are_refused(self):
+        for bad in (b'{"t":"x","v":NaN}\n', b'{"t":"x","v":Infinity}\n', b'{"t":"x","v":-Infinity}\n',
+                    b'{"t":"x","v":' + b"9" * 5000 + b"}\n"):
+            with self.assertRaises(self.wire.FrameError, msg=bad[:30]):
+                self.wire.Reader(authenticated=True).feed(bad)
+        self.assertEqual(self.wire.Reader().feed(b'{"t":"x","v":1e400}\n')[0]["v"], float("inf"))
+
+    def test_what_cannot_be_sent_is_a_frame_error(self):
+        for bad in ({"t": "x", "v": float("nan")}, {"t": "x", "v": "\ud800"}):
+            with self.assertRaises(self.wire.FrameError):
+                self.wire.encode(bad)
+
+
 if __name__ == "__main__":
     unittest.main()
