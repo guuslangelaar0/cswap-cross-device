@@ -257,21 +257,51 @@ def op_start(args):
     # meta.json keeps only this run's own opt-in; the host's setting is read at each launch.
     opt_in = args.get("skip_permissions") is True
     ensure_dir(path("runs"))
-    ensure_dir(d)
+    try:  # the claim on the name: of two concurrent starts, one creates the directory
+        os.mkdir(d, 0o700)  # GUARD:start-atomic
+    except FileExistsError:
+        raise CxdError("run %r already exists on %s, or is being started (use resume, or another name)"
+                       % (name, self_label()), "exists")
+    os.chmod(d, 0o700)  # whatever the umask
+    lock = _launch_lock(d)
     meta = {
         "name": name, "host": self_label(), "account": account, "bypass_opt_in": opt_in,  # GUARD:host-not-kept
         "cwd": cwd, "claude_args": list(args.get("claude_args") or []), "gen": 1,
         "created": now_iso(), "session_id": None, "cxd_version": VERSION,
     }
-    atomic_write_json(os.path.join(d, "meta.json"), meta)
-    return _launch(d, meta, 1, None, prompt, float(args.get("init_timeout") or 90), opt_in)
+    try:
+        atomic_write_json(os.path.join(d, "meta.json"), meta)
+        return _launch(d, meta, 1, None, prompt, float(args.get("init_timeout") or 90), opt_in)
+    except CxdError as e:
+        if e.code == "spawn_failed":  # nothing was started: give the name back
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)  # GUARD:start-cleanup
+        raise
+    finally:
+        os.close(lock)
+
+
+def _launch_lock(d):
+    """Held across a start's or a resume's checks and launch: one at a time
+    per run (concurrent resumes would each launch a gen)."""
+    fd = os.open(os.path.join(d, "launch.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # GUARD:launch-lock
+    except OSError:
+        os.close(fd)
+        raise CxdError("run %r is being started or resumed right now; try again shortly"
+                       % os.path.basename(d), "busy")
+    return fd
 
 
 def _launch(d, meta, gen, resume_sid, prompt, init_timeout, opt_in):
     """Start gen of a run. The run's opt-in is saved with its session id, once
     the gen has started; a launch that fails does not save an opt-in."""
     skip_permissions = bypass_opted_in(opt_in)
-    _spawn_supervisor(d, gen, resume_sid, skip_permissions)
+    try:
+        _spawn_supervisor(d, gen, resume_sid, skip_permissions)
+    except OSError as e:
+        raise CxdError("could not start the supervisor on %s: %s" % (self_label(), e), "spawn_failed")
     pids = _wait_pids(d, gen)
     try:
         fifo_write(os.path.join(d, "in.fifo"), user_message(prompt))
@@ -321,6 +351,14 @@ def op_resume(args):
     if not prompt:
         raise CxdError("empty prompt", "usage")
     d = _load_run(name)
+    lock = _launch_lock(d)
+    try:
+        return _resume_locked(d, name, prompt, args)
+    finally:
+        os.close(lock)
+
+
+def _resume_locked(d, name, prompt, args):
     meta, pids, ex = _run_files(d)
     if claude_alive(pids):  # GUARD:resume-alive
         raise CxdError("run %r is still running (pid %s); stop it before resuming" % (name, pids.get("claude_pid")), "alive")

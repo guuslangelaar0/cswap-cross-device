@@ -177,11 +177,103 @@ class Base(unittest.TestCase):
 
 
 class TestRuns(Base):
+    def own_children(self):
+        out = subprocess.run(["ps", "-eo", "pid=,ppid="], stdout=subprocess.PIPE, universal_newlines=True).stdout
+        return {int(p) for p, pp in (l.split() for l in out.splitlines() if l.strip()) if int(pp) == os.getpid()}
+
+    def end_new_groups(self, before):
+        """Supervisors this test started in-process are its children, each the
+        leader of its own process group (with its keeper and claude): end the
+        groups that are new, also when a guard failed and a second run started."""
+        for pid in self.own_children() - before:
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+    def concurrently(self, n, fn):
+        results, threads = [], []
+        for _ in range(n):
+            def run():
+                try:
+                    results.append(("ok", fn()))
+                except Exception as e:  # noqa: BLE001
+                    results.append((getattr(e, "code", type(e).__name__), None))
+            threads.append(threading.Thread(target=run))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(90)
+        self.assertFalse(any(t.is_alive() for t in threads), "a launch did not finish")
+        return results
+
+    def test_concurrent_starts_with_one_name_start_one_run(self):
+        """GUARD start-atomic. Mutation: the run directory is created with
+        makedirs(exist_ok) -> two starts that both passed the name check run
+        two claudes in one run directory, sharing its FIFO and output."""
+        from cxd import state
+        real = state.find_cswap  # the base config's default account goes through cswap
+
+        def slow(*a, **kw):  # widen the window between the name check and the claim
+            time.sleep(0.3)
+            return real(*a, **kw)
+        before = self.own_children()
+        env = dict(self.env, CXD_HOME=self.local)
+        try:
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(state, "find_cswap", slow):
+                results = self.concurrently(4, lambda: state.op_start(
+                    {"name": "wr", "prompt": "MARK-R", "cwd": self.work, "init_timeout": 20}))
+            self.assertEqual(sorted(r[0] for r in results), ["exists", "exists", "exists", "ok"], results)
+            self.wait_results("laptop", "wr", 1)
+            self.ok("stop", "laptop", "wr", "--grace", "10")
+        finally:
+            self.end_new_groups(before)
+
+    def test_concurrent_resumes_launch_one_gen(self):
+        """GUARD launch-lock. Mutation: resumes are not serialised -> four
+        concurrent resumes of a stopped run each pass the checks and launch a
+        gen: four claudes, three of them unrecorded."""
+        from cxd import state
+        self.start("laptop", "wq", "MARK-Q1")
+        self.wait_results("laptop", "wq", 1)
+        self.ok("stop", "laptop", "wq", "--grace", "10")
+        real = state.keeper_alive
+
+        def slow(pids):  # widen the window between the checks and the launch
+            time.sleep(0.3)
+            return real(pids)
+        before = self.own_children()
+        env = dict(self.env, CXD_HOME=self.local)
+        try:
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(state, "keeper_alive", slow):
+                results = self.concurrently(4, lambda: state.op_resume(
+                    {"name": "wq", "prompt": "MARK-Q2", "init_timeout": 20}))
+            self.assertEqual(sorted(r[0] for r in results), ["busy", "busy", "busy", "ok"], results)
+            self.assertEqual(read_json(os.path.join(self.local, "runs", "wq", "meta.json"))["gen"], 2)
+            self.ok("stop", "laptop", "wq", "--grace", "10")
+        finally:
+            self.end_new_groups(before)
+
+    def test_a_start_whose_supervisor_never_started_gives_the_name_back(self):
+        """GUARD start-cleanup. Mutation: the claimed directory stays after the
+        supervisor could not be started -> the name is taken for good: start
+        says it exists, resume finds no session, prune keeps it."""
+        import errno as _errno
+        from cxd import state
+        env = dict(self.env, CXD_HOME=self.local)
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(state, "_spawn_supervisor", side_effect=OSError(_errno.EAGAIN, "no processes left")):
+            with self.assertRaises(state.CxdError) as cm:
+                state.op_start({"name": "wg", "prompt": "MARK-G", "cwd": self.work, "init_timeout": 5})
+        self.assertEqual(cm.exception.code, "spawn_failed")
+        self.assertFalse(os.path.exists(os.path.join(self.local, "runs", "wg")))
+        self.start("laptop", "wg", "MARK-G2")
+        self.wait_results("laptop", "wg", 1)
+        self.ok("stop", "laptop", "wg", "--grace", "10")
+
     def test_concurrent_sends_to_a_run_never_interleave(self):
-        """GUARD fifo-one-writer. Mutation: senders write to the run's FIFO at
-        the same time -> a message larger than the pipe's atomic size (512
-        bytes on macOS) is cut into another one's, claude reads a broken JSON
-        line, and the run dies."""
+        """Eight large messages sent at once all arrive whole and the run lives
+        (the lock itself: TestFifoWrite.test_one_writer_at_a_time)."""
         from cxd import state
         self.start("laptop", "wi", "MARK-0")
         self.wait_results("laptop", "wi", 1)
@@ -1096,6 +1188,23 @@ class TestFifoWrite(unittest.TestCase):
         t = threading.Thread(target=run, daemon=True)
         t.start()
         return t, out
+
+    def test_one_writer_at_a_time(self):
+        """GUARD fifo-one-writer. Mutation: writers do not take the FIFO's lock
+        -> two senders' pieces of large messages mix into one line (whether
+        they do depends on the kernel: Linux splits large pipe writes, macOS
+        often does not), claude reads broken JSON and the run dies."""
+        from cxd import state
+        lock = self.hold_lock()
+        t, out = self.in_thread(lambda: state.fifo_write(self.fifo, b"MARK-WAITED\n"))
+        time.sleep(0.5)
+        try:
+            self.assertEqual(self.pending(self.reader), b"", "written while another writer held the lock")
+        finally:
+            os.close(lock)
+        t.join(5)
+        self.assertEqual(out, [("ok", None)])
+        self.assertEqual(self.pending(self.reader), b"MARK-WAITED\n")
 
     def test_a_message_waits_for_the_lock_a_bounded_time(self):
         """GUARD fifo-lock-bounded. Mutation: the wait for the lock has no end
