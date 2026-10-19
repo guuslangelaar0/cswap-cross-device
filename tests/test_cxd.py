@@ -6,6 +6,7 @@ tests/mutate.py, which applies each mutation to a throwaway copy and runs it.
 """
 
 import json
+import re
 import os
 import shutil
 import signal
@@ -43,6 +44,9 @@ class Base(unittest.TestCase):
             # Never the real claude: a run without an account execs CXD_CLAUDE.
             "CXD_CLAUDE": os.path.join(FAKES, "claude_stub.py"),
             "FAKE_REMOTE_CXD_HOME": self.remote,
+            # The hooks run under the interpreter being tested (in production the
+            # wrapper picks one; test_hook_is_fast measures that choice).
+            "CXD_PYTHON": sys.executable,
         })
         os.makedirs(self.local, mode=0o700)
         os.makedirs(self.remote, mode=0o700)
@@ -1466,10 +1470,10 @@ class TestHooks(Base):
             json.dump({"id": mid, "ts": "t", "sender": "s", "text": text}, f)
         return mid
 
-    def run_hook(self, sid, event="PostToolUse", broken_stdout=False):
+    def run_hook(self, sid, event="PostToolUse", broken_stdout=False, env=None):
         payload = json.dumps({"session_id": sid}).encode()
         if not broken_stdout:
-            r = subprocess.run([HOOK, event], input=payload, stdout=subprocess.PIPE, env=self.env)
+            r = subprocess.run([HOOK, event], input=payload, stdout=subprocess.PIPE, env=env or self.env)
             return r.stdout.decode()
         # The reader is gone before the hook writes: its output can never be read.
         p = subprocess.Popen([HOOK, event], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=self.env)
@@ -1706,28 +1710,56 @@ class TestHooks(Base):
         self.assertEqual((r.returncode, r.stdout, r.stderr), (0, b"", b""))
 
     def test_hook_is_fast(self):
-        payload = json.dumps({"session_id": "44444444-aaaa", "last_assistant_message": "x"}).encode()
-        for ev, limit in (("PostToolUse", 100), ("Stop", 100)):
+        """Every hook event, with the interpreter the wrapper picks in
+        production, has a median under 100 ms (CI prints the medians on Linux
+        and macOS)."""
+        env = {k: v for k, v in self.env.items() if k != "CXD_PYTHON"}
+        for i, ev in enumerate(("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd")):
             ts = []
-            for _ in range(7):
+            for n in range(7):
+                payload = json.dumps({"session_id": "44444444-aaaa-%04d-%04d" % (i, n), "source": "startup",
+                                      "cwd": self.work, "prompt": "x", "last_assistant_message": "x"}).encode()
                 t0 = time.time()
-                subprocess.run([HOOK, ev], input=payload, stdout=subprocess.PIPE, env=self.env)
+                subprocess.run([HOOK, ev], input=payload, stdout=subprocess.PIPE, env=env)
                 ts.append((time.time() - t0) * 1000)
             med = sorted(ts)[3]
             print("hook %s median %.1f ms" % (ev, med), file=sys.stderr)
-            self.assertLess(med, limit)
+            self.assertLess(med, 100, ev)
         # A hook that delivers (claim, write, ack) is held to the same limit.
         sid = "44444444-bbbb"
         ts = []
         for i in range(7):
             self.queue(sid, i, "MARK-FAST-%d" % i)
             t0 = time.time()
-            out = self.run_hook(sid)
+            out = self.run_hook(sid, env=env)
             ts.append((time.time() - t0) * 1000)
             self.assertIn("MARK-FAST-%d" % i, out)
         med = sorted(ts)[3]
         print("hook PostToolUse delivering median %.1f ms" % med, file=sys.stderr)
         self.assertLess(med, 100)
+
+    def test_the_wrapper_prefers_a_fast_stable_interpreter(self):
+        """GUARD hook-python. Mutation: the wrapper takes /usr/bin/python3 first
+        -> on macOS the hooks run on 3.9 behind the xcrun shim, about three
+        times slower (SessionStart over 100 ms)."""
+        with open(HOOK) as f:
+            src = f.read()
+        order = re.search(r"for c in ([^;]+); do  # GUARD:hook-python", src).group(1).split()
+        self.assertEqual(order, ["/opt/homebrew/bin/python3", "/usr/bin/python3"])
+        # Without any of them, python3 from PATH.
+        fake = os.path.join(self.tmp, "fakepy")
+        os.makedirs(fake)
+        with open(os.path.join(fake, "python3"), "w") as f:
+            f.write("#!/bin/sh\necho picked-from-path > %s\n" % os.path.join(self.tmp, "picked"))
+        os.chmod(os.path.join(fake, "python3"), 0o755)
+        patched = os.path.join(self.tmp, "cxd-hook")
+        with open(patched, "w") as f:
+            f.write(src.replace("for c in /opt/homebrew/bin/python3 /usr/bin/python3;", "for c in /nonexistent/python3;"))
+        os.chmod(patched, 0o755)
+        env = {k: v for k, v in self.env.items() if k != "CXD_PYTHON"}
+        env["PATH"] = fake + os.pathsep + env.get("PATH", "")
+        subprocess.run([patched, "Stop"], input=b"{}", stdout=subprocess.PIPE, env=env)
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, "picked")))
 
     def test_notify_lands_in_outbox(self):
         r = self.ok("notify", "built it MARK-N", env={"CLAUDE_CODE_SESSION_ID": "55555555-aaaa"})
