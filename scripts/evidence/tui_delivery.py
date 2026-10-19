@@ -440,15 +440,20 @@ class Driver(object):
         sent then waits for the next prompt (a documented limitation), and
         that prompt delivers it."""
         self.set_config(idle_wake=True)
-        n0 = len(self.assistant_texts())
-        stops = self.stop_count()
-        self.type_prompt("Write the numbers from 1 to 5000, one per line, nothing else.")
-        self.wait(lambda: self._streaming(n0), 60, "the answer to start streaming", step=0.1)
-        self.keys("Escape")
-        t_esc = time.time()
-        time.sleep(2)
-        if not self._interrupted():
-            return "FAIL: the turn ended before Esc could interrupt it (no interruption to test)"
+        for attempt in range(1, 4):
+            n0 = len(self.assistant_texts())
+            stops = self.stop_count()
+            interruptions = self._interrupted()
+            self.type_prompt("Write the numbers from 1 to 5000, one per line, nothing else.")
+            self.wait(lambda: self._streaming(n0), 60, "the answer to start streaming", step=0.1)
+            self.keys("Escape")
+            time.sleep(4)
+            if self._interrupted() > interruptions:
+                break
+            self.note("attempt %d: the answer ended before Esc reached it; again" % attempt)
+            self.settle()
+        else:
+            return "FAIL: no turn could be interrupted in 3 attempts"
         self.prompts -= 1 if self.stop_count() == stops else 0  # an interrupted turn writes no Stop record
         self.note("pressed Esc while the answer streamed; the transcript records the interruption; "
                   "Stop records since: %d" % (self.stop_count() - stops))
@@ -477,11 +482,12 @@ class Driver(object):
                 or len(self.assistant_texts()) > n0)
 
     def _interrupted(self):
+        """How many interruptions the transcript records."""
         try:
             with open(self.transcript) as f:
-                return any("interrupted" in line.lower() for line in f)
+                return sum("[request interrupted by user" in line.lower() for line in f)
         except (OSError, TypeError):
-            return False
+            return 0
 
     def _new_record(self, old_sid):
         d = os.path.join(self.home, "sessions")
