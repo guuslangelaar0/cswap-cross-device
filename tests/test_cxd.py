@@ -6,6 +6,7 @@ tests/mutate.py, which applies each mutation to a throwaway copy and runs it.
 """
 
 import json
+import re
 import os
 import shutil
 import signal
@@ -43,6 +44,9 @@ class Base(unittest.TestCase):
             # Never the real claude: a run without an account execs CXD_CLAUDE.
             "CXD_CLAUDE": os.path.join(FAKES, "claude_stub.py"),
             "FAKE_REMOTE_CXD_HOME": self.remote,
+            # The hooks run under the interpreter being tested (in production the
+            # wrapper picks one; test_hook_is_fast measures that choice).
+            "CXD_PYTHON": sys.executable,
         })
         os.makedirs(self.local, mode=0o700)
         os.makedirs(self.remote, mode=0o700)
@@ -1466,13 +1470,13 @@ class TestHooks(Base):
             json.dump({"id": mid, "ts": "t", "sender": "s", "text": text}, f)
         return mid
 
-    def run_hook(self, sid, event="PostToolUse", broken_stdout=False):
+    def run_hook(self, sid, event="PostToolUse", broken_stdout=False, env=None):
         payload = json.dumps({"session_id": sid}).encode()
         if not broken_stdout:
-            r = subprocess.run([HOOK, event], input=payload, stdout=subprocess.PIPE, env=self.env)
+            r = subprocess.run([HOOK, event], input=payload, stdout=subprocess.PIPE, env=env or self.env)
             return r.stdout.decode()
         # The reader is gone before the hook writes: its output can never be read.
-        p = subprocess.Popen([HOOK, event], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=self.env)
+        p = subprocess.Popen([HOOK, event], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env or self.env)
         p.stdout.close()
         p.stdin.write(payload)
         p.stdin.close()
@@ -1705,29 +1709,95 @@ class TestHooks(Base):
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=bad)
         self.assertEqual((r.returncode, r.stdout, r.stderr), (0, b"", b""))
 
+    def hook_python(self, env):
+        return subprocess.run([HOOK, "WhichPython"], stdout=subprocess.PIPE, universal_newlines=True,
+                              env=env).stdout.strip()
+
+    def timed(self, argv, payload, env):
+        t0 = time.perf_counter()
+        r = subprocess.run(argv, input=payload, stdout=subprocess.PIPE, env=env)
+        return (time.perf_counter() - t0) * 1000, r
+
     def test_hook_is_fast(self):
-        payload = json.dumps({"session_id": "44444444-aaaa", "last_assistant_message": "x"}).encode()
-        for ev, limit in (("PostToolUse", 100), ("Stop", 100)):
+        """Every hook event, with the interpreter the wrapper picks in
+        production, has a median under 100 ms (CI prints the medians on Linux
+        and macOS)."""
+        env = {k: v for k, v in self.env.items() if k != "CXD_PYTHON"}
+        py = self.hook_python(env)
+        if sys.platform == "darwin" and py == "/usr/bin/python3":
+            self.skipTest("macOS's /usr/bin/python3 (an xcrun shim) is the only interpreter here: "
+                          "about three times slower; install Homebrew's python3")
+        payload = lambda sid: json.dumps({"session_id": sid, "source": "startup", "cwd": self.work,
+                                          "prompt": "x", "last_assistant_message": "x"}).encode()
+        sids = ["44444444-aaaa-0000-%04d" % n for n in range(12)]
+        self.timed([HOOK, "SessionStart"], payload("44444444-warm"), env)  # warm-up (bytecode caches)
+        for ev in ("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"):
             ts = []
-            for _ in range(7):
-                t0 = time.time()
-                subprocess.run([HOOK, ev], input=payload, stdout=subprocess.PIPE, env=self.env)
-                ts.append((time.time() - t0) * 1000)
-            med = sorted(ts)[3]
-            print("hook %s median %.1f ms" % (ev, med), file=sys.stderr)
-            self.assertLess(med, limit)
-        # A hook that delivers (claim, write, ack) is held to the same limit.
-        sid = "44444444-bbbb"
-        ts = []
-        for i in range(7):
-            self.queue(sid, i, "MARK-FAST-%d" % i)
-            t0 = time.time()
-            out = self.run_hook(sid)
-            ts.append((time.time() - t0) * 1000)
-            self.assertIn("MARK-FAST-%d" % i, out)
-        med = sorted(ts)[3]
-        print("hook PostToolUse delivering median %.1f ms" % med, file=sys.stderr)
-        self.assertLess(med, 100)
+            for sid in sids[:11]:
+                ms, r = self.timed([HOOK, ev], payload(sid), env)
+                self.assertEqual(r.returncode, 0, ev)
+                ts.append(ms)
+            med = sorted(ts)[5]
+            print("hook %s median %.1f ms (python %s)" % (ev, med, py), file=sys.stderr)
+            self.assertLess(med, 100, ev)
+            if ev == "SessionStart":  # it really registered them
+                self.assertTrue(all(os.path.exists(os.path.join(self.local, "sessions", s + ".json"))
+                                    for s in sids[:11]))
+        # Hooks that start Python because there is mail (claim, write, ack) are held to the same limit.
+        for ev in ("PostToolUse", "UserPromptSubmit"):
+            sid = "44444444-bbbb-" + ev
+            ts = []
+            for i in range(11):
+                self.queue(sid, i, "MARK-FAST-%d" % i)
+                ms, r = self.timed([HOOK, ev], json.dumps({"session_id": sid, "prompt": "x"}).encode(), env)
+                self.assertIn("MARK-FAST-%d" % i, r.stdout.decode())
+                ts.append(ms)
+            med = sorted(ts)[5]
+            print("hook %s delivering median %.1f ms" % (ev, med), file=sys.stderr)
+            self.assertLess(med, 100)
+
+    def fake_python(self, name, marker):
+        p = os.path.join(self.tmp, name)
+        with open(p, "w") as f:
+            f.write('#!/bin/sh\necho %s > "%s"\n' % (marker, os.path.join(self.tmp, "picked")))
+        os.chmod(p, 0o755)
+        return p
+
+    def picked(self, wrapper, env):
+        target = os.path.join(self.tmp, "picked")
+        if os.path.exists(target):
+            os.unlink(target)
+        subprocess.run([wrapper, "Stop"], input=b"{}", stdout=subprocess.PIPE, env=env)
+        with open(target) as f:
+            return f.read().strip()
+
+    def test_the_wrapper_prefers_a_fast_stable_interpreter(self):
+        """GUARD hook-python. Mutation: the wrapper does not stop at the first
+        interpreter it finds -> it ends on the last one, which on macOS is
+        /usr/bin/python3 (3.9 behind the xcrun shim, about three times slower)."""
+        with open(HOOK) as f:
+            src = f.read()
+        first, second = self.fake_python("py-first", "first"), self.fake_python("py-second", "second")
+        wrapper = os.path.join(self.tmp, "cxd-hook")
+
+        def with_candidates(cands):
+            with open(wrapper, "w") as f:
+                f.write(re.sub(r'(?m)^  cands=.*\n  \[ -d /System/Library \].*\n', '  cands="%s"\n' % cands, src))
+            os.chmod(wrapper, 0o755)
+        env = {k: v for k, v in self.env.items() if k != "CXD_PYTHON"}
+        with_candidates("%s %s" % (first, second))
+        self.assertEqual(self.picked(wrapper, env), "first")
+        with_candidates("/nonexistent/python3 %s" % second)
+        self.assertEqual(self.picked(wrapper, env), "second")
+        with_candidates("%s %s" % (first, second))
+        self.assertEqual(self.picked(wrapper, dict(env, CXD_PYTHON=second)), "second")  # CXD_PYTHON wins
+        # Without any of them, python3 from PATH.
+        fake_dir = os.path.join(self.tmp, "fakepy")
+        os.makedirs(fake_dir)
+        shutil.copy(self.fake_python("py-path", "from-path"), os.path.join(fake_dir, "python3"))
+        with_candidates("/nonexistent/python3")
+        self.assertEqual(self.picked(wrapper, dict(env, PATH=fake_dir + os.pathsep + env.get("PATH", ""))),
+                         "from-path")
 
     def test_notify_lands_in_outbox(self):
         r = self.ok("notify", "built it MARK-N", env={"CLAUDE_CODE_SESSION_ID": "55555555-aaaa"})

@@ -570,6 +570,14 @@ MUTATIONS = [
         "expect": "red",
     },
     {
+        "name": "hook-python",
+        "what": "the hook wrapper takes /usr/bin/python3 first (on macOS: 3.9 behind the xcrun shim, about three times slower)",
+        "edits": [("hooks/cxd-hook", '    if [ -x "$c" ]; then py=$c; break; fi\n  done\n  [ -n "$py" ] || py=python3\n',
+                   '    if [ -x "$c" ]; then py=$c; fi  # MUTATION\n  done\n  [ -n "$py" ] || py=python3\n')],
+        "tests": [T + "TestHooks.test_the_wrapper_prefers_a_fast_stable_interpreter"],
+        "expect": "red",
+    },
+    {
         "name": "init-no-link",
         "what": "cxd init does not link ~/.cxd/bin/cxd, so peers cannot reach this host",
         "edits": [("lib/cxd/cli.py", "    link, target = _link_cli()\n",

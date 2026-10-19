@@ -273,8 +273,11 @@ by name.
   [Permissions](#permissions).
 - **Hooks never break a session.** They exit 0 on every error and print nothing unless
   they deliver a message or (at `SessionStart`) announce how messages arrive. `PostToolUse` and `UserPromptSubmit` skip Python entirely when no
-  inbox has mail. The test suite requires a median under 100 ms for `PostToolUse` and
-  `Stop`.
+  inbox has mail. The test suite requires a median under 100 ms for every hook event, with
+  the interpreter the hooks use in production: on macOS Homebrew's `python3`
+  (`/opt/homebrew`, then `/usr/local`; macOS's own `/usr/bin/python3` is about three times
+  slower to start), else `/usr/bin/python3`; `CXD_PYTHON` overrides it. `cxd doctor` shows
+  which one the hooks use, and its hook self-test fails if that interpreter is broken.
 - **Announced, tagged, factual injection.** On a machine where cxd is set up
   (`~/.cxd/config.json` exists), each session gets a random secret tag when it registers. Its
   `SessionStart` hook tells it that messages from the user's lead session arrive marked
