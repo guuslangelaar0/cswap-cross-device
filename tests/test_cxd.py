@@ -2242,7 +2242,7 @@ class TestIdleWaker(Base):
         self.ok("send", "laptop", sid, "wake up MARK-WAKE")
         self.assertEqual(self.wake_rc(p), 2, self.wake_err(p))
         err = self.wake_err(p)
-        self.assertIn("arrived while it was idle", err)
+        self.assertIn("This is not an error. cxd", err)
         self.assertIn("MARK-WAKE", err)
         self.assertIn("[cxd:%s]" % self.tag(sid), err)  # GUARD wake-tagged: the lead's mark
         with open(os.path.join(self.local, "outbox", sid + ".jsonl")) as f:

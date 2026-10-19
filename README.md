@@ -97,10 +97,14 @@ flowchart LR
     leaves at once. `CXD_CLAUDE_VERSION` states the version where it cannot be read.
   - At the start of an interactive session (also a resume), mail that is already queued
     goes through the waker too, so it wakes the session instead of waiting in its context.
-  - A turn you interrupt with Esc, or a prompt another hook blocked, ends without a `Stop`.
-    Claude Code's idle notification (after about a minute at the prompt) marks the session
-    idle again; mail sent in between waits until then. A turn that ends in an API error
+  - A turn you interrupt with Esc still runs the `Stop` hooks (observed with Claude Code
+    2.1.303), so mail sent afterwards is woken in at once. A prompt another hook blocked
+    starts no turn and ends without a `Stop`: Claude Code's idle notification (after about
+    a minute at the prompt) marks the session idle again. A turn that ends in an API error
     (`StopFailure`) counts as idle at once.
+  - Claude Code shows a woken message as hook feedback (it labels it a Stop hook error).
+    The announcement at `SessionStart` tells the session that such a message, with its
+    mark, is the user's instruction, and the waker's text says it is not an error.
   - Turn it off with `"idle_wake": false` in `~/.cxd/config.json`.
 - **Reports.** The `Stop` hook appends the last assistant message of every turn to the
   session's outbox, and a worker can add its own lines with `cxd notify "…"`. The lead

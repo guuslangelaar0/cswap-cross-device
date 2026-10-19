@@ -77,8 +77,9 @@ reading `Message from the lead session <sender> at <time> (cxd message <id>) [cx
 announcement names; a second copy with the same id is a repeat, not a new instruction. An
 interactive session that sits idle at its prompt is woken for it: a background waker (an
 asyncRewake hook, Claude Code 2.1.287 or later) hands it over and Claude starts a turn on
-it, with no human typing. After a turn the user interrupted with Esc, or with `"idle_wake":
-false`, the message waits for the next prompt.
+it, with no human typing; Claude Code shows such a message as hook feedback, labelled a
+Stop hook error, and it is still the user's instruction when it carries the mark. With
+`"idle_wake": false` the message waits for the next prompt.
 
 ## Worker: reporting back
 

@@ -18,6 +18,8 @@ scrubbed environment, then proves, one case at a time:
                        and Claude acts on it unprompted
   E  untouched         a message to a session nobody has typed into (after
                        /clear): the waker its SessionStart started delivers it
+  F  Esc               a message after a turn interrupted with Esc (no Stop):
+                       Claude Code's idle notification starts a waker
 
 A-C run with the waker off ("idle_wake": false), so they prove the hooks; D
 and E turn it on.
@@ -432,6 +434,44 @@ class Driver(object):
         self.wait(lambda: self.receipts(mid), 60, "delivery on the next prompt", step=1)
         return "FAIL: not delivered while idle within %ds (the next prompt delivered it)" % wait_s
 
+    def case_esc(self, wait_s):
+        """A turn interrupted with Esc ends without a Stop, so the session
+        counts as busy. Claude Code's idle notification (after about a minute
+        at the prompt) marks it idle again and starts a waker, which then
+        delivers a message sent in between."""
+        self.set_config(idle_wake=True)
+        n0 = len(self.assistant_texts())
+        t_prompt = time.time()
+        self.type_prompt("Write the numbers from 1 to 400, one per line, nothing else.")
+        self.wait(lambda: len(self.assistant_texts()) > n0 or time.time() - t_prompt > 8, 30,
+                  "the answer to start", step=0.3)
+        stops = self.stop_count()
+        self.keys("Escape")
+        t_esc = time.time()
+        self.note("pressed Esc while the answer streamed")
+        time.sleep(3)
+        if self.stop_count() > stops:
+            self.note("the interrupted turn ended with a Stop hook run (this Claude Code runs Stop on Esc)")
+        else:
+            self.prompts -= 1  # an interrupted turn without a Stop record
+            self.note("the interrupted turn ended without a Stop hook run")
+        n1 = len(self.assistant_texts())
+        mid = self.send("Reply with the word PEAR-F. (cxd evidence check)")
+        deadline = time.time() + wait_s
+        while time.time() < deadline and not self.receipts(mid):
+            time.sleep(1)
+        got = self.receipts(mid)
+        if not got:
+            self.type_prompt("Reply with the single word OK.")
+            return "FAIL: not delivered within %ds after Esc" % wait_s
+        self.note("receipt: delivered by the %s hook %.0fs after Esc (no prompt typed)" % (
+            got[0]["event"], time.time() - t_esc))
+        texts = self.wait(lambda: self.reply_with("PEAR-F", n1), 120, "Claude's reply to the woken message", step=1)
+        self.note("Claude replied, unprompted: %r" % texts[-1][:200])
+        if got[0]["event"] != "Wake":
+            return "FAIL: delivered via %s, not the waker" % got[0]["event"]
+        return "PASS: after Esc, the waker delivered without a prompt"
+
     def _new_record(self, old_sid):
         d = os.path.join(self.home, "sessions")
         for n in os.listdir(d) if os.path.isdir(d) else []:
@@ -484,13 +524,13 @@ def main(argv):
     ap.add_argument("--model", default="haiku")
     ap.add_argument("--tmux", default=shutil.which("tmux") or "tmux")
     ap.add_argument("--idle-wait", type=int, default=30)
-    ap.add_argument("--cases", default="ABCDE")
+    ap.add_argument("--cases", default="ABCDEF")
     ap.add_argument("--out")
     ap.add_argument("--keep-transcript", help="copy the session transcript here (for debugging; not redacted)")
     a = ap.parse_args(argv)
-    cases = [c for c in a.cases.upper() if c in "ABCDE"]
+    cases = [c for c in a.cases.upper() if c in "ABCDEF"]
     if not cases:
-        sys.stderr.write("no case selected (use --cases from ABCDE)\n")
+        sys.stderr.write("no case selected (use --cases from ABCDEF)\n")
         return 2
     plugin_dir = a.plugin_dir and os.path.abspath(a.plugin_dir)
     tmp = tempfile.mkdtemp(prefix="cxd-tui-")
@@ -515,9 +555,11 @@ def main(argv):
         labels = {"A": "A: delivery on PostToolUse", "B": "B: delivery on UserPromptSubmit",
                   "C": "C: delivery at Stop, and whether the session continues",
                   "D": "D: a message queued while the session is idle (the waker a Stop started)",
-                  "E": "E: a message to a session nobody has typed into (the waker SessionStart started)"}
+                  "E": "E: a message to a session nobody has typed into (the waker SessionStart started)",
+                  "F": "F: a message after a turn interrupted with Esc (the idle notification's waker)"}
         fns = {"A": d.case_post_tool_use, "B": d.case_user_prompt_submit, "C": d.case_stop,
-               "D": lambda: d.case_idle(a.idle_wait), "E": lambda: d.case_session_start_waker(a.idle_wait)}
+               "D": lambda: d.case_idle(a.idle_wait), "E": lambda: d.case_session_start_waker(a.idle_wait),
+               "F": lambda: d.case_esc(max(a.idle_wait, 150))}
         for c in cases:
             results[labels[c].split(":")[0]] = d.case(labels[c], fns[c])
     except Exception as e:
