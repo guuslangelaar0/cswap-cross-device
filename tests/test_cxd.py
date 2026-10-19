@@ -1030,6 +1030,147 @@ class TestSupervisorFailure(Base):
             os.close(fd)
 
 
+class TestSupervisorRobust(Base):
+    """The supervisor ends what it started and records why, however it fails
+    (issue #10)."""
+
+    def setUp(self):
+        Base.setUp(self)
+        self.addCleanup(self.end_strays)
+
+    def end_strays(self):
+        """Stop any process whose arguments name this test's temp dir (when a
+        guard fails, a keeper or claude outlives the test)."""
+        ps = subprocess.run(["ps", "-eo", "pid=,args="], stdout=subprocess.PIPE, universal_newlines=True).stdout
+        for line in ps.splitlines():
+            pid, _, args = line.strip().partition(" ")
+            if self.tmp in args and int(pid) != os.getpid():
+                try:
+                    os.kill(int(pid), signal.SIGTERM)
+                except OSError:
+                    pass
+
+    def run_dir(self, name, account=None):
+        from cxd.common import atomic_write_json
+        d = os.path.join(self.local, "runs", name)
+        os.makedirs(d, mode=0o700)
+        atomic_write_json(os.path.join(d, "meta.json"), {"name": name, "gen": 1, "account": account,
+                                                         "cwd": self.work})
+        return d
+
+    def fifo_has_no_writer(self, d, timeout=5):
+        fd = os.open(os.path.join(d, "in.fifo"), os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            deadline = time.time() + timeout
+            while True:
+                try:
+                    return os.read(fd, 1) == b""
+                except BlockingIOError:
+                    if time.time() > deadline:
+                        return False
+                    time.sleep(0.1)
+        finally:
+            os.close(fd)
+
+    def in_child(self, d, patch):
+        """supervise_main(d, 1) in a child process, after `patch` (Python code
+        run with `supervise` imported). Returns its exit status."""
+        code = ("import os, signal, sys, time; sys.path.insert(0, %r); from cxd import supervise\n%s\n"
+                "supervise.supervise_main(%r, 1)") % (os.path.join(REPO, "lib"), patch, d)
+        env = dict(self.env)
+        p = subprocess.run([sys.executable, "-c", code], env=env, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, timeout=60)
+        return p.returncode
+
+    def test_sigterm_before_claude_runs_is_recorded_and_ends_the_keeper(self):
+        """GUARD supervise-sigterm. Mutation: SIGTERM keeps its default action
+        -> a supervisor terminated before claude runs leaves no exit record
+        (watch waits forever) and an orphaned keeper holding the FIFO."""
+        d = self.run_dir("ws")
+        rc = self.in_child(d, "supervise.find_claude = lambda: (os.kill(os.getpid(), signal.SIGTERM), time.sleep(5))")
+        ex = read_json(os.path.join(d, "exit.json"))
+        self.assertIsNotNone(ex, "no exit record (rc %s)" % rc)
+        self.assertEqual((ex["gen"], ex["rc"]), (1, None))
+        self.assertIn("terminated", ex["error"])
+        self.assertTrue(self.fifo_has_no_writer(d), "the keeper still holds the FIFO open")
+        self.assertEqual(read_json(os.path.join(d, "supervisor.json"))["gen"], 1)
+
+    def test_a_failure_after_claude_started_ends_claude_too(self):
+        """GUARD supervise-children. Mutation: the guard ends only the keeper ->
+        claude, started a moment before the failure, runs on with no pids
+        record (on macOS it ignores the FIFO's EOF)."""
+        from cxd import supervise
+        d = self.run_dir("wc")
+        started = []
+        real_popen = supervise.subprocess.Popen
+
+        def popen(cmd, *a, **kw):
+            p = real_popen(cmd, *a, **kw)
+            if "-p" in cmd:
+                started.append(p)
+            return p
+        real_ident = supervise.proc_identity
+
+        def ident(pid):
+            if started and pid == started[0].pid:
+                raise RuntimeError("cannot read claude's identity")
+            return real_ident(pid)
+        # Like Claude Code on macOS, this claude ignores the FIFO's EOF: only the guard can end it.
+        env = {"CXD_HOME": self.local, "CXD_CLAUDE": self.env["CXD_CLAUDE"], "PATH": self.env["PATH"],
+               "STUB_IGNORE_EOF": "1"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(supervise.signal, "signal"), \
+                mock.patch.object(supervise.subprocess, "Popen", popen), \
+                mock.patch.object(supervise, "proc_identity", ident):
+            with self.assertRaises(RuntimeError):
+                supervise.supervise_main(d, 1)
+        self.assertTrue(started, "claude was not started")
+        self.addCleanup(lambda: started[0].poll() is None and started[0].kill())
+        try:
+            started[0].wait(10)
+        except subprocess.TimeoutExpired:
+            self.fail("claude was left running")
+        self.assertIn("identity", read_json(os.path.join(d, "exit.json"))["error"])
+        self.assertTrue(self.fifo_has_no_writer(d))
+
+    def test_a_full_disk_does_not_hide_the_first_error(self):
+        """GUARD supervise-record-safe. Mutation: the guard's own write is not
+        protected -> on a full disk its error replaces the real one, and the
+        keeper is not ended."""
+        import errno as _errno
+        from cxd import supervise
+        d = self.run_dir("wd")
+        real_write = supervise.atomic_write_json
+
+        def write(p, obj):
+            if p.endswith("exit.json"):
+                raise OSError(_errno.ENOSPC, "no space for the record")
+            return real_write(p, obj)
+        env = {"CXD_HOME": self.local, "CXD_CLAUDE": self.env["CXD_CLAUDE"]}
+        with mock.patch.dict(os.environ, env), mock.patch.object(supervise.signal, "signal"), \
+                mock.patch.object(supervise, "append_jsonl", side_effect=OSError(_errno.ENOSPC, "disk full")), \
+                mock.patch.object(supervise, "atomic_write_json", write):
+            with self.assertRaises(OSError) as cm:
+                supervise.supervise_main(d, 1)
+        self.assertIn("disk full", str(cm.exception))
+        self.assertTrue(self.fifo_has_no_writer(d))
+
+    def test_a_failure_leaks_no_file_descriptor(self):
+        """GUARD supervise-fds. Mutation: the FIFO's read end is closed only on
+        the normal path -> every failed start leaks a descriptor (and holds the
+        FIFO's read end open)."""
+        import errno as _errno
+        from cxd import supervise
+        d = self.run_dir("wf")
+        fds = lambda: len(os.listdir("/dev/fd"))
+        env = {"CXD_HOME": self.local, "CXD_CLAUDE": self.env["CXD_CLAUDE"]}
+        before = fds()
+        with mock.patch.dict(os.environ, env), mock.patch.object(supervise.signal, "signal"), \
+                mock.patch.object(supervise, "append_jsonl", side_effect=OSError(_errno.ENOSPC, "disk full")):
+            with self.assertRaises(OSError):
+                supervise.supervise_main(d, 1)
+        self.assertEqual(fds(), before)
+
+
 class TestRemote(Base):
     def test_remote_start_send_stop_resume_list(self):
         self.start("buildbox", "rr", "MARK-R1")
