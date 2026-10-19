@@ -87,15 +87,20 @@ flowchart LR
   - It only hands mail over while the session is idle. A typed prompt, a turn the waker
     started and a `Stop` that delivered mail mark the session busy; during a turn the
     other hooks deliver.
-  - There is one waker per session. It leaves on its own when the session ends or is
-    resumed by another process, when its claude process is gone, or after about a day;
-    after that, mail waits for the next prompt.
-  - It needs an interactive session of Claude Code 2.1.287 or later (read from the
-    running executable). In `claude -p` sessions, headless runs included (their messages
-    go through the FIFO), and with older or unknown versions it leaves at once.
-  - A turn you interrupt with Esc ends without a `Stop`, so the session counts as busy
-    until your next prompt: mail sent in between waits for it. A turn that ends in an API
-    error (`StopFailure`) does count as idle.
+  - There is one waker per session process. It leaves on its own when the session ends,
+    when its claude process is gone, or after about a day. When another process resumes
+    the session, the old waker leaves and the new process's waker takes over.
+  - It needs an interactive session of Claude Code 2.1.287 or later, read from the running
+    executable: the native installer's `.../claude/versions/X.Y.Z`, or the npm package's
+    `package.json`. With other installs (a version it cannot read), in `claude -p` sessions,
+    headless runs included (their messages go through the FIFO), and with older versions it
+    leaves at once. `CXD_CLAUDE_VERSION` states the version where it cannot be read.
+  - At the start of an interactive session (also a resume), mail that is already queued
+    goes through the waker too, so it wakes the session instead of waiting in its context.
+  - A turn you interrupt with Esc, or a prompt another hook blocked, ends without a `Stop`.
+    Claude Code's idle notification (after about a minute at the prompt) marks the session
+    idle again; mail sent in between waits until then. A turn that ends in an API error
+    (`StopFailure`) counts as idle at once.
   - Turn it off with `"idle_wake": false` in `~/.cxd/config.json`.
 - **Reports.** The `Stop` hook appends the last assistant message of every turn to the
   session's outbox, and a worker can add its own lines with `cxd notify "…"`. The lead
@@ -291,6 +296,8 @@ by name.
   with `--skip-permissions` on `cxd start` or `cxd resume`, or `"skip_permissions": true` on
   the host that runs it. Otherwise a tool call that needs approval is refused. See
   [Permissions](#permissions).
+- **Hooks need Claude Code 2.1.78 or later** (for the `StopFailure` event); the waker needs
+  2.1.287 or later.
 - **Hooks never break a session.** They exit 0 on every error and print nothing unless
   they deliver a message or (at `SessionStart`) announce how messages arrive. `PostToolUse` and `UserPromptSubmit` skip Python entirely when no
   inbox has mail. The test suite requires a median under 100 ms for `PostToolUse` and

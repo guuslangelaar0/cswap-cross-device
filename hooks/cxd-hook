@@ -35,7 +35,10 @@ fi
 if [ "$ev" = Wake ]; then
   # The idle waker (asyncRewake): exit 2 with the message on stderr wakes
   # Claude. Only the waker's own "delivered" code (42) becomes exit 2; any
-  # failure, Python's own exit 2 included, must not wake Claude.
+  # failure, Python's own exit 2 included, must not wake Claude. Outside an
+  # interactive session (claude -p runs this hook synchronously) it has
+  # nothing to do: skip Python.
+  [ "$CLAUDE_CODE_ENTRYPOINT" = cli ] || { cat >/dev/null 2>&1; exit 0; }  # GUARD:wake-shell-entrypoint
   CXD_HOOK_PARENT=$$ "$py" -I -S "$root/bin/cxd" _hook Wake
   [ $? -eq 42 ] && exit 2  # GUARD:wake-exit-code
   exit 0

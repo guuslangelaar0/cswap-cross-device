@@ -1,6 +1,7 @@
 """Plugin hook handler: `cxd _hook <Event>` with the hook JSON on stdin.
 
-Contract: fast, silent on error, exit 0 always. A broken hook must never
+Contract: fast, silent on error, exit 0 always (except the idle waker, which
+returns WAKE_DELIVERED when it delivered: see wake()). A broken hook must never
 break the session it runs in.
 
 SessionStart      register ~/.cxd/sessions/<sid>.json (pid, cwd, config dir, tag);
@@ -9,10 +10,11 @@ PostToolUse       \
 UserPromptSubmit   > claim queued inbox messages, return them as additionalContext,
 Stop              /  ack them once written (Stop also records last_assistant_message)
 StopFailure       the turn ended in an API error: the session is idle
+Notification      (idle_prompt) the session waits for input: it is idle
 SessionEnd        mark the session ended
-Wake              the idle waker (an asyncRewake hook started at SessionStart, Stop
-                  and StopFailure): deliver mail to an idle interactive session and
-                  wake it (see the comment above wake())
+Wake              the idle waker (an asyncRewake hook started at SessionStart, Stop,
+                  StopFailure and the idle notification): deliver mail to an idle
+                  interactive session and wake it (see the comment above wake())
 """
 
 import json
@@ -312,7 +314,12 @@ def handle(event, data):
         return None, []
     ctx, claims = None, []
     announce = event == "SessionStart" and _announce(data, fresh_tag)
-    if event in ("SessionStart", "PostToolUse", "UserPromptSubmit", "Stop"):
+    leave_to_waker = (event == "SessionStart" and data.get("source") != "compact"
+                      and _waker_will_run())  # GUARD:start-leaves-mail
+    if event in ("SessionStart", "PostToolUse", "UserPromptSubmit", "Stop") and not leave_to_waker:
+        # (At the start of an interactive session the waker hands queued mail
+        # over and wakes the session; as SessionStart context it would wait
+        # for someone to type.)
         tag = session_tag(sid)
         budget = CONTEXT_BUDGET - (len(ANNOUNCE) + 64 if announce else 0)
         claims = claim_inbox(sid, budget)
@@ -324,13 +331,11 @@ def handle(event, data):
             ctx = ANNOUNCE % tag + ("\n\n" + ctx if ctx else "")
     if event == "SessionStart" and data.get("source") != "compact":  # GUARD:idle-not-on-compact
         mark_idle(sid)  # a compaction can come in the middle of a turn
-    elif event == "Stop":
-        if claims:
-            mark_busy(sid)  # GUARD:stop-delivered-busy (the turn goes on with the mail)
-        else:
-            mark_idle(sid)
     elif event == "StopFailure":
         mark_idle(sid)  # GUARD:stopfailure-idle (an API error ended the turn: there is no Stop)
+    elif event == "Notification" and data.get("notification_type") == "idle_prompt":
+        mark_idle(sid)  # GUARD:idle-prompt (waiting for input, also after Esc or a blocked prompt)
+    # (A Stop marks idle or busy in main(), once its output is handed over.)
     if event == "Stop":
         ensure_dir(path("outbox"))
         last = data.get("last_assistant_message")
@@ -396,6 +401,7 @@ def _announce(data, fresh_tag=False):
 WAKE_SECONDS = 86400 - 600
 WAKE_POLL = 1.0
 WAKE_DELIVERED = 42  # hooks/cxd-hook turns this, and only this, into exit 2
+START_SLACK = 0.1
 MIN_CLAUDE_FOR_WAKER = (2, 1, 287)
 
 
@@ -428,13 +434,15 @@ def _exe_path(pid):
     except OSError:
         pass
     if sys.platform == "darwin":
-        try:
-            import ctypes
-            buf = ctypes.create_string_buffer(4096)
-            n = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidpath(int(pid), buf, ctypes.sizeof(buf))
-            return buf.value.decode("utf-8", "replace") if n > 0 else None
-        except (OSError, AttributeError, ValueError):
-            return None
+        import ctypes
+        for lib in ("/usr/lib/libproc.dylib", "/usr/lib/libSystem.B.dylib"):
+            try:
+                buf = ctypes.create_string_buffer(4096)
+                n = ctypes.CDLL(lib).proc_pidpath(int(pid), buf, ctypes.sizeof(buf))
+                if n > 0:
+                    return buf.value.decode("utf-8", "replace")
+            except (OSError, AttributeError, ValueError):
+                continue
     return None
 
 
@@ -453,9 +461,11 @@ def _claude_version(pid, argv):
         m = re.search(r"/claude/versions/(\d+\.\d+\.\d+)", os.path.realpath(cand) if os.path.isabs(cand) else cand)
         if m:
             return _version(m.group(1))
-    if len(argv) > 1 and os.path.isabs(argv[1]):
-        d = os.path.dirname(os.path.realpath(argv[1]))
-        for _ in range(4):  # .../@anthropic-ai/claude-code/{cli.js,bin/claude.exe}
+    # An npm install: .../@anthropic-ai/claude-code/bin/claude.exe run directly
+    # (its own executable), or node running .../claude-code/cli.js (argv[1]).
+    for cand in ([exe] if exe else []) + ([argv[1]] if len(argv) > 1 and os.path.isabs(argv[1]) else []):
+        d = os.path.dirname(os.path.realpath(cand))
+        for _ in range(4):
             pkg = read_json(os.path.join(d, "package.json"), None)
             if isinstance(pkg, dict) and pkg.get("name") == "@anthropic-ai/claude-code":
                 return _version(str(pkg.get("version")))
@@ -530,20 +540,16 @@ def _release(sid, claims):
 
 
 def wake(data):
-    started = time.time()  # before anything slow: an end after this counts
+    # An end of the session after this counts. File times come from a coarse
+    # clock that can lag time.time() by a tick: allow for it (a real earlier
+    # end, before a resume, is at least a claude start older).
+    started = time.time() - START_SLACK
     sid = data.get("session_id")
     if not isinstance(sid, str) or not SID_RE.match(sid):
         return 0
     from .common import load_config
     if load_config().get("idle_wake") is False:
         return 0
-    import fcntl
-    lock = os.open(os.path.join(ensure_dir(path("wake")), sid + ".lock"), os.O_WRONLY | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)  # GUARD:wake-single
-    except OSError:
-        os.close(lock)
-        return 0  # another waker already waits for this session
     pid, argv = _claude_process()
     if not pid:
         return 0  # without its claude process the waker can neither stay safe nor know when to leave
@@ -554,6 +560,8 @@ def wake(data):
         return 0  # an older (or unknown) Claude Code may not run it in the background
     claude_ident = proc_identity(pid)
     if not claude_ident:
+        return 0
+    if _wake_lock(sid, pid, claude_ident, started) is None:
         return 0
     check_every = float(os.environ.get("CXD_WAKE_CHECK_S") or 10)
     deadline = time.monotonic() + WAKE_SECONDS
@@ -576,20 +584,64 @@ def wake(data):
                 _release(sid, claims)
                 claims = []
             if claims:  # GUARD:wake-deliver
-                mark_busy(sid)  # GUARD:wake-marks-busy
                 text = format_messages([m for m, _ in claims], tag, sid)  # GUARD:wake-tagged
                 sys.stderr.write("cxd: a message for this session arrived while it was idle at its prompt.\n\n" + text)
                 sys.stderr.flush()
                 if _wrapper_alive():  # GUARD:wake-ack-wrapper
+                    mark_busy(sid)  # GUARD:wake-marks-busy (the woken turn has no UserPromptSubmit)
                     ack(sid, claims, "Wake")
                 return WAKE_DELIVERED
         time.sleep(WAKE_POLL)
     return 0
 
 
+def _wake_lock(sid, pid, ident, started):
+    """Take the session's waker lock and write this waker's claude pid in it.
+    None when another waker of the same claude process already waits. A
+    waker of another process (the session was resumed elsewhere, and that
+    waker has not noticed yet) is waited for: it leaves within its check
+    interval. Meanwhile this waker leaves for its own reasons as usual."""
+    import fcntl
+    p = os.path.join(ensure_dir(path("wake")), sid + ".lock")
+    fd = os.open(p, os.O_RDWR | os.O_CREAT, 0o600)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # GUARD:wake-single
+            break
+        except OSError:
+            pass
+        try:
+            holder = json.loads(os.pread(fd, 256, 0).decode("utf-8") or "{}")
+        except (OSError, ValueError):
+            holder = {}
+        if not isinstance(holder, dict) or holder.get("pid") in (None, pid):  # GUARD:wake-same-process
+            os.close(fd)
+            return None  # a waker of this process (or one that has not said whose it is yet)
+        from .common import load_config
+        if not _wrapper_alive() or load_config().get("idle_wake") is False or _gone(sid, started, pid, ident):
+            os.close(fd)
+            return None
+        time.sleep(WAKE_POLL)
+    os.ftruncate(fd, 0)
+    os.pwrite(fd, json.dumps({"pid": pid}).encode("utf-8"), 0)
+    return fd
+
+
+def _waker_will_run():
+    """Whether this session (from a hook) gets an idle waker."""
+    from .common import load_config
+    if load_config().get("idle_wake") is False:
+        return False
+    pid, argv = _claude_process()
+    if not pid or not _interactive(argv):
+        return False
+    version = _claude_version(pid, argv)
+    return version is not None and version >= MIN_CLAUDE_FOR_WAKER
+
+
 def _has_json(d):
     try:
-        return any(n.endswith(".json") for n in os.listdir(d))
+        return any(n.endswith(".json") and not n.startswith(".") for n in os.listdir(d))
     except OSError:
         return False
 
@@ -626,19 +678,25 @@ def main(event):
             out, claims = handle(event, data)
     except Exception:
         out = None  # claims stay claimed by this process; the next hook requeues them
+    handed_over = False
     if out:
         try:
             sys.stdout.write(json.dumps(out))
             sys.stdout.flush()
+            # Unless our hook wrapper was killed (a timeout): then nobody reads this output.
+            handed_over = os.getppid() == parent
         except Exception:
-            return 0  # not handed over: no ack, so the messages come again
-        if os.getppid() != parent:
-            return 0  # our hook wrapper was killed (a timeout): nobody reads this output
-        try:
-            if claims:
+            pass  # not handed over: no ack, so the messages come again
+        if handed_over and claims:
+            try:
                 ack(sid, claims, event)  # GUARD:ack-after-write
-        except Exception:
-            pass
+            except Exception:
+                pass
+    if event == "Stop" and isinstance(sid, str) and SID_RE.match(sid):
+        if handed_over and claims:
+            mark_busy(sid)  # GUARD:stop-delivered-busy (the turn goes on with the mail)
+        else:
+            mark_idle(sid)  # the turn ended (mail not handed over comes again)
     if event == "SessionStart":
         _prune_after_session_start()  # after any mail has gone out
     return 0

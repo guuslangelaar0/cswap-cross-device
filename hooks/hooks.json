@@ -74,6 +74,24 @@
         ]
       }
     ],
+    "Notification": [
+      {
+        "matcher": "idle_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/cxd-hook Notification",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/cxd-hook Wake",
+            "asyncRewake": true,
+            "timeout": 86400
+          }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "hooks": [
