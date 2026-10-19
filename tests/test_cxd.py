@@ -272,10 +272,8 @@ class TestRuns(Base):
         self.ok("stop", "laptop", "wg", "--grace", "10")
 
     def test_concurrent_sends_to_a_run_never_interleave(self):
-        """GUARD fifo-one-writer. Mutation: senders write to the run's FIFO at
-        the same time -> a message larger than the pipe's atomic size (512
-        bytes on macOS) is cut into another one's, claude reads a broken JSON
-        line, and the run dies."""
+        """Eight large messages sent at once all arrive whole and the run lives
+        (the lock itself: TestFifoWrite.test_one_writer_at_a_time)."""
         from cxd import state
         self.start("laptop", "wi", "MARK-0")
         self.wait_results("laptop", "wi", 1)
@@ -1190,6 +1188,23 @@ class TestFifoWrite(unittest.TestCase):
         t = threading.Thread(target=run, daemon=True)
         t.start()
         return t, out
+
+    def test_one_writer_at_a_time(self):
+        """GUARD fifo-one-writer. Mutation: writers do not take the FIFO's lock
+        -> two senders' pieces of large messages mix into one line (whether
+        they do depends on the kernel: Linux splits large pipe writes, macOS
+        often does not), claude reads broken JSON and the run dies."""
+        from cxd import state
+        lock = self.hold_lock()
+        t, out = self.in_thread(lambda: state.fifo_write(self.fifo, b"MARK-WAITED\n"))
+        time.sleep(0.5)
+        try:
+            self.assertEqual(self.pending(self.reader), b"", "written while another writer held the lock")
+        finally:
+            os.close(lock)
+        t.join(5)
+        self.assertEqual(out, [("ok", None)])
+        self.assertEqual(self.pending(self.reader), b"MARK-WAITED\n")
 
     def test_a_message_waits_for_the_lock_a_bounded_time(self):
         """GUARD fifo-lock-bounded. Mutation: the wait for the lock has no end

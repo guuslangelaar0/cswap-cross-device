@@ -34,7 +34,7 @@ MUTATIONS = [
         "what": "senders write to a run's FIFO at the same time (large messages interleave; claude reads broken JSON and the run dies)",
         "edits": [("lib/cxd/state.py", "                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)  # GUARD:fifo-one-writer\n",
                    "                pass  # MUTATION\n")],
-        "tests": [T + "TestRuns.test_concurrent_sends_to_a_run_never_interleave"],
+        "tests": [T + "TestFifoWrite.test_one_writer_at_a_time"],
         "expect": "red",
     },
     {
