@@ -460,7 +460,7 @@ class Driver(object):
         if self.receipts(mid):
             return "FAIL: delivered while the session counted as busy (via %s)" % self.receipts(mid)[0]["event"]
         self.note("after %ds: not delivered (the session counts as busy after Esc), still queued" % wait_s)
-        self.type_prompt("Reply with the single word OK.")
+        self.type_prompt("Continue.")  # neutral: the delivered message says what to do
         rec = self.wait(lambda: self.receipts(mid), 60, "delivery on the next prompt", step=1)[0]
         texts = self.wait(lambda: self.reply_with("PEAR-F", n1), 120, "a reply with the marker", step=1)
         self.note("the next prompt delivered it (receipt: %s hook); Claude replied: %r" % (rec["event"], texts[-1][:120]))
