@@ -177,6 +177,36 @@ class Base(unittest.TestCase):
 
 
 class TestRuns(Base):
+    def test_concurrent_sends_to_a_run_never_interleave(self):
+        """GUARD fifo-one-writer. Mutation: senders write to the run's FIFO at
+        the same time -> a message larger than the pipe's atomic size (512
+        bytes on macOS) is cut into another one's, claude reads a broken JSON
+        line, and the run dies."""
+        from cxd import state
+        self.start("laptop", "wi", "MARK-0")
+        self.wait_results("laptop", "wi", 1)
+        barrier, results = threading.Barrier(8), []
+
+        def send(i):
+            barrier.wait()  # all at once: far above any pipe buffer, together
+            try:
+                state.op_send({"target": "wi", "text": "MARK-C%d %s" % (i, "x" * 400000)})
+                results.append("ok")
+            except state.CxdError as e:
+                results.append(e.code)
+        with mock.patch.dict(os.environ, {"CXD_HOME": self.local}):
+            threads = [threading.Thread(target=send, args=(i,)) for i in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(60)
+        self.assertEqual(results, ["ok"] * 8)
+        res = self.wait_results("laptop", "wi", 9, timeout=60)
+        for i in range(8):
+            self.assertEqual(sum("MARK-C%d" % i in r for r in res), 1, res)
+        runs = json.loads(self.ok("list", "laptop", "--json").stdout)[0]["runs"]
+        self.assertEqual([r["alive"] for r in runs if r["name"] == "wi"], [True])
+
     def test_start_send_list(self):
         self.start("laptop", "w1", "hello MARK-A")
         res = self.wait_results("laptop", "w1", 1)
@@ -1028,6 +1058,120 @@ class TestSupervisorFailure(Base):
                     time.sleep(0.1)
         finally:
             os.close(fd)
+
+
+class TestFifoWrite(unittest.TestCase):
+    """fifo_write: one writer at a time, bounded, for the FIFO it meant."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="cxd-fifo-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.fifo = os.path.join(self.tmp, "in.fifo")
+        os.mkfifo(self.fifo, 0o600)
+        self.reader = os.open(self.fifo, os.O_RDONLY | os.O_NONBLOCK)
+        self.addCleanup(lambda: os.close(self.reader))
+
+    @staticmethod
+    def pending(fd):
+        """What can be read now (b"" when nothing; with no writer, read gives EOF)."""
+        try:
+            return os.read(fd, 1 << 16)
+        except BlockingIOError:
+            return b""
+
+    def hold_lock(self):
+        import fcntl
+        fd = os.open(self.fifo + ".lock", os.O_WRONLY | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+
+    def in_thread(self, fn):
+        out = []
+
+        def run():
+            try:
+                out.append(("ok", fn()))
+            except Exception as e:  # noqa: BLE001
+                out.append((getattr(e, "code", type(e).__name__), str(e)))
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        return t, out
+
+    def test_a_message_waits_for_the_lock_a_bounded_time(self):
+        """GUARD fifo-lock-bounded. Mutation: the wait for the lock has no end
+        -> a sender stuck on a full FIFO blocks every later message (and the
+        next gen's first prompt) for good."""
+        from cxd import state
+        lock = self.hold_lock()
+        try:
+            with mock.patch.object(state, "FIFO_LOCK_WAIT", 0.5):
+                t, out = self.in_thread(lambda: state.fifo_write(self.fifo, b"x\n"))
+                t.join(5)
+            self.assertFalse(t.is_alive(), "the message waited without end")
+            self.assertEqual(out[0][0], "busy")
+        finally:
+            os.close(lock)
+
+    def test_a_message_never_goes_into_the_next_gens_fifo(self):
+        """GUARD fifo-same-gen. Mutation: the FIFO is not checked after the wait
+        -> a message that waited behind another one lands in the FIFO a resume
+        created meanwhile, before the resume's own prompt."""
+        from cxd import state
+        lock = self.hold_lock()
+        t, out = self.in_thread(lambda: state.fifo_write(self.fifo, b"MARK-OLD\n"))
+        time.sleep(0.3)
+        os.unlink(self.fifo)  # a resume makes a new FIFO, and its claude reads it
+        os.mkfifo(self.fifo, 0o600)
+        reader2 = os.open(self.fifo, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            os.close(lock)
+            t.join(5)
+            self.assertEqual(out[0][0], "dead", out)
+            self.assertEqual(self.pending(reader2), b"")  # nothing arrived in the new FIFO
+        finally:
+            os.close(reader2)
+
+    def test_a_run_that_stopped_while_the_message_waited_gets_none(self):
+        """GUARD fifo-recheck. Mutation: liveness is checked only before the
+        wait -> a message sent while the run was being stopped is written to a
+        claude that is ending and reported as sent."""
+        from cxd import state
+        with self.assertRaises(state.CxdError) as cm:
+            state.fifo_write(self.fifo, b"x\n", still_ok=lambda: False)
+        self.assertEqual(cm.exception.code, "dead")
+        self.assertEqual(self.pending(self.reader), b"")
+
+    def test_ctrl_c_during_a_write_still_writes_the_whole_message(self):
+        """GUARD fifo-whole. Mutation: signals are not held off during the
+        write -> Ctrl-C between two pieces leaves half a line in the FIFO, and
+        claude dies on the broken JSON."""
+        payload = b"{\"t\": \"" + b"x" * 2000000 + b"\"}\n"
+        src = os.path.join(self.tmp, "payload")
+        with open(src, "wb") as f:
+            f.write(payload)
+        code = ("import sys; sys.path.insert(0, %r); from cxd import state; "
+                "state.fifo_write(%r, open(%r, 'rb').read())" % (os.path.join(REPO, "lib"), self.fifo, src))
+        p = subprocess.Popen([sys.executable, "-c", code], stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: p.poll() is None and p.kill())
+        got = bytearray()
+        sent = False
+        deadline = time.time() + 30
+        while len(got) < len(payload) and time.time() < deadline:
+            chunk = self.pending(self.reader)
+            if chunk:
+                got += chunk
+                if not sent and len(got) > 100000:
+                    os.kill(p.pid, signal.SIGINT)  # Ctrl-C in the middle of the write
+                    sent = True
+                time.sleep(0.005)  # a slow reader: the writer waits between pieces
+            elif sent and p.poll() is not None:
+                got += self.pending(self.reader)
+                break  # the writer is gone and nothing more comes
+            else:
+                time.sleep(0.01)
+        p.wait(10)
+        self.assertTrue(sent)
+        self.assertEqual(bytes(got), payload)
 
 
 class TestRemote(Base):
