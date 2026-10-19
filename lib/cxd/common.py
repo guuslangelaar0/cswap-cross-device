@@ -98,14 +98,30 @@ def read_json(p, default=None):
         return default
 
 
-def atomic_write_json(p, obj):
+def atomic_write(p, data, fsync=False):
+    """Replace p with data (bytes), mode 600; never a partly written p."""
     tmp = "%s.tmp.%d.%s" % (p, os.getpid(), os.urandom(4).hex())
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        os.write(fd, json.dumps(obj, indent=1, sort_keys=True).encode("utf-8"))
-    finally:
-        os.close(fd)
-    os.replace(tmp, p)
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            if fsync:
+                os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def atomic_write_json(p, obj):
+    atomic_write(p, json.dumps(obj, indent=1, sort_keys=True).encode("utf-8"))
 
 
 def append_jsonl(p, obj):
