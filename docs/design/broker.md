@@ -1,6 +1,6 @@
 # Design: the broker transport
 
-**Status:** proposed, revision 5 (after four reviews). Implementation follows in small pull requests; see the end of this document.
+**Status:** proposed, revision 6 (after five reviews). Implementation follows in small pull requests; see the end of this document.
 
 `cxd` reaches other machines over ssh. Each operation is one `ssh <alias> cxd _rpc`, and `cxd watch` holds a stream open. That works well, but every pair of machines needs an ssh alias and a key.
 
@@ -52,7 +52,7 @@ flowchart LR
   subgraph buildbox
     A2["agent buildbox (master)"]
     CLI2["cxd (CLI)"] -- "unix socket" --> A2
-    A2 -- "stdin/stdout" --> R2["cxd _rpc (per request)"]
+    A2 -- "stdin/stdout" --> R2["cxd _rpc2 (per request)"]
   end
   subgraph spare
     A3["agent spare"]
@@ -70,7 +70,7 @@ flowchart LR
   3. any member that reports a link to the target. Members list their live links in `hello` and in state messages.
 
   When no hop exists, the node that has the request answers `unreachable` at once, back to the origin by node id: the origin itself, or a relay (the master, typically) that has no link to the target. So `auto` falls back to ssh without waiting, also when the target is a laptop that is closed.
-- **Execution: the agent runs `cxd _rpc`.** For each request addressed to its machine, the agent starts the installed CLI, `~/.cxd/bin/cxd _rpc`, and speaks to it over stdin and stdout exactly as `SshTransport` does over ssh (see Delivery). So the broker and ssh execute operations with the same code and the same claim store, and an agent that has run for days still executes requests with the `cxd` that is installed now, for example after a plugin update. For `watch`, the `_rpc` child streams `state.stream()`.
+- **Execution: the agent runs `cxd _rpc2`.** For each request addressed to its machine, the agent starts the installed CLI, `~/.cxd/bin/cxd _rpc2` (`_rpc` for read-only requests and streams), and speaks to it over stdin and stdout exactly as `SshTransport` does over ssh (see Delivery). So the broker and ssh execute operations with the same code and the same claim store, and an agent that has run for days still executes requests with the `cxd` that is installed now, for example after a plugin update. For `watch`, the child streams `state.stream()`.
 - **One agent per machine.** An agent holds `~/.cxd/agent/lock` (flock) while it runs, so a second agent on the same machine exits at once.
 - **Version check.** The agent's own code (links, lease, routing) is the code it was started with. `cxd doctor` warns when the agent's version differs from the installed `cxd`. Restart the agent to pick up the new code.
 
@@ -83,14 +83,16 @@ A link is a long-lived TLS connection. Either side may have dialed it; once up, 
 
 **Liveness.** Each side sends a `ping` on an idle link every `LEASE / 3` seconds. A link that has carried nothing, not even a `pong` or part of a frame, for `LEASE` seconds is closed and redialed. This catches TCP connections that died silently, for example while a laptop slept.
 
-**Control first.** Each link has a send queue in which control frames (`lease`, `lease_ok`, `ping`, `pong`, `hello`, `unreachable`) go before data. A data message over 256 KiB is sent as `part` frames of 256 KiB, so a large request on a slow link never holds a renewal back for long; the receiver reassembles them, up to the 8 MiB limit.
+**Link changes travel.** When a member's set of live links changes, it sends `{"t": "links", "node", "links", "seq"}` to all its links, and members forward it while its `seq` is newer, like a renewal. So routing rule 3 stays current without waiting for a membership change.
+
+**Control first.** Each link has a send queue in which control frames (`lease`, `lease_ok`, `ping`, `pong`, `hello`, `links`, `unreachable`, and the small per-request frames `accepted`, `go`, `running` and `cancel`) go before data. A data message over 256 KiB is sent as `part` frames of 256 KiB, so a large request on a slow link never holds a renewal back for long; the receiver reassembles them, up to the 8 MiB limit.
 
 **One direction is enough.** A member that accepts no inbound connections still works, because the other side dials it or both dial the master. Examples are a WSL2 instance behind Windows NAT, or a laptop behind a firewall.
 
 **Addresses.**
 - `listen` in config.json (for example `0.0.0.0:47100`) is what the agent binds.
 - `advertise` (for example `<lan address>:47100`, or the Windows host address and forwarded port for WSL2) is what it tells other members. A wildcard is never advertised.
-- Each member also remembers the address a peer last connected from.
+- Each member also remembers the IP address a peer last connected from, and dials it at the peer's advertised port (the source port of an inbound connection cannot be dialed back).
 
 **Checks.** A dialer checks that the peer's node id is the member it meant to reach. A `hello` whose node is the agent itself, which happens when it dialed one of its own addresses, closes the link.
 
@@ -149,14 +151,14 @@ Pairing has to work before the new machine is trusted, so it uses a separate, sm
 
 **Both commands need a real terminal.** `cxd join`, `cxd accept`, `cxd members remove` and `cxd members priority` read their confirmation from `/dev/tty` and refuse without one. The agent does not take the CLI's word for it: it accepts these changes on its socket only from a process that has a controlling terminal, which it checks itself (the peer's pid from `SO_PEERCRED` on Linux or `LOCAL_PEERPID` on macOS, then that process's terminal). A raw write to the socket from a process without a terminal is refused like the CLI would be.
 
-This stops the common case: a session that has been prompt-injected ("run `cxd accept ABCDE-FGHJK`") and runs commands through Claude Code's Bash tool, which has no controlling terminal. The implementation verifies that on both platforms. A session that deliberately allocates a pty (`script`, Python's `pty`) gets around it; see Threat model.
+This stops the common case: a session that has been prompt-injected ("run `cxd accept ABCDE-FGHJK`") and runs commands through Claude Code's Bash tool, which has no controlling terminal (checked: opening `/dev/tty` there fails with ENXIO). The implementation verifies that on both platforms. It does not stop a session that deliberately allocates a pty (`script`, Python's `pty`) or drives a terminal that already exists (`tmux send-keys`, `screen -X stuff`, `osascript` telling Terminal to type); see Threat model.
 
 1. **Joiner connects.** On the new machine, `cxd join <addr>`:
-   - refuses if this machine is a member of a mesh with other members (a machine that is the only member of its own mesh leaves it first; see The first member);
+   - refuses if this machine is a member of a mesh with other members (a machine that is the only member of its own mesh leaves it first; see The first member), unless `--reset` is given: that discards the old mesh state and makes a new key, which a machine that was removed from its mesh needs, since its old node id stays revoked;
    - creates the agent identity if needed;
    - connects to `<addr>`, any member's advertised address, with TLS and **without** a client certificate. It does not verify the member's certificate yet, but records its fingerprint `member_fp_seen`.
 2. **Commit.** The joiner sends `{"t": "join", "name", "cert": <its PEM>, "commit": SHA-256(nonce_j)}`, where `nonce_j` is 32 random bytes.
-3. **Member's nonce.** The member checks that the name is free and records a pending join with:
+3. **Member's nonce.** The member checks that the joiner's node id is not revoked and that its name is valid (the rules for `cxd` host names: lowercase letters, digits and dashes, at most 32 characters, not `local` and not a name the member itself answers to) and free, and records a pending join with:
    - the joiner's node id `joiner_fp` (the SHA-256 of its certificate's DER), its name and address, and the commit;
    - its own node id `member_fp`;
    - an expiry of 10 minutes.
@@ -177,7 +179,7 @@ This stops the common case: a session that has been prompt-injected ("run `cxd a
    The joiner shows the join code as `ABCDE-FGHJK`, with the member's name and address, and asks for the confirmation code.
 6. **Accept.** On any member, `cxd accept ABCDE-FGHJK` looks for a pending join with that code. It shows the joiner's name, the address it connected from, and its fingerprint, then asks for confirmation at the terminal. Accepting marks the pending join *accepted* (with priority below every existing member unless `--priority` says otherwise) and shows the confirmation code, `KLMNP-QRSTV`. Nobody trusts the joiner yet.
 7. **Joiner confirms.** The member that holds the joiner's connection sends `{"t": "accepted_join", state}`: the mesh as it will be with the joiner in it. The joiner keeps it unapplied until the human types the confirmation code. When the typed code equals the joiner's own `confirm_code`, and the state lists `member_fp_seen` as a member and the joiner itself under its name, the joiner answers `{"t": "confirmed", "mac": SHA-256("cxd-confirmed-v2" | transcript | confirm_code)}`. A wrong code may be retyped twice; the third mismatch aborts the join.
-8. **Commit.** The member checks the `mac` against the transcript and the confirmation code it knows, and only then has the master add the joiner to the membership. It sends `{"t": "joined", state}`; the joiner writes the state and its trust bundle and from then on connects like any member. If the joiner aborts, mistypes three times, or its connection drops before `confirmed`, the pending join is dropped and no member ever trusted it: a retry starts again from `cxd join`.
+8. **Commit.** The `mac` is the joiner's consent, not proof that any human acted: the joiner knows everything the confirmation code is made of. The human action on the member side is `cxd accept`. So the member commits only when all of these hold: the pending join is marked accepted, it already sent `accepted_join` on this very connection, and the `mac` matches the transcript and the confirmation code. A `confirmed` that arrives before the member sent `accepted_join` drops the pending join and closes the connection. Then the master adds the joiner to the membership, and the member sends `{"t": "joined", state}`; the joiner writes the state and its trust bundle and from then on connects like any member. If the joiner aborts, mistypes three times, or its connection drops before `confirmed`, the pending join is dropped and no member ever trusted it: a retry starts again from `cxd join`.
 
 **Why this is safe.**
 - **A man in the middle** must show its own certificate to each side, so the two sides compute different transcripts. The real member has no pending join with the code that the joiner shows, so `accept` there finds nothing. The man in the middle can send the joiner an `accepted_join` state of its own, but cannot make the real member show the matching confirmation code: the joiner sends no `confirmed` and installs nothing until the human types that code, and it accepts `joined` only after its own `confirmed`.
@@ -186,7 +188,7 @@ This stops the common case: a session that has been prompt-injected ("run `cxd a
 
 **Limits.**
 - **Per member.** A member keeps at most 5 pending joins. When full it refuses new ones rather than evicting old ones, so a flood cannot push out a real join.
-- **Tied to the connection.** A pending join lives only while the joiner's connection stays open, so a host cannot park joins and walk away. `cxd members pending` lists them and `cxd members pending --clear` drops them.
+- **Tied to the connection.** A pending join lives only while the joiner's connection stays open, so a host cannot park joins and walk away. `cxd members pending` lists them and `cxd members pending --clear` drops them. While a human walks from one machine to the other, the member keeps the connection alive with TCP keepalive (no frames, so nothing counts against the joiner's frame limit); the connection is closed at the 10-minute expiry.
 - **Per address.** It accepts at most one join attempt per source address every 10 seconds.
 - **One per address.** A source address has at most one pending join, so one host cannot fill all five places.
 - **Replication.** Pending joins, transcripts included, are replicated through the master, so that `accept` works on any member. When the joiner's connection drops, the member that held it tells the master, which drops the pending join everywhere. Without a reachable master, `accept` works only on the member that received the join, and only when that member creates the mesh (the first member) or the master is back by the time the joiner confirms: membership changes always go through a master.
@@ -206,7 +208,7 @@ Each agent keeps one state file, `~/.cxd/agent/state.json`:
   "lease": {"term": t, "master": node_id, "provisional": bool} }
 ```
 
-- **Membership entries** carry a version `(term, rev, writer)`. Only a master changes membership; `accept` and `priority` need a reachable master, and say so when there is none. Merging keeps, per member, the entry with the higher version, compared in that order: the term first, so a deposed master's later edits never beat the elected master's, and the writer last, so two masters of a split cannot produce a tie. `hello` and `state` carry the full versions, so a split is noticed when links come back.
+- **Membership entries** carry a version `(term, regular, rev, writer)`, where `regular` is 1 when a regular master wrote the entry and 0 when a provisional one did. Only a master changes membership; `accept` and `priority` need a reachable master, and say so when there is none. Merging keeps, per member, the entry with the higher version, compared in that order: the term first, so a deposed master's later edits never beat the elected master's; then regular over provisional, so a provisional master of the same term never overrides a regular one; and the writer last, so two masters of a split cannot produce a tie. `hello` and `state` carry the full versions, so a split is noticed when links come back.
 - **Names are unique.** An `accept` whose name is taken is refused. If two masters of a split each admitted a machine under the same name, the merge keeps both members (they have different node ids), marks the name as a conflict, and `cxd doctor` and `cxd members` ask the user to remove one; until then, that name resolves to neither.
 - **Links.** The master's state messages also list which members have live links to which, for routing.
 - **Revocation is sticky and needs no master.**
@@ -219,47 +221,60 @@ Each agent keeps one state file, `~/.cxd/agent/state.json`:
 
 ## Lease and election
 
-**Clocks and sleep.** Lease timing uses a clock that keeps counting while the machine sleeps where there is one: `CLOCK_BOOTTIME` on Linux, and `CLOCK_MONOTONIC` on macOS (which, unlike Linux's, counts sleep). Python's `time.monotonic()` stops during suspend on both. That is not enough everywhere: under WSL2, `CLOCK_BOOTTIME` does not count the host's sleep either (checked on the WSL2 test machine: it equals `CLOCK_MONOTONIC`, and the boot time it implies is off by the hours Windows slept). So every agent also watches for sleep directly:
-- **Sleep detection.** On every loop tick, and again just before it sends a renewal or a `hello`, the agent compares how far the wall clock (`time.time()`) moved with how far its lease clock moved since the last tick. When the wall clock moved more than `LEASE / 2` further, the machine slept (the wall clock is corrected after resume) or the clock was stepped; either way the agent handles it as a wake (see Confirmation and Grace). A wall clock stepped backwards is ignored.
-- Durations between machines are always sent as seconds remaining, never as absolute times, so wall clocks are never compared between machines.
-- The agent logs each detected sleep, with its length, so long-running real nodes show it in their logs.
+**Clocks.** Lease timing uses a clock that keeps counting while the machine sleeps where there is one: `CLOCK_BOOTTIME` on Linux, and `CLOCK_MONOTONIC` on macOS (which, unlike Linux's, counts sleep). Python's `time.monotonic()` stops during suspend on both. Under WSL2, `CLOCK_BOOTTIME` does not count the host's sleep either (checked on the WSL2 test machine: it equals `CLOCK_MONOTONIC`, and the boot time it implies is off by the hours Windows slept). Durations between machines are always sent as seconds remaining, never as absolute times, so wall clocks are never compared between machines.
 
-- **Holding the lease.** The master holds a lease of `LEASE = 15 s` and renews it every `LEASE / 3`. A renewal `{"t": "lease", "term", "master", "provisional", "provisional_for", "seq", "remaining"}` carries the seconds left. A receiver sets its own deadline to its own clock plus `remaining`.
-- **Confirmation.** Members answer each renewal with `{"t": "lease_ok", "term", "master", "seq", "seen_term"}`, where `seen_term` is the highest term the member has seen (it keeps it in its state file). A member never confirms a lease whose term is below its `seen_term`. A regular master that has had no `lease_ok` from any member for `LEASE` steps down to *provisional* at the same term. So does a master that detects a sleep, or a gap of more than `LEASE / 2` in its own loop. A regular master is therefore always one that a member confirmed within the last lease period.
-- **A start is never a lease.** An agent always starts as a follower, also when its state file says it was the master: the saved term is only a lower bound for the terms it will accept and create. A lease view that names the agent itself, received after it started, is treated as lapsed. While an agent is in its grace period it says so in `hello` and `pong` (`grace: true`), and the others leave it out when they pick a candidate.
-- **Forwarding.** Members forward a renewal to their other links only if its `(term, master, seq)` is newer than what they have seen for that master. That makes forwarding stop, and two masters at the same term never hide each other.
-- **Lease views travel.** Every `hello` and `pong` carries the sender's current lease view: term, master, provisional, `provisional_for`, and the seconds left by its own clock. A member learns about a live lease the moment a link comes up, without waiting for the next renewal.
-- **Grace.** A member never promotes during its first `2 x LEASE` after it starts, and again for `2 x LEASE` after it leaves the alone state (below) or wakes from sleep. In that time it dials (every few seconds, see Links), exchanges hellos, and learns the master.
+**Wakes.** An agent, whatever its role, treats either of these as a *wake*:
+- a gap of more than `LEASE / 2` on the lease clock between two of its loop ticks (sleep on Linux and macOS, where that clock counts it; also a long stall of the process);
+- a forward jump of the wall clock (`time.time()`) of more than `LEASE / 2` beyond what the lease clock moved since the last tick (sleep under WSL2, once the host corrects the wall clock; also a stepped clock). It checks this on every tick and again just before it sends a renewal or a `hello`. A wall clock stepped backwards is ignored.
+
+On a wake, a master becomes provisional with `provisional_for` 0, and every agent enters grace (below). The agent logs each wake, with its length, so long-running real nodes show it.
+
+A wake detected by the wall clock comes only once the host has corrected that clock, which under WSL2 can be late. The rule below (*lapse witnesses*) therefore does not depend on it: the members whose clocks kept running decide.
+
+**The lease.**
+- **Identity.** A lease is `(term, master, incarnation)`. The incarnation is a random number an agent picks every time it starts, so a restarted agent's renewals are never mistaken for, or discarded as older than, those of its previous run. Renewals carry a `seq` that grows within one incarnation.
+- **Holding it.** The master holds a lease of `LEASE = 15 s` and renews it every `LEASE / 3`. A renewal `{"t": "lease", "term", "master", "incarnation", "provisional", "provisional_for", "seq", "remaining"}` carries the seconds left. A receiver sets its own deadline to its own clock plus `remaining`.
+- **Confirmation.** Members answer each renewal with `{"t": "lease_ok", "term", "master", "incarnation", "seq", "seen_term", "lapsed"}`. A regular master that has had no `lease_ok` from any member for `LEASE` becomes provisional at the same term. A regular master is therefore always one that a member confirmed within the last lease period.
+- **Lapse witnesses.** A member that saw a lease lapse on its own clock remembers it (`lapsed`: the last few `(term, master, incarnation)` it saw lapse) and sends that list in `hello`, `pong` and `lease_ok`. It never treats a lease it saw lapse as regular again: any later claim of it counts as provisional with `provisional_for` 0. A master that finds its own current lease in a peer's `lapsed` list becomes provisional at once, with `provisional_for` 0. So both sides of a link always agree on what the returning master is, whatever its own clock says.
+- **`seen_term`.** Each member keeps the highest term it has seen in this mesh (in its state file; it starts again at 0 when the machine joins a mesh). It never confirms a *regular* lease below it. It confirms a *provisional* lease below it only when, after its grace, no lease at or above `seen_term` has been heard of for `LEASE + 3 s` (the master of that term is gone for good, or was revoked); the confirmed master then becomes regular at `seen_term + 1`.
+- **A start is never a lease.** An agent always starts as a follower, also when its state file says it was the master: the saved term is only a lower bound for the terms it will accept and create. While an agent is in grace it says so in `hello` and `pong` (`grace: true`), and the others leave it out when they pick a candidate.
+- **Forwarding.** Members forward a renewal to their other links only if its `(term, master, incarnation, seq)` is newer than what they have seen for that lease. That makes forwarding stop, and two masters at the same term never hide each other.
+- **Lease views travel.** Every `hello` and `pong` carries the sender's current lease view (term, master, incarnation, provisional, `provisional_for`, the seconds left by its own clock) and its `lapsed` list. A member learns about a live lease the moment a link comes up.
+- **Grace.** A member never promotes during its first `2 x LEASE` after it starts, and for `2 x LEASE` after a wake or after it leaves the alone state (below). In that time it dials (every few seconds, see Links), exchanges hellos, and learns the master. Grace does not stop a provisional master from being upgraded.
+
+**Election.**
 - **Lapse.** A member that has seen no renewal for `LEASE + 3 s` treats the lease as lapsed.
 - **Pre-vote.** Before it promotes, a member asks every member it can reach (a live link and a `pong` within 2 s) for its lease view. If any of them reports a live lease, the member follows that master instead.
 - **Promotion.** If no reachable member holds a live lease:
-  - **With others:** if the member can reach at least one other member, the reachable member with the highest priority promotes itself to `term + 1`, ties going to the lower node id. Every other member waits `LEASE` for that member's renewal before it checks again.
-  - **Alone: provisional.** If it can reach **no** other member, it promotes itself as a *provisional* master, without raising the term, and counts how long it has been provisional (`provisional_for`). A provisional master serves its own CLI. It becomes a regular master as soon as another member links to it and confirms its lease, at one more than the highest term either of them has seen (its own term and the confirmer's `seen_term`). That is the two-machine failover: when the master dies, the survivor becomes master, and stays master when the old one comes back.
-- **No preemption.** A member that hears a live lease, through renewals or lease views, never takes over, whatever its priority. A restarted or reconnecting high-priority member therefore joins as a follower. A master that slept wakes up provisional (see Confirmation), so it cannot outrank the member that took over while it slept.
+  - **With others:** if the member can reach at least one other member, the reachable member with the highest priority that is not in grace promotes itself to `max(term, seen_term) + 1`, ties going to the lower node id. Every other member waits `LEASE` for that member's renewal before it checks again.
+  - **Alone: provisional.** If it can reach **no** other member, it promotes itself as a *provisional* master, without raising the term, and counts how long it has been provisional (`provisional_for`, reset to 0 on every wake). A provisional master serves its own CLI, relays, and may commit membership changes (see Replicated state for how they rank). It becomes regular as soon as any member confirms its lease, on a new link or an existing one, at one more than the highest term either of them has seen. That is the two-machine failover: when the master dies, the survivor becomes master, and stays master when the old one comes back.
+- **No preemption.** A member that hears a live lease, through renewals or lease views, never takes over, whatever its priority. A restarted or reconnecting member joins as a follower. A master that slept is provisional by the time it talks to anyone: through a wake it detected, or through the lapse witness of the member that took over.
 - **When two masters meet.** This happens after a partition or a sleep. The comparison order is:
   1. the higher term wins;
-  2. on equal terms, a regular master beats a provisional one;
+  2. on equal terms, a regular master beats a provisional one (a lease a member saw lapse counts as provisional);
   3. between two provisional masters, the one provisional for longer wins;
   4. then the higher priority;
   5. then the lower node id.
 
-  The loser steps down at once. Two provisional masters can only meet when a link comes up (each was alone), so they compare the values in the pair of `hello` messages: each side its own `provisional_for` as it sent it and the peer's as it received it. Both compare the same two numbers and reach the same verdict, so there is no tolerance window in which each could believe it won. A provisional master never raises the term, so it always yields to a master that members kept confirming. A master that slept or was cut off became provisional when its confirmations stopped, and yields to the member that has served longer. So a partition never ends in preemption. Membership entries merge by version, and revocations by union.
+  The loser steps down at once. When two provisional masters link up directly, each compares the values in their pair of `hello` messages (its own as it sent them, the peer's as it received them), so both reach the same verdict. When they meet through a third member instead (it links to both while they cannot reach each other), the third member applies the same order to the two lease views it holds and confirms only the winner, which becomes regular at a higher term; the loser yields when that term reaches it. A provisional master never raises the term by itself, so it always yields to a master that members kept confirming. Membership entries merge by version, and revocations by union.
 
   Examples, with two machines A (old master) and B:
-  - **A's agent dies, then restarts.** B, alone, becomes provisional. A restarts in its grace period, links to B within seconds, hears B's lease view, and follows. B becomes regular at `term + 1`.
-  - **A sleeps.** B becomes provisional. A wakes, sees the gap in its loop, and steps down to provisional with `provisional_for` 0. When they link, B has been provisional longer and wins; A follows, and B becomes regular.
-  - **The network between them breaks.** A loses its confirmations and goes provisional after `LEASE`; B sees the lease lapse after `LEASE + 3 s`. So A has usually been provisional a few seconds longer and wins on reconnection, and B follows. Both had served only their own CLI meanwhile.
-  - **A restarts while B is provisional.** A starts as a follower whatever its state file says, links within seconds, hears B's lease view in B's `hello`, and follows.
-  - **Three machines, a stale term.** A is provisional at term 7 while B and C elected B at term 8. C restarts and reaches A first: C's `seen_term` is 8, so it does not confirm A's term-7 lease, and A stays provisional until it meets B and yields.
+  - **A's agent dies, then restarts.** B, alone, becomes provisional. A restarts as a follower in grace with a new incarnation, links to B within seconds, hears B's lease view, and follows. B becomes regular at `term + 1`.
+  - **A sleeps (macOS or Linux).** B sees A's lease lapse and becomes provisional. A wakes and detects the gap on its lease clock: it is provisional with `provisional_for` 0. When they link, B wins; A follows, and B becomes regular.
+  - **A sleeps (WSL2), and its wall clock is corrected late.** A detects nothing yet and its hello still says "regular". But B's `hello` lists A's lease as lapsed: A becomes provisional with `provisional_for` 0, B counts A's lease as provisional, and both pick B. A's late wake changes nothing more.
+  - **The network between them breaks.** A loses its confirmations and goes provisional after `LEASE`; B sees the lease lapse after `LEASE + 3 s` and goes provisional too. On reconnection B's `lapsed` list names A's lease, so A's `provisional_for` restarts at 0 and B wins. Both had served only their own CLI meanwhile.
+  - **Three machines, a stale term.** A is provisional at term 7 while B and C elected B at term 8. C restarts and reaches A first: C's `seen_term` is 8, so it does not confirm A while B's term-8 lease is heard of. If B is gone for good, C confirms A after `LEASE + 3 s` without any lease at term 8 or above, and A becomes regular at 9.
 - **Routing never needs exactly one master.** Requests carry their target and travel over any path that reaches it, so a split brain only changes which member relays.
 
 ## Delivery: at-least-once, deduplicated, never twice
 
-Every request that changes something (`start`, `send`, `stop`, `resume`, `notify`, `prune`) has an id: 128 random bits in hex. The CLI generates it once per logical operation, and it stays the same for every retry, including a retry over ssh. Each delivery of it is an *attempt* with its own random attempt id and a sequence number that grows with every attempt the CLI makes for that request. Read-only requests (`ping`, `list`, `doctor_info`) and streams skip the claim store; a stream is identified by its own stream id so that `cancel` can stop it.
+Every request that changes something (`start`, `send`, `stop`, `resume`, `notify`, `prune`) has an id of 32 hex digits: its creation time in milliseconds (48 bits) followed by 80 random bits. The CLI generates it once per logical operation, and it stays the same for every retry, including a retry over ssh. Each delivery of it is an *attempt* with its own random attempt id and a sequence number that grows with every attempt the CLI makes for that request. Read-only requests (`ping`, `list`, `doctor_info`) and streams skip the claim store; a stream is identified by its own stream id so that `cancel` can stop it.
 
 ### The claim store
 
-The claim store is shared by every process on the target machine: `cxd _rpc` children of the agent and `cxd _rpc` processes started over ssh. Each request id has two files in `~/.cxd/dedupe/`: `<id>.json` holds the record, and `<id>.lock` is an flock that every state change holds. Every operation on the store also holds `~/.cxd/dedupe/.store.lock` shared, and pruning holds it exclusively: so a lock file is only ever removed while nobody can hold or wait on it.
+The first record of a claim also stores the operation and a digest of its arguments; an attempt whose operation or arguments differ is refused (`cxd stop … --request-id <the id of a send>` must not return the send's reply as the stop's).
+
+The claim store is shared by every process on the target machine: `cxd _rpc2` children of the agent and `cxd _rpc2` processes started over ssh. Each request id has two files in `~/.cxd/dedupe/`: `<id>.json` holds the record, and `<id>.lock` is an flock that every state change holds. Every operation on the store also holds `~/.cxd/dedupe/.store.lock` shared, and pruning holds it exclusively: so a lock file is only ever removed while nobody can hold or wait on it.
 
 **Making a claim.** The claimant writes the first record to a temporary file and links it to `<id>.json` with `os.link`, which fails if the name already exists. So exactly one attempt creates the claim, and no reader ever sees an empty record.
 
@@ -270,7 +285,7 @@ The claim store is shared by every process on the target machine: `cxd _rpc` chi
 | (none) | `awaiting` (owner: attempt and its sequence number) | an attempt arrives first |
 | `awaiting` | `awaiting` (new owner) | an attempt with a higher sequence number takes it over (below); a stale attempt with a lower one never does |
 | `awaiting` | `running` (pid, identity) | `go` from the owning attempt, before the lapse deadline |
-| `awaiting` | `cancelled` | the lapse deadline passed without `go` (checked by whoever touches the claim next, and by the waiting `_rpc` itself) |
+| `awaiting` | `cancelled` | the lapse deadline passed without `go` (checked by whoever touches the claim next, and by the waiting `_rpc2` itself), or the client's input ended before `go` |
 | `running` | `done` (reply) or `error` | the operation finished; `error` is written in a `finally` |
 | `running` | `unknown` | the executor died before it finished (checked by whoever touches the claim next) |
 
@@ -278,13 +293,17 @@ The claim store is shared by every process on the target machine: `cxd _rpc` chi
 
 ### One attempt, step by step
 
-The same steps run over ssh and over the broker. Over ssh, `SshTransport` speaks them to `ssh <alias> cxd _rpc`. Over the broker, the origin agent relays them, and the target agent speaks them to its local `cxd _rpc` child.
+The same steps run over ssh and over the broker. Over ssh, `SshTransport` speaks them to `ssh <alias> cxd _rpc2`. Over the broker, the origin agent relays them, and the target agent speaks them to its local `cxd _rpc2` child.
 
-0. **Greeting.** A version-2 `_rpc` writes `{"t": "rpc", "v": 2}` before it reads anything, so a client knows within seconds whether it talks to a version-2 host (see Compatibility).
-1. **Request.** The client sends `{"v": 2, "id", "attempt", "seq", "op", "args", "wait"}`. `wait` is the number of seconds the client will still wait for `accepted`. Each relay subtracts the time the request spent with it; time on the wire is not subtracted, which only makes the lapse later, and a late lapse is harmless because no `go` is sent once the client has given up.
-2. **Claim.** `_rpc` creates or examines the claim and answers `accepted`. The claim's lapse deadline is its own clock plus `wait` plus 5 seconds of slack.
-3. **Go: only the CLI decides.** The CLI itself sends `go`, never an agent on its behalf: over the broker it writes `go` to its local agent's socket, which relays it; over ssh it writes it to `_rpc`'s stdin. It does so only while it still waits: its deadline has not passed and its user has not pressed Ctrl-C. From the moment it writes `go`, the CLI counts the request as possibly run. A CLI that gives up before `go` sends nothing more. The claim then lapses, nothing runs, and the CLI's exit 4 (could not reach the host, nothing was decided) stays true.
-4. **Run.** On `go`, `_rpc` moves the claim to `running` and executes. It writes `done` or `error`, then answers with `rep`.
+0. **Entry point and greeting.** Version 2 has its own entry point, `cxd _rpc2`, used over ssh and by the agent for its children; read-only requests keep using `cxd _rpc` (see Compatibility). `_rpc2` writes `{"t": "rpc", "v": 2}` before it reads anything.
+1. **Request.** The client sends `{"t": "req", "v": 2, "id", "attempt", "seq", "op", "args", "wait"}`. `wait` is the number of seconds the client will still wait for `accepted`. Each relay subtracts the time the request spent with it; time on the wire is not subtracted, which only makes the lapse later, and a late lapse is harmless because no `go` is sent once the client has given up.
+2. **Claim.** `_rpc2` creates or examines the claim and answers `accepted`. The claim's lapse deadline is its own clock plus `wait` plus 5 seconds of slack.
+3. **Go: only the CLI decides.** The CLI itself sends `go`, never an agent on its behalf: over the broker it writes `go` to its local agent's socket, which relays it; over ssh it writes it to `_rpc2`'s stdin. It does so only while it still waits: its deadline has not passed and its user has not pressed Ctrl-C. From the moment it writes `go`, the CLI counts the request as possibly run. A CLI that gives up before `go` sends nothing more. The claim then lapses, nothing runs, and the CLI's exit 4 (could not reach the host, nothing was decided) stays true.
+4. **Run.** On `go`, `_rpc2` moves the claim to `running`, answers `{"t": "running"}` at once, and executes. It writes `done` or `error`, then answers with `rep`.
+
+**If the client goes away early.** End of input before `go` means the client gave up: `_rpc2` cancels the claim if this attempt still owns it (under the claim's lock, like any change), so nothing runs, and exits. End of input after `go` changes nothing: the operation runs to its end and its outcome is recorded for a re-issue.
+
+**A lost `go`.** If `running` does not come within 10 seconds of `go` (a link dropped it, or the claim lapsed), the CLI re-issues the same id as a new attempt with a higher sequence number. That is safe whatever happened: the new attempt takes the claim over, waits for it, or learns it was cancelled. An `unreachable` that arrives after `go` is treated the same way, never as exit 4.
 
 **After `go`, the client never reports exit 4.**
 - **A reply lost in transit.** If the link, the relay or the ssh connection breaks after `go`, the client re-issues the same request id as a new attempt, over the broker or over ssh, and gets the recorded outcome (below).
@@ -292,7 +311,7 @@ The same steps run over ssh and over the broker. Over ssh, `SshTransport` speaks
 - **Cancelled.** If the answer to `go` is `cancelled` (the lapse won), nothing ran. The CLI retries once with a new request id if its deadline allows, and otherwise exits 4.
 
 **A second attempt with the same id.** It is answered according to the claim's state:
-- `awaiting`: an attempt with a higher sequence number (the ssh fallback, or a broker retry; the CLI numbers its attempts) takes over ownership, and its `go` runs the operation once. A `go` from an earlier owner is answered as a *duplicate*: the `_rpc` that received it waits for the claim's final state and answers with that, like any second attempt. An attempt with a lower sequence number than the owner's is a duplicate from the start.
+- `awaiting`: an attempt with a higher sequence number (the ssh fallback, or a broker retry; the CLI numbers its attempts) takes over ownership, and its `go` runs the operation once. A `go` from an earlier owner is answered as a *duplicate*: the `_rpc2` that received it waits for the claim's final state and answers with that, like any second attempt. An attempt with a lower sequence number than the owner's is a duplicate from the start.
 - `running`, executor alive: wait for the result.
 - `running`, executor dead: `outcome_unknown`, exit 6.
 - `done`: the recorded reply.
@@ -302,19 +321,19 @@ The same steps run over ssh and over the broker. Over ssh, `SshTransport` speaks
 ### Compatibility, expiry and limits
 
 **Compatibility.** `PROTO` goes up to 2 for this handshake.
-- **A new CLI and an old host.** A version-1 `_rpc` reads its request up to the end of input before it answers, so it would wait forever for a client that keeps stdin open for `go`. The client therefore waits up to 5 seconds for the version-2 greeting. If none comes, it closes stdin: the old `_rpc` then reads the request, refuses it with "protocol mismatch" (as it does today, so an id is never silently dropped), and the CLI reports that the host needs an update. Nothing ran.
+- **A new CLI and an old host.** A version-1 `cxd` does not know `_rpc2`: its argument parser exits at once with status 2 ("invalid choice") without reading its input. So "exit 2 and no greeting" identifies an old host, with no timer at all (a timer would misjudge a slow ssh connection, whose own connect timeout is 10 seconds). The CLI reports that the host needs an update; nothing ran. A version-1 `_rpc` never sees a version-2 request.
 - **Read-only requests and streams** (`ping`, `list`, `doctor_info`, `watch`) need no claim and keep the version-1 framing, so `cxd list`, `cxd doctor` and `cxd watch` keep working against old hosts during an upgrade.
 - **An old CLI and a new host.** A version-2 `_rpc` still accepts version-1 requests, without the handshake or an id, as today.
 
 **Expiry.** Records in a final state (`done`, `error`, `cancelled`, `unknown`) are kept for 24 hours after they reached it, and are pruned with the sessions. `awaiting` and `running` records are never pruned while their deadline or their executor lives. The CLI caps every operation's timeout at 12 hours and refuses `--request-id` for an id it created more than 12 hours ago (the id carries its creation time), so an expired record can never make an operation run twice.
 
-**Loops and replies.** Each request carries `path` (the node ids it went through) and `ttl` (4). A relay never sends a request back to a node already on its path. It never drops a request just because it has seen the id before. Replies go to the origin by node id, over whatever link reaches it at the time, and carry a `ttl` too. Every reply and stream message carries a sequence number per request; the origin passes them to its CLI in order, holding back any that overtook an earlier one (a new direct link can make a later message arrive first), so an `end` can never overtake the exit event before it.
+**Loops and replies.** Each request carries `path` (the node ids it went through) and `ttl` (4). A relay never sends a request back to a node already on its path. It never drops a request just because it has seen the id before. Replies go to the origin by node id, over whatever link reaches it at the time: every per-request frame (`req`, `accepted`, `go`, `running`, `rep`, `stream`, `end`, `error`, `cancel`, `unreachable`) carries `from`, `to`, `path` and `ttl`, so any member can route it, also one that never saw the request. Every reply and stream message carries a number `n`, counted per attempt; the origin passes them to its CLI in order per (request, attempt), holding back any that overtook an earlier one (a new direct link can make a later message arrive first), so an `end` can never overtake the exit event before it. A gap that stays open for 30 seconds counts as a break, and the CLI re-issues or resumes as after any break.
 
-**Timeouts bound delivery, not the operation.** The broker timeout (`broker_timeout`, default 30 s, longer than a failover) limits the wait for `accepted`. After `go`, the call waits with the timeout the CLI already passes for that operation (for example `(grace or 120) + 120` for stop, and the start timeout plus `--init-timeout`).
+**Timeouts bound delivery, not the operation.** The broker timeout (`broker_timeout`, default 30 s, longer than a failover) limits the wait for `accepted`. After `go`, the call waits with the timeout the CLI already uses for that operation: `(grace or 120) + 120` seconds for stop, and the transport's default of 300 seconds for the others.
 
 **Size.** The origin refuses a request whose frame would exceed 7 MiB, with a usage error, instead of retrying it forever.
 
-**Streams.** `watch` resumes from a cursor that the host owns. Every stream message carries the cursor as it stands **after that message**, not after its batch, so a break between two events of one batch loses neither. Within one line of a run's output that yields several events (PR links, then the turn), every event but the last carries a cursor at the start of the line, and the resumed scan reads the line again and skips the PRs it already sent. The final scan at a run's exit reads its reports too, so a report written as a run exits comes before the exit. Over the broker a stream carries `hello`, `event`, `keepalive`, `end` and `error`. `cancel` with the stream id stops it on the target, so reconnects do not leave polling streams behind. After any break, on either transport, the client resumes from its last cursor. Only the owning host can report an exit.
+**Streams.** `watch` resumes from a cursor that the host owns. Every stream message carries the cursor as it stands **after that message**, not after its batch, so a break between two events of one batch loses neither. Within one line of a run's output that yields several events (PR links, then the turn), every event but the last carries a cursor at the start of the line, and the resumed scan reads the line again and skips the PRs it already sent. The final scan at a run's exit reads its reports too, so a report written as a run exits comes before the exit. Over the broker a stream carries `hello`, `event`, `keepalive`, `end` and `error`. `cancel` with the stream id stops it on the target, so reconnects do not leave polling streams behind. Because a `cancel` can be lost too (the origin agent restarted, the path broke), the origin sends a `stream_alive` every 10 seconds for each stream it still reads, and the target agent ends a stream child that has had none for 30 seconds. After any break, on either transport, the client resumes from its last cursor. Only the owning host can report an exit.
 
 **Ordering.** The CLI waits for each reply, so requests from one client to one target run in the order the client issued them. Concurrent clients get no ordering guarantee, the same as over ssh.
 
@@ -345,7 +364,7 @@ The fallback reuses the request id and never sends `cancel` first. The ssh copy 
 
   When the joiner's name matches an existing entry, the command shows that entry and asks before it touches it (it runs at a terminal anyway), because a host of the same name may be another machine.
 - **`cxd init --peer`** still writes `ssh`.
-- **An unknown name** that is a mesh member resolves to the broker.
+- **An unknown name** that is a mesh member resolves to the broker, and `cxd list` and `cxd doctor` include every mesh member, not only the hosts in config.json.
 
 `cxd list`, `cxd doctor` and `cxd watch` show which transport carried each call, for example `via broker (master buildbox)` or `via ssh (broker: no master reachable)`.
 
@@ -357,20 +376,25 @@ The first message on a member link is a `hello` from each side. A mismatched bro
 
 | `t` | Direction | Fields |
 | --- | --- | --- |
-| `hello` | both, first on a link | `v` (broker protocol, 1), `node`, `name`, `version` (cxd), `advertise`, `lease` (the sender's lease view, with `provisional_for`), `grace`, `seen_term`, `links` (node ids it has live links to), `members` (node id to full version), `revoked` (the full set) |
-| `lease` | master to all, forwarded while newer | `term`, `master`, `provisional`, `provisional_for`, `seq`, `remaining` |
-| `lease_ok` | member to master | `term`, `master`, `seq`, `seen_term` |
+| `hello` | both, first on a link | `v` (broker protocol, 1), `node`, `name`, `version` (cxd), `advertise`, `lease` (the sender's lease view, with `incarnation` and `provisional_for`), `lapsed`, `grace`, `seen_term`, `links` (node ids it has live links to), `members` (node id to full version), `revoked` (the full set) |
+| `lease` | master to all, forwarded while newer | `term`, `master`, `incarnation`, `provisional`, `provisional_for`, `seq`, `remaining` |
+| `lease_ok` | member to master | `term`, `master`, `incarnation`, `seq`, `seen_term`, `lapsed` |
+| `links` | any, forwarded while newer | `node`, `links`, `seq` |
 | `state` | master to all, and on request | the replicated state (see Replicated state) |
 | `state_req` | any | ask a peer for its state |
-| `ping` / `pong` | both | `id`; `pong` adds `lease` and `grace` |
+| `ping` / `pong` | both | `id`; `pong` adds `lease`, `lapsed` and `grace` |
 | `part` | both | `id`, `n`, `of`, `data`: one 256 KiB piece of a larger message |
-| `req` | origin to target, via relays | `id`, `attempt`, `seq`, `from`, `to`, `op`, `args`, `wait`, `path`, `ttl` |
+| `req` | origin to target, via relays | `id`, `attempt`, `seq`, `op`, `args`, `wait` |
 | `accepted` | target to origin | `id`, `attempt`, `n` |
 | `go` | the CLI, relayed to the target | `id`, `attempt`: the CLI still waits, so run it |
+| `running` | target to origin | `id`, `attempt`, `n`: `go` arrived and the operation runs |
 | `unreachable` | any node to the origin | `id`, `at` (the node with no next hop) |
-| `rep` | target to origin | `id`, `attempt`, `n`, `ttl`, `ok`, then `result`, or `error` and `code` (`cancelled`, `outcome_unknown`, or an operation error) |
-| `stream` / `end` / `error` | target to origin | `id`, `n`, `ttl`, `msg` (one `state.stream()` message) or `error` |
+| `rep` | target to origin | `id`, `attempt`, `n`, `ok`, then `result`, or `error` and `code` (`cancelled`, `outcome_unknown`, or an operation error) |
+| `stream` / `end` / `error` | target to origin | `id`, `n`, `msg` (one `state.stream()` message) or `error` |
 | `cancel` | origin to target | a stream id: stop the stream |
+| `stream_alive` | origin to target | a stream id: the origin still reads it |
+
+Every per-request frame (from `req` to `stream_alive`) also carries `from`, `to`, `path` and `ttl`.
 | `join`, `nonce`, `reveal`, `accepted_join`, `confirmed`, `joined` | join connection only | see Pairing |
 | `accept`, `remove`, `priority`, `pending_drop` | any member to master | the change; `remove` also applies locally at once |
 
@@ -382,7 +406,7 @@ The local unix socket uses the same framing with two requests:
 - `call` (`op`, `args`, `to`, `id`, `attempt`, `seq`, `wait`) is answered by `accepted`, after which the CLI writes `go` itself (or nothing, if it gave up), and then `rep`; or by `unreachable`;
 - `open` (a stream) is answered by `stream`, then `end` or `error`.
 
-Between a client and `cxd _rpc` (over ssh, or from the agent to its child), version 2 carries the request, then `accepted`, `go` and `rep` as single lines on stdin and stdout.
+Between a client and `cxd _rpc2` (over ssh, or from the agent to its child), version 2 carries the greeting, the request, `accepted`, `go`, `running` and `rep` as single lines on stdin and stdout.
 
 ## Command line and configuration
 
@@ -434,7 +458,7 @@ New keys in `~/.cxd/config.json`:
 | Someone on the network connects to an agent port | Mutual TLS with pinned member certificates. A connection without a certificate can only attempt a join. It gets tight frame limits, at most 4 frames, and a rate limit per address. |
 | Someone joins themselves | A join stays pending until a human, at a terminal on a member, accepts the code that the joining machine shows. The code is unguessable: 50 bits, a 10-minute expiry, at most 5 pending joins, refused rather than evicted when full. |
 | A man in the middle during pairing | The codes bind both TLS certificates as each side saw them, and the nonces are committed before they are revealed. A man in the middle produces different codes on the two sides and cannot grind them into agreement. The joiner installs a mesh only after the human types the confirmation code that a real member showed on accepting, so a man in the middle cannot pull the joiner into a mesh of its own. |
-| A prompt-injected Claude session pairs or edits the mesh ("run `cxd accept …`", "run `cxd join attacker:47100`") | join, accept, remove and priority require input read from `/dev/tty`, and the agent itself accepts these changes only from a socket peer that has a controlling terminal, so neither the CLI from Claude Code's Bash tool (no terminal) nor a raw write to the socket works. A session that is induced to allocate a pty on purpose gets around this gate. If the attacker also controls the joining machine, no human needs to read anything, so that session can admit the attacker's machine: the gate stops a session that only runs commands, not one that writes and runs terminal emulation on purpose. Treat any prompt that asks for `cxd accept` or `cxd join` as an attack. |
+| A prompt-injected Claude session pairs or edits the mesh ("run `cxd accept …`", "run `cxd join attacker:47100`") | join, accept, remove and priority require input read from `/dev/tty`, and the agent itself accepts these changes only from a socket peer that has a controlling terminal, so neither the CLI from Claude Code's Bash tool (no terminal) nor a raw write to the socket works. A session that is induced to allocate a pty on purpose, or to drive an existing terminal (`tmux send-keys`, `screen -X stuff`, `osascript`), gets around this gate. If the attacker also controls the joining machine, no human needs to read anything, so that session can admit the attacker's machine: the gate stops a session that only runs commands, not one that writes and runs terminal emulation on purpose. Treat any prompt that asks for `cxd accept` or `cxd join` as an attack. |
 | A stolen member key | `cxd members remove` on any member revokes the key locally at once. The revocation spreads in every hello and state message, and nothing can undo it. Lease and state messages from or naming a revoked node are ignored. The key file is mode 600, so stealing it requires your user account on that machine. |
 | A malicious or compromised member | Out of scope by definition, because a member is you. Revoke it as above. Relays see request contents; they are members too. |
 | Replay of captured traffic | TLS prevents replay on the wire. A replayed request id is answered from the claim store and never executed again. |
@@ -451,19 +475,19 @@ New keys in `~/.cxd/config.json`:
 - **A stolen key before it is revoked** can act as a member, including revoking the real members permanently. Revocation cannot be undone, so recovery is re-pairing the machines with new keys. A member is you, so this is equivalent to a compromised account.
 - **Split brain.** A partition that separates groups of members can briefly produce two masters. That only affects which member relays, and healing is deterministic.
 - **Confirming codes without checking them.** A human who accepts a join code they did not check on the joining machine admits whatever machine produced it. `accept` therefore shows the joiner's name, address and fingerprint before it asks for confirmation.
-- **A pty on purpose.** As in the table: a Claude session that allocates a pty on purpose, with an attacker who controls the joining machine, can admit that machine.
+- **A pty on purpose.** As in the table: a Claude session that allocates a pty, or drives an existing terminal, on purpose, with an attacker who controls the joining machine, can admit that machine.
 
 ## Testing and evidence
 
 **Unit tests.** All of them run agents on localhost under separate `CXD_HOME`s, ports and identities, with the stub claude. The lease logic takes its clock as a parameter, so tests can simulate sleep and step the clock.
 - certificate generation and pinning with several members (done, `tests/test_broker.py`);
 - framing limits;
-- the claim store: an atomic claim; every change in the table, including the race between `go` and the lapse, run from separate processes; a duplicate while awaiting or running; takeover only by a higher sequence number; an executor that died; the takeover by an ssh copy; pruning under the store lock; the store shared by `_rpc` over ssh and the agent's children;
-- the `_rpc` version-2 handshake over a fake ssh: the greeting; exit 4 only before `go`, exit 6 after it with the request id printed, `--request-id` returning the recorded outcome, re-issue after a break; a version-2 client against a version-1 host (the greeting times out, the host refuses, nothing ran) and the reverse; read-only requests against a version-1 host;
-- the join and confirmation codes, including a simulated man in the middle that sends its own `accepted_join` and `joined`, a grinding attempt, a wrong confirmation code, and a joiner that drops before `confirmed` (no member trusts it);
+- the claim store: an atomic claim; every change in the table, including the race between `go` and the lapse, run from separate processes; a duplicate while awaiting or running; takeover only by a higher sequence number; an attempt for another operation refused; an executor that died; the takeover by an ssh copy; pruning under the store lock; the store shared by `_rpc2` over ssh and the agent's children;
+- the `_rpc2` handshake over a fake ssh: the greeting; `running` after `go`; end of input before `go` cancels; exit 4 only before `go`, exit 6 after it with the request id printed; `--request-id` returning the recorded outcome, and refused for another command or an id older than 12 hours; a lost `go` re-issued; re-issue after a break; a version-2 client against a version-1 host (exit 2 at once, no greeting, nothing ran) and an old client against a new host; read-only requests against a version-1 host;
+- the join and confirmation codes, including a simulated man in the middle that sends its own `accepted_join` and `joined`, a grinding attempt, a wrong confirmation code, a joiner that drops before `confirmed` (no member trusts it), a `confirmed` sent before any `accept` (dropped, never committed: its test has a mutation), a revoked node id and invalid names refused, and `join --reset`;
 - the `/dev/tty` requirement, in the CLI and in the agent's check of its socket peer;
-- the lease and election, with an injected clock: a lapse, priority order, the pre-vote, the confirmation rule and `seen_term`, a simulated sleep of the master by the lease clock and by the wall clock alone (WSL2), a start from a state file that says "master", no preemption after a restart, a reconnect or a sleep, provisional promotion when alone and its upgrade, two provisional masters deciding from their `hello` pair, healing in the comparison order, sticky revocation, a name conflict after a split;
-- relaying, `unreachable` from a relay, retries through the same master, replies by node id put back in order, and `part` frames with control frames between them;
+- the lease and election, with injected clocks: a lapse, priority order, the pre-vote, the confirmation rule; `seen_term`, including a master of that term that never comes back; wakes by the lease clock and by the wall clock alone; a WSL2 master whose wall clock is corrected only after it reconnects (the lapse witness decides); incarnations after a restart; a start from a state file that says "master"; no preemption after a restart, a reconnect or a sleep; provisional promotion when alone and its upgrade on an existing link; two provisional masters deciding from their `hello` pair, and through a third member; healing in the comparison order; sticky revocation; a name conflict after a split; membership versions with the regular flag;
+- relaying, `unreachable` from a relay, retries through the same master, replies routed by a member that never saw the request, replies put back in order per attempt (and a gap that stays open), `part` frames with control frames between them, `links` updates, and a stream child ended when its `stream_alive` stops;
 - the `auto` transport and the ssh fallback;
 - watch resuming across a transport switch, and per-message cursors (done, `TestExitRecord`).
 
@@ -484,7 +508,7 @@ A third agent, under its own `CXD_HOME` and port on one of the machines, then sh
 
 1. This design document.
 2. `lib/cxd/broker/identity.py`: key and certificate generation (explicit openssl config, early start, lock, pair check), fingerprints, the trust bundle, the TLS contexts and `classify()`, checked against LibreSSL on macOS. *(Pull request #19.)*
-3. `lib/cxd/broker/wire.py` for framing, and `lib/cxd/dedupe.py` for the claim store (atomic claim, locked changes, attempt sequence numbers, go, lapse, done, error, cancelled, unknown, the store lock for pruning) *(pull request #20)*; then wired into `cxd _rpc` (PROTO 2 with the greeting and the handshake, version 1 still accepted, read-only requests in version 1), with request and attempt ids in `SshTransport`, exit 6 and `--request-id`.
+3. `lib/cxd/broker/wire.py` for framing, and `lib/cxd/dedupe.py` for the claim store (atomic claim, locked changes, attempt sequence numbers, go, lapse, done, error, cancelled, unknown, the store lock for pruning) *(pull request #20)*; then wired into a new `cxd _rpc2` (the greeting, the handshake, `running`, cancel on early end of input; `cxd _rpc` stays for version 1 and read-only requests), with time-stamped request ids, attempt ids and sequence numbers in `SshTransport` (whose stderr goes to a file, issue #2), exit 6 and `--request-id`.
 4. The agent core: the lock, the local socket, links with liveness pings, `hello`, executing requests through `cxd _rpc` children, relaying by path, and replies by node id, with a static master.
 5. Pairing: `cxd join` and `cxd accept`, commit and reveal, the join and confirmation codes, pending joins, and the `/dev/tty` requirement.
 6. The lease and election: the sleep-counting clock, grace, pre-vote, confirmation and step-down, provisional promotion, healing, sticky revocation, and `cxd members`.
