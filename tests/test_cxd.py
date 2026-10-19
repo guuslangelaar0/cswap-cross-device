@@ -816,6 +816,58 @@ class TestExitRecord(Base):
         self.assertEqual([e["ev"] for e in events], ["turn"] * 10 + ["exit"])
         self.assertEqual((events[-1]["turns"], events[-1]["cost_usd"]), (10, 0.1))
 
+    def test_the_poll_that_ends_the_wait_keeps_it_in_its_events(self):
+        """GUARD exit-wait-kept. Mutation: the wait is dropped before the scan
+        -> a client that drops after a turn from the poll whose wait ran out
+        starts the whole wait again before it hears of the exit."""
+        from cxd import state
+        d = self.fake_run("wv", supervisor_alive=True)  # it hangs: never writes exit.json
+        with self.home_env(), mock.patch.object(state, "EXIT_RECORD_WAIT", 0.3):
+            events, cur = state.poll("wv", {})
+            self.assertEqual(events, [])
+            self.add_lines(d, [{"type": "result", "subtype": "success", "result": "MARK-LAST"}])
+            time.sleep(0.4)
+            events, cur = state.poll("wv", cur)
+            self.assertEqual([e["ev"] for e in events], ["turn", "exit"])
+            rest, _ = state.poll("wv", json.loads(json.dumps(events[0]["_cursor"])))
+        self.assertEqual([e["ev"] for e in rest], ["exit"])
+
+    def test_a_line_longer_than_a_chunk_is_read_or_skipped(self):
+        """GUARD long-line. Mutation: a line longer than the chunk stops the
+        scan -> the cursor never moves past it: later events are never sent,
+        and the exit comes with too few turns."""
+        from cxd import state
+        big_user = {"type": "user", "message": {"content": "x" * 1500}}
+        big_result = {"type": "result", "subtype": "success", "result": "MARK-BIG " + "y" * 1500}
+        self.run_with_lines("wg", [{"type": "result", "subtype": "success", "result": "MARK-1"}, big_user,
+                                   big_result, {"type": "result", "subtype": "success", "result": "MARK-2"}])
+        with self.home_env(), mock.patch.object(state, "SCAN_CHUNK", 300):
+            events, _ = state.poll("wg", {})
+        self.assertEqual([(e["ev"], str(e.get("result", ""))[:8]) for e in events],
+                         [("turn", "MARK-1"), ("turn", "MARK-BIG"), ("turn", "MARK-2"), ("exit", "")])
+        self.assertEqual(events[-1]["turns"], 3)
+
+    def test_a_watch_started_late_skips_everything_already_written(self):
+        """GUARD watch-start-drain. Mutation: positioning reads one chunk -> a
+        watch started on a long live run replays old turns as new."""
+        from cxd import state
+        d = self.run_with_lines("wl2", [{"type": "result", "subtype": "success", "result": "MARK-OLD-%d" % i}
+                                        for i in range(10)], claude=self.live_claude())
+        seen = []
+        with self.home_env(), mock.patch.object(state, "SCAN_CHUNK", 300):
+            t0 = time.time()
+            for m in state.stream({"target": "wl2", "interval": 0.1, "heartbeat": 3600, "keepalive": 0.2}):
+                if m.get("type") == "event" and m["event"]["ev"] == "turn":
+                    seen.append(m["event"]["result"])
+                    if "MARK-NEW" in m["event"]["result"]:
+                        break
+                if time.time() - t0 > 1.0 and not os.path.exists(os.path.join(d, "added")):
+                    open(os.path.join(d, "added"), "w").close()
+                    self.add_lines(d, [{"type": "result", "subtype": "success", "result": "MARK-NEW"}])
+                if time.time() - t0 > 10:
+                    break
+        self.assertEqual(seen, ["MARK-NEW"])
+
     def test_a_long_run_is_read_a_chunk_per_poll_while_it_lives(self):
         from cxd import state
         self.run_with_lines("wk", [{"type": "result", "subtype": "success", "result": "MARK-%d" % i}

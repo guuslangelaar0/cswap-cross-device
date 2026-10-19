@@ -530,14 +530,22 @@ def _scan_out(out, cur, emit, drain=False):
         with open(out, "rb") as f:
             f.seek(off)
             chunk = f.read(min(size - off, SCAN_CHUNK))
-        end = chunk.rfind(b"\n")
+            end = chunk.rfind(b"\n")
+            if end < 0 and len(chunk) == SCAN_CHUNK:
+                line, length = _long_line(f, chunk)  # GUARD:long-line
+                if line is None and length >= 0:  # skipped: it gives no events
+                    cur.pop("out_skip", None)
+                    cur["out"] = off + length + 1
+                    continue
+                if line is not None:
+                    chunk, end = line, length
         if end < 0:
-            return
+            return  # an incomplete last line: read it once it is complete
         for raw in chunk[: end + 1].split(b"\n")[:-1]:
             skip = cur.pop("out_skip", 0)
-            ev = _parse(raw.decode("utf-8", "replace"))
-            # Only these lines can give several events; copy the state for them.
-            before = json.loads(json.dumps(cur)) if ev and ev.get("type") in ("assistant", "result") else None
+            ev = _parse(raw.decode("utf-8", "replace")) if raw else None
+            # Only a line with a PR link can give several events; copy the state for those.
+            before = json.loads(json.dumps(cur)) if ev and b"github.com/" in raw else None
             line_events = []
             if ev:
                 _scan_line(ev, cur, line_events.append)
@@ -551,6 +559,31 @@ def _scan_out(out, cur, emit, drain=False):
                     emit(e)
         if not drain:
             return
+
+
+def _long_line(f, head):
+    """A line longer than SCAN_CHUNK starts with head (f is positioned after
+    it): find its end. A line that can give events (a result, assistant text,
+    init) is read whole; any other (a replayed tool result with screenshots,
+    say) is only measured. Returns (line or None, its length), or (None, -1)
+    while the line is still being written."""
+    kinds = (b'"type":"result"', b'"type":"assistant"', b'"type":"system"',
+             b'"type": "result"', b'"type": "assistant"', b'"type": "system"')
+    keep = any(k in head[:4096] for k in kinds)
+    parts, length = [head] if keep else [], len(head)
+    while True:
+        block = f.read(SCAN_CHUNK)
+        if not block:
+            return None, -1
+        nl = block.find(b"\n")
+        if nl >= 0:
+            if keep:
+                parts.append(block[: nl + 1])
+                return b"".join(parts), length + nl
+            return None, length + nl
+        length += len(block)
+        if keep:
+            parts.append(block)
 
 
 def _add_pr(cur, url, emit):
@@ -646,7 +679,7 @@ def run_cost(cur):
     return round(sum((cur.get("gen_costs") or {}).values()), 6)
 
 
-def poll(target, cur):
+def poll(target, cur, drain=False):
     """One scan. Returns (events, cursor). Emits 'exit' once, from host state only.
     Each event carries, under "_cursor", the cursor to resume from right after
     that event: a client that loses the stream between two events of one scan
@@ -691,12 +724,12 @@ def poll(target, cur):
                 waiting = waited < EXIT_RECORD_WAIT  # GUARD:exit-rc-cap
             if not waiting:
                 ex = ex or _exit_record(d, gen)  # written just before the supervisor exited?
-                cur.pop("exit_wait", None)
                 exit_ev = {"ev": "exit", "rc": ex.get("rc"), "gen": gen}
         # Before an exit, read to the end: watch ends at the exit.
-        _scan_run(d, meta, cur, emit, drain=exit_ev is not None)  # GUARD:exit-drain
+        _scan_run(d, meta, cur, emit, drain=drain or exit_ev is not None)  # GUARD:exit-drain
         if exit_ev:
             cur["exit_gen"] = exit_ev["gen"]
+            cur.pop("exit_wait", None)  # after the scan: its events keep the wait (a resume reports at once)
             exit_ev.update(turns=cur.get("turns", 0), cost_usd=run_cost(cur))
             emit(exit_ev)
     else:
@@ -735,7 +768,7 @@ def stream(args):
         if args.get("from_start"):
             cur = {}
         else:
-            _, cur = poll(target, {"exit_gen": None})
+            _, cur = poll(target, {"exit_gen": None}, drain=True)  # GUARD:watch-start-drain
             cur.pop("exit_gen", None)
             cur.pop("exit_reported", None)
         st = status_of(target, cur)
