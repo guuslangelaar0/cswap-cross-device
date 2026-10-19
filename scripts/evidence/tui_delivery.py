@@ -446,8 +446,11 @@ class Driver(object):
             self.type_prompt("Write the numbers from 1 to 5000, one per line, nothing else.")
             self.wait(lambda: self._streaming(n0), 60, "the answer to start streaming", step=0.1)
             self.keys("Escape")
-            time.sleep(6)
-            if self.stop_count() == stops:  # no Stop record: the turn was interrupted
+            # Wait until the turn is over (the spinner is gone), then judge by
+            # the Stop record: an interrupted turn writes none.
+            self.wait(lambda: self._turn_over(), 150, "the turn to end after Esc", step=0.5)
+            time.sleep(3)
+            if self.stop_count() == stops:
                 self.prompts -= 1
                 break
             self.note("attempt %d: the answer ended (with a Stop) before Esc reached it; again" % attempt)
@@ -478,6 +481,15 @@ class Driver(object):
         pane = self.pane()
         return (len(re.findall(r"(?m)^\s*\d+\s*$", pane)) >= 3 or bool(re.search(r"\u2193 [\d.]+k? tokens", pane))
                 or len(self.assistant_texts()) > n0)
+
+    def _turn_over(self, quiet=2.0):
+        """No spinner on screen for `quiet` seconds."""
+        deadline = time.time() + quiet
+        while time.time() < deadline:
+            if re.search(r"\u2193 [\d.]+k? tokens|\(\d+s \u00b7", self.pane()):
+                return False
+            time.sleep(0.3)
+        return True
 
     def _new_record(self, old_sid):
         d = os.path.join(self.home, "sessions")
