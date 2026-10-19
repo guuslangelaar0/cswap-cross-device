@@ -572,8 +572,8 @@ MUTATIONS = [
     {
         "name": "hook-python",
         "what": "the hook wrapper takes /usr/bin/python3 first (on macOS: 3.9 behind the xcrun shim, about three times slower)",
-        "edits": [("hooks/cxd-hook", "  for c in /opt/homebrew/bin/python3 /usr/bin/python3; do  # GUARD:hook-python\n",
-                   "  for c in /usr/bin/python3 /opt/homebrew/bin/python3; do  # GUARD:hook-python\n")],
+        "edits": [("hooks/cxd-hook", '    if [ -x "$c" ]; then py=$c; break; fi\n  done\n  [ -n "$py" ] || py=python3\n',
+                   '    if [ -x "$c" ]; then py=$c; fi  # MUTATION\n  done\n  [ -n "$py" ] || py=python3\n')],
         "tests": [T + "TestHooks.test_the_wrapper_prefers_a_fast_stable_interpreter"],
         "expect": "red",
     },
