@@ -400,11 +400,11 @@ def _announce(data, fresh_tag=False):
 WAKE_SECONDS = 86400 - 600
 WAKE_POLL = 1.0
 WAKE_DELIVERED = 42  # hooks/cxd-hook turns this, and only this, into exit 2
-START_SLACK = 0.1
+REGISTER_WAIT = 10.0  # how long a SessionStart waker waits for its session's registration
 # Claude Code shows the waker's output as Stop hook feedback ("Stop hook
 # blocking error from command ..."): say what it is.
-WAKE_PREAMBLE = ("This is not an error. cxd (the cswap-cross-device plugin) delivers a message from the user's "
-                 "lead session that arrived while this session was idle at its prompt:\n\n")
+WAKE_PREAMBLE = ("This is not an error. cxd (the cswap-cross-device plugin) delivers messages that arrived "
+                 "while this session was idle at its prompt:\n\n")
 MIN_CLAUDE_FOR_WAKER = (2, 1, 287)
 
 
@@ -437,7 +437,10 @@ def _exe_path(pid):
     except OSError:
         pass
     if sys.platform == "darwin":
-        import ctypes
+        try:
+            import ctypes
+        except ImportError:
+            return None
         for lib in ("/usr/lib/libproc.dylib", "/usr/lib/libSystem.B.dylib"):
             try:
                 buf = ctypes.create_string_buffer(4096)
@@ -512,24 +515,29 @@ def is_idle(sid):
     return idle > busy  # GUARD:wake-tie-busy
 
 
-def _record_since(sid, t0):
-    """The session record, if it was written at or after t0 (an older one may
-    be from a previous run of the same session id), else None."""
-    p = path("sessions", sid + ".json")
-    rec = read_json(p, None)
-    try:
-        return rec if isinstance(rec, dict) and os.stat(p).st_mtime >= t0 else None
-    except OSError:
-        return None
-
-
-def _gone(sid, t0, pid, ident):
-    """The session ended, or another process took it over (a resume
-    elsewhere), since t0; or its claude is gone."""
-    rec = _record_since(sid, t0)
-    if rec and (rec.get("ended") or rec.get("pid") not in (None, pid)):  # GUARD:wake-moved
+def _gone(sid, pid, ident):
+    """This waker's process no longer hosts the session: the session record
+    names another process (the session was resumed elsewhere, also when this
+    waker started after that), the session ended, or this claude is gone.
+    (Only asked once the record named this process: see _registered.)"""
+    rec = read_json(path("sessions", sid + ".json"), None)
+    if not isinstance(rec, dict) or rec.get("pid") != pid or rec.get("ended"):  # GUARD:wake-moved
         return True
     return not proc_alive(pid, ident)
+
+
+def _registered(sid, pid, ident, event, deadline):
+    """Whether the session record names this waker's process. A waker that
+    SessionStart started runs alongside the hook that registers the session,
+    so it waits for that (bounded); any later waker needs it at once."""
+    give_up = time.monotonic() + (REGISTER_WAIT if event == "SessionStart" else 0)
+    while True:
+        rec = read_json(path("sessions", sid + ".json"), None)
+        if isinstance(rec, dict) and rec.get("pid") == pid and not rec.get("ended"):  # GUARD:wake-own-record
+            return True
+        if time.monotonic() >= min(give_up, deadline) or not proc_alive(pid, ident):
+            return False
+        time.sleep(0.2)
 
 
 def _release(sid, claims):
@@ -542,42 +550,51 @@ def _release(sid, claims):
             pass
 
 
+def _waker_gate():
+    """(pid, ident) of this hook's claude when it gets an idle waker: idle_wake
+    on, an interactive Claude Code of a version known to run asyncRewake hooks
+    in the background, its identity readable. Else None. SessionStart asks
+    the same question to decide whether to leave queued mail to the waker."""
+    from .common import load_config
+    if load_config().get("idle_wake") is False:
+        return None
+    pid, argv = _claude_process()
+    if not pid:
+        return None  # without its claude process the waker can neither stay safe nor know when to leave
+    if not _interactive(argv):  # GUARD:wake-interactive-only
+        return None  # `claude -p`: an asyncRewake hook may run synchronously there
+    version = _claude_version(pid, argv)
+    if version is None or version < MIN_CLAUDE_FOR_WAKER:  # GUARD:wake-version
+        return None  # an older (or unknown) Claude Code may not run it in the background
+    ident = proc_identity(pid)
+    return (pid, ident) if ident else None
+
+
 def wake(data):
-    # An end of the session after this counts. File times come from a coarse
-    # clock that can lag time.time() by a tick: allow for it (a real earlier
-    # end, before a resume, is at least a claude start older).
-    started = time.time() - START_SLACK
+    deadline = time.monotonic() + WAKE_SECONDS  # the whole life, the wait for the lock included
     sid = data.get("session_id")
     if not isinstance(sid, str) or not SID_RE.match(sid):
         return 0
+    gate = _waker_gate()
+    if gate is None:
+        return 0
+    pid, claude_ident = gate
+    if not _registered(sid, pid, claude_ident, data.get("hook_event_name"), deadline):
+        return 0  # the session is (now) hosted by another process
+    if _wake_lock(sid, pid, claude_ident, deadline) is None:
+        return 0
     from .common import load_config
-    if load_config().get("idle_wake") is False:
-        return 0
-    pid, argv = _claude_process()
-    if not pid:
-        return 0  # without its claude process the waker can neither stay safe nor know when to leave
-    if not _interactive(argv):  # GUARD:wake-interactive-only
-        return 0  # `claude -p`: an asyncRewake hook may run synchronously there
-    version = _claude_version(pid, argv)
-    if version is None or version < MIN_CLAUDE_FOR_WAKER:  # GUARD:wake-version
-        return 0  # an older (or unknown) Claude Code may not run it in the background
-    claude_ident = proc_identity(pid)
-    if not claude_ident:
-        return 0
-    if _wake_lock(sid, pid, claude_ident, started) is None:
-        return 0
     check_every = float(os.environ.get("CXD_WAKE_CHECK_S") or 10)
-    deadline = time.monotonic() + WAKE_SECONDS
     next_check = 0.0
     inbox, claimed = path("inbox", sid), path("claimed", sid)
     while time.monotonic() < deadline:
         if time.monotonic() >= next_check:
             next_check = time.monotonic() + check_every
             if (not os.path.isdir(path()) or not _wrapper_alive() or load_config().get("idle_wake") is False
-                    or _gone(sid, started, pid, claude_ident)):
+                    or _gone(sid, pid, claude_ident)):
                 return 0  # GUARD:wake-leave
         if (_has_json(inbox) or _has_json(claimed)) and is_idle(sid):  # GUARD:wake-idle-only
-            if _gone(sid, started, pid, claude_ident):  # GUARD:wake-recheck
+            if _gone(sid, pid, claude_ident):  # GUARD:wake-recheck
                 return 0
             tag = session_tag(sid)
             if not tag:  # GUARD:wake-tag
@@ -598,12 +615,13 @@ def wake(data):
     return 0
 
 
-def _wake_lock(sid, pid, ident, started):
+def _wake_lock(sid, pid, ident, deadline):
     """Take the session's waker lock and write this waker's claude pid in it.
     None when another waker of the same claude process already waits. A
-    waker of another process (the session was resumed elsewhere, and that
-    waker has not noticed yet) is waited for: it leaves within its check
-    interval. Meanwhile this waker leaves for its own reasons as usual."""
+    waker of another process (the session was resumed here from there, and
+    that waker has not noticed yet) is waited for: it leaves at its next
+    check, since the session record no longer names its process. Meanwhile
+    this waker leaves for its own reasons as usual, and at its deadline."""
     import fcntl
     p = os.path.join(ensure_dir(path("wake")), sid + ".lock")
     fd = os.open(p, os.O_RDWR | os.O_CREAT, 0o600)
@@ -616,30 +634,28 @@ def _wake_lock(sid, pid, ident, started):
         try:
             holder = json.loads(os.pread(fd, 256, 0).decode("utf-8") or "{}")
         except (OSError, ValueError):
-            holder = {}
-        if not isinstance(holder, dict) or holder.get("pid") in (None, pid):  # GUARD:wake-same-process
+            holder = {}  # being written (truncated, not yet filled): look again
+        if isinstance(holder, dict) and holder.get("pid") == pid:  # GUARD:wake-same-process
             os.close(fd)
-            return None  # a waker of this process (or one that has not said whose it is yet)
+            return None  # a waker of this process already waits
         from .common import load_config
-        if not _wrapper_alive() or load_config().get("idle_wake") is False or _gone(sid, started, pid, ident):
+        if (time.monotonic() >= deadline or not _wrapper_alive() or load_config().get("idle_wake") is False
+                or _gone(sid, pid, ident)):  # GUARD:wake-lock-leave
             os.close(fd)
             return None
         time.sleep(WAKE_POLL)
-    os.ftruncate(fd, 0)
+    os.ftruncate(fd, 0)  # GUARD:wake-lock-truncate
     os.pwrite(fd, json.dumps({"pid": pid}).encode("utf-8"), 0)
     return fd
 
 
 def _waker_will_run():
-    """Whether this session (from a hook) gets an idle waker."""
-    from .common import load_config
-    if load_config().get("idle_wake") is False:
+    """Whether this session (from a hook) gets an idle waker: the waker's own
+    gate. Never raises (SessionStart must go on)."""
+    try:
+        return _waker_gate() is not None
+    except Exception:
         return False
-    pid, argv = _claude_process()
-    if not pid or not _interactive(argv):
-        return False
-    version = _claude_version(pid, argv)
-    return version is not None and version >= MIN_CLAUDE_FOR_WAKER
 
 
 def _has_json(d):
@@ -687,7 +703,7 @@ def main(event):
             sys.stdout.write(json.dumps(out))
             sys.stdout.flush()
             # Unless our hook wrapper was killed (a timeout): then nobody reads this output.
-            handed_over = os.getppid() == parent
+            handed_over = os.getppid() == parent  # GUARD:stop-handover-parent
         except Exception:
             pass  # not handed over: no ack, so the messages come again
         if handed_over and claims:

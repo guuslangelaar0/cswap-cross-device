@@ -2114,17 +2114,24 @@ if [ -z "$NO_REGISTER" ]; then
 fi
 # The hooks are children of this process itself (no subshell that also looks
 # like claude), as with Claude Code.
-payload=$(printf '{"session_id": "%s", "hook_event_name": "Stop", "transcript_path": "%s"}' "$sid" "$OUTDIR/transcript.jsonl")
+payload=$(printf '{"session_id": "%s", "hook_event_name": "%s", "transcript_path": "%s"}' "$sid" "${WAKE_EVENT:-Stop}" "$OUTDIR/transcript.jsonl")
 printf '%s' "$payload" | /bin/sh -c '"$HOOK" Wake' > "$OUTDIR/wake.out" 2> "$OUTDIR/wake.err" &
 w1=$!
-if [ -n "$SECOND_WAKE" ]; then  # a second waker of this same process (another Stop)
-  sleep 1
-  printf '%s' "$payload" | /bin/sh -c '"$HOOK" Wake' > "$OUTDIR/wake2.out" 2> "$OUTDIR/wake2.err"
-  echo $? > "$OUTDIR/wake2.rc"
-fi
+w2=
+t2=
+# A second waker of this same process (another Stop), SECOND_WAKE_DELAY seconds in.
+[ -n "$SECOND_WAKE" ] && t2=$(( $(date +%s) + ${SECOND_WAKE_DELAY:-1} ))
 while [ ! -e "$OUTDIR/exit" ]; do
+  if [ -n "$t2" ] && [ "$(date +%s)" -ge "$t2" ]; then
+    printf '%s' "$payload" | /bin/sh -c '"$HOOK" Wake' > "$OUTDIR/wake2.out" 2> "$OUTDIR/wake2.err" &
+    w2=$!
+    t2=
+  fi
   if [ -n "$w1" ] && ! kill -0 "$w1" 2>/dev/null; then
     wait "$w1"; echo $? > "$OUTDIR/wake.rc"; w1=
+  fi
+  if [ -n "$w2" ] && ! kill -0 "$w2" 2>/dev/null; then
+    wait "$w2"; echo $? > "$OUTDIR/wake2.rc"; w2=
   fi
   sleep 0.1
 done
@@ -2299,25 +2306,119 @@ class TestIdleWaker(Base):
             time.sleep(0.2)
         self.assertTrue(self.lock_free(sid2))
 
-    def test_an_end_from_before_the_waker_started_is_ignored(self):
-        # A resume re-registers the session, but the waker may read the old
-        # record (ended set) first: an end older than the waker does not count.
+    def register_for(self, sid, p, **extra):
+        from cxd.common import atomic_write_json, proc_identity
+        os.makedirs(os.path.join(self.local, "sessions"), mode=0o700, exist_ok=True)
+        rec = {"session_id": sid, "pid": p.pid, "pid_ident": proc_identity(p.pid), "tag": "t0t0t0t0t0t0"}
+        rec.update(extra)
+        atomic_write_json(os.path.join(self.local, "sessions", sid + ".json"), rec)
+
+    def test_a_session_start_waker_waits_for_its_registration(self):
+        """GUARD wake-own-record. Mutation: the waker does not wait to see its
+        own process in the session record -> at a resume it reads the record of
+        the previous run (ended, another process) and leaves, and the mail
+        SessionStart left to it waits for the next prompt."""
         from cxd.common import atomic_write_json
         sid = "a6a6a6a6-2222-3333-4444-555555555555"
+        gone = subprocess.Popen(["true"])
+        gone.wait()
         os.makedirs(os.path.join(self.local, "sessions"), mode=0o700, exist_ok=True)
-        rec_p = os.path.join(self.local, "sessions", sid + ".json")
-        atomic_write_json(rec_p, {"session_id": sid, "ended": "2026-01-01T00:00:00+0000", "tag": "t0t0t0t0t0t0"})
-        os.utime(rec_p, (time.time() - 60,) * 2)
+        atomic_write_json(os.path.join(self.local, "sessions", sid + ".json"),
+                          {"session_id": sid, "pid": gone.pid, "ended": "2026-01-01T00:00:00+0000", "tag": "t0"})
         os.makedirs(os.path.join(self.local, "turn"), mode=0o700, exist_ok=True)
-        open(os.path.join(self.local, "turn", sid + ".idle"), "w").close()  # the resume's SessionStart
-        p = self.claude(sid, env={"NO_REGISTER": "1"})
-        time.sleep(1.5)
-        self.assertIsNone(self.wake_rc(p, timeout=0.5))
-        inbox = os.path.join(self.local, "inbox", sid)
-        os.makedirs(inbox, mode=0o700)
-        with open(os.path.join(inbox, "0000000000000000001-000001.json"), "w") as f:
-            json.dump({"id": "0000000000000000001-000001", "ts": "t", "sender": "s", "text": "MARK-RESUMED"}, f)
+        open(os.path.join(self.local, "turn", sid + ".idle"), "w").close()
+        p = self.claude(sid, env={"NO_REGISTER": "1", "WAKE_EVENT": "SessionStart"})
+        time.sleep(1.0)  # the resume's register hook is slow today
+        self.assertIsNone(self.wake_rc(p, timeout=0.2), "the waker left before its session was registered")
+        self.register_for(sid, p)
+        self.queue(sid, "MARK-RESUMED")
         self.assertEqual(self.wake_rc(p), 2, self.wake_err(p))
+
+    def test_a_waker_the_old_process_starts_after_a_resume_leaves(self):
+        """GUARD wake-moved: a waker that the old process starts after the
+        session was resumed elsewhere (a Stop of a turn it was still running)
+        leaves at once, and mail goes to the new process."""
+        sid = "a6a6a6b6-2222-3333-4444-555555555555"
+        old = self.claude(sid, env={"SECOND_WAKE": "1", "SECOND_WAKE_DELAY": "3"})
+        self.assertTrue(self.registered(sid) and self.marked_idle(sid))
+        time.sleep(0.8)
+        new = self.claude(sid)  # the resume: the record names the new process now
+        self.assertEqual(self.wake_rc(old, timeout=10), 0)  # the old waiting waker left
+        self.assertEqual(self.wake_rc(old, timeout=10, n=2), 0)  # the old process's later waker left at once
+        self.ok("send", "laptop", sid, "MARK-NEW-HOME")
+        self.assertEqual(self.wake_rc(new), 2, self.wake_err(new))
+        self.assertIn("MARK-NEW-HOME", self.wake_err(new))
+
+    def hold_wake_lock(self, sid, content):
+        import fcntl
+        d = os.path.join(self.local, "wake")
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        fd = os.open(os.path.join(d, sid + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, content, 0)
+        return fd
+
+    def test_a_waker_waiting_for_the_lock_leaves_when_its_process_loses_the_session(self):
+        """GUARD wake-lock-leave. Mutation: the wait for the lock has no exits
+        -> a waker whose session moved to another process meanwhile waits on,
+        and later takes the lock in the wrong process."""
+        sid = "a6a6a6c6-2222-3333-4444-555555555555"
+        other = subprocess.Popen(["sleep", "60"])
+        self.bg.append(other)
+        lock = self.hold_wake_lock(sid, json.dumps({"pid": other.pid}).encode())
+        try:
+            p = self.claude(sid)
+            self.assertTrue(self.registered(sid))
+            time.sleep(1.0)
+            self.assertIsNone(self.wake_rc(p, timeout=0.2))  # waiting for the lock
+            self.register_for(sid, other)  # the session moves to another process
+            self.assertEqual(self.wake_rc(p, timeout=10), 0)
+        finally:
+            os.close(lock)
+
+    def test_a_lock_whose_holder_is_still_being_written_is_waited_for(self):
+        """GUARD wake-same-process: an empty holder (truncated, not yet
+        written) is no reason to leave: the waker looks again and, once the
+        lock is free, delivers."""
+        sid = "a6a6a6d6-2222-3333-4444-555555555555"
+        lock = self.hold_wake_lock(sid, b"")
+        try:
+            p = self.claude(sid)
+            self.assertTrue(self.registered(sid) and self.marked_idle(sid))
+            time.sleep(1.5)
+            self.assertIsNone(self.wake_rc(p, timeout=0.2), "left on an empty holder")
+        finally:
+            os.close(lock)
+        self.ok("send", "laptop", sid, "MARK-AFTER-EMPTY")
+        self.assertEqual(self.wake_rc(p), 2, self.wake_err(p))
+
+    def test_the_holder_is_written_over_an_older_longer_one(self):
+        """GUARD wake-lock-truncate. Mutation: the holder is written without
+        truncating the file -> a longer older content leaves garbage after it,
+        and a second waker of the same process cannot tell it is one and
+        waits instead of leaving."""
+        sid = "a6a6a6e6-2222-3333-4444-555555555555"
+        d = os.path.join(self.local, "wake")
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        with open(os.path.join(d, sid + ".lock"), "w") as f:
+            f.write(json.dumps({"pid": 1, "note": "x" * 100}))
+        p = self.claude(sid, env={"SECOND_WAKE": "1"})
+        self.assertTrue(self.registered(sid))
+        self.assertEqual(self.wake_rc(p, timeout=10, n=2), 0)
+
+    def test_a_non_interactive_start_delivers_queued_mail_itself(self):
+        """GUARD wake-entrypoint-python. Mutation: the waker's gate ignores the
+        entry point -> a print-mode session's SessionStart leaves queued mail
+        to a waker that the hook wrapper never starts: the mail is stuck."""
+        sid = "a6a6a6f6-2222-3333-4444-555555555555"
+        self.queue(sid, "MARK-PRINT-START")
+        p = self.claude(sid, env={"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"})
+        self.assertTrue(self.registered(sid))
+        self.assertEqual(self.wake_rc(p, timeout=10), 0)
+        with open(os.path.join(self.local, "outbox", sid + ".jsonl")) as f:
+            receipts = [json.loads(l)["event"] for l in f if '"delivered"' in l]
+        self.assertEqual(receipts, ["SessionStart"])
 
     def test_waker_stays_out_of_print_mode(self):
         """GUARD wake-interactive-only. Mutation: the waker also waits in
@@ -2401,17 +2502,15 @@ class TestIdleWaker(Base):
         it marked idle -> the woken turn has no UserPromptSubmit, so the next
         waker claims mail in the middle of that turn."""
         sid = "a9a9a9a9-2222-3333-4444-555555555555"
-        p = self.claude(sid)
+        # The same process starts a second waker 3 s in (a Stop of another turn).
+        p = self.claude(sid, env={"SECOND_WAKE": "1", "SECOND_WAKE_DELAY": "3"})
         self.assertTrue(self.registered(sid) and self.marked_idle(sid))
         self.ok("send", "laptop", sid, "MARK-W1")
         self.assertEqual(self.wake_rc(p), 2, self.wake_err(p))
         self.assertFalse(self.is_idle(sid))
-        # The woken turn runs; a waker that a Stop of another turn started meanwhile
-        # (here a second process for the same session) must leave new mail alone.
-        w2 = self.claude(sid, env={"NO_REGISTER": "1"})
-        time.sleep(1.0)
+        time.sleep(3.5)  # the second waker is up; the woken turn still runs (no Stop yet)
         self.ok("send", "laptop", sid, "MARK-W2")
-        self.assertIsNone(self.wake_rc(w2, timeout=2.0), "claimed during the woken turn")
+        self.assertIsNone(self.wake_rc(p, timeout=2.0, n=2), "claimed during the woken turn")
 
     def test_a_stop_that_delivered_keeps_the_turn_busy(self):
         """GUARD stop-delivered-busy. Mutation: a Stop that delivered mail leaves
@@ -2578,6 +2677,7 @@ class TestIdleWaker(Base):
         self.assertFalse(alive(waker), "the waker should have delivered and exited")
         delivered = os.path.join(self.local, "delivered", sid)
         self.assertEqual(os.listdir(delivered) if os.path.isdir(delivered) else [], [])
+        self.assertTrue(self.is_idle(sid))  # nobody was woken: no busy mark either
         self.assertTrue(os.listdir(os.path.join(self.local, "claimed", sid)))  # recovered by the next hook
 
     def test_the_running_version_is_read_from_the_executable(self):
@@ -2622,6 +2722,25 @@ class TestIdleWaker(Base):
         with open(os.path.join(self.local, "outbox", sid + ".jsonl")) as f:
             receipts = [json.loads(l)["event"] for l in f if '"delivered"' in l]
         self.assertEqual(receipts, ["Wake"])
+
+    def test_a_stop_whose_wrapper_is_gone_has_not_handed_over(self):
+        """GUARD stop-handover-parent. Mutation: a written output counts as
+        handed over whoever reads it -> when the hook's wrapper was killed (a
+        timeout), the mail is acked and the session marked busy although
+        Claude never saw it."""
+        sid = "c4c4c4c4-2222-3333-4444-555555555555"
+        self.run_hook("SessionStart", {"session_id": sid, "source": "startup", "cwd": self.tmp})
+        self.tick()
+        self.run_hook("UserPromptSubmit", {"session_id": sid, "prompt": "go"})
+        self.queue(sid, "MARK-ORPHANED-STOP")
+        self.tick()
+        r = subprocess.run([sys.executable, "-I", "-S", os.path.join(REPO, "bin", "cxd"), "_hook", "Stop"],
+                           input=json.dumps({"session_id": sid, "last_assistant_message": "x"}).encode(),
+                           stdout=subprocess.PIPE, env=dict(self.env, CXD_HOOK_PARENT="1"), timeout=30)
+        self.assertIn(b"MARK-ORPHANED-STOP", r.stdout)  # written, but no wrapper reads it
+        delivered = os.path.join(self.local, "delivered", sid)
+        self.assertEqual(os.listdir(delivered) if os.path.isdir(delivered) else [], [])
+        self.assertTrue(self.is_idle(sid))
 
     def test_a_stop_whose_output_was_not_handed_over_is_idle(self):
         """GUARD stop-handover. Mutation: a Stop marks busy whenever it claimed

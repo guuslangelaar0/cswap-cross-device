@@ -87,9 +87,11 @@ flowchart LR
   - It only hands mail over while the session is idle. A typed prompt, a turn the waker
     started and a `Stop` that delivered mail mark the session busy; during a turn the
     other hooks deliver.
-  - There is one waker per session process. It leaves on its own when the session ends,
-    when its claude process is gone, or after about a day. When another process resumes
-    the session, the old waker leaves and the new process's waker takes over.
+  - There is one waker per session (a lock), in the process the session record names.
+    It leaves on its own when the session ends, when its claude process is gone, or after
+    about a day. When another process resumes the session, every waker of the old process
+    leaves (also one a later turn of the old process starts), and the new process's waker
+    takes over.
   - It needs an interactive session of Claude Code 2.1.287 or later, read from the running
     executable: the native installer's `.../claude/versions/X.Y.Z`, or the npm package's
     `package.json`. With other installs (a version it cannot read), in `claude -p` sessions,
