@@ -982,8 +982,9 @@ def hook_selftest():
             pass
         ok = (rc0 == 0 and out0.strip() == "" and rc1 == 0 and "SELFTEST-MARK" in ctx
               and rc2 == 0 and out2.strip() == "")
+        _, py, _ = _run_capture([hook, "WhichPython"], 10, env=env, stdin_text="")
         return {"ok": ok, "empty_inbox_ms": empty_ms, "delivery_ms": full_ms,
-                "delivered_once": "SELFTEST-MARK" in ctx and out2.strip() == ""}
+                "delivered_once": "SELFTEST-MARK" in ctx and out2.strip() == "", "python": py.strip()}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1011,7 +1012,8 @@ def op_doctor_info(args):
     check("claude CLI", rc == 0, (out.strip() or err.strip())[:80])
     st = hook_selftest()
     check("hook self-test (empty inbox silent, message delivered once)", st["ok"],
-          "empty %.0f ms, delivery %.0f ms" % (st["empty_inbox_ms"], st["delivery_ms"]))
+          "empty %.0f ms, delivery %.0f ms, python %s" % (st["empty_inbox_ms"], st["delivery_ms"],
+                                                         st.get("python") or "?"))
     regs = read_json(path("registrations.json"), {})  # kept by the SessionStart hook
     regs = dict(regs) if isinstance(regs, dict) else {}
     sd = path("sessions")

@@ -1476,7 +1476,7 @@ class TestHooks(Base):
             r = subprocess.run([HOOK, event], input=payload, stdout=subprocess.PIPE, env=env or self.env)
             return r.stdout.decode()
         # The reader is gone before the hook writes: its output can never be read.
-        p = subprocess.Popen([HOOK, event], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=self.env)
+        p = subprocess.Popen([HOOK, event], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env or self.env)
         p.stdout.close()
         p.stdin.write(payload)
         p.stdin.close()
@@ -1709,57 +1709,95 @@ class TestHooks(Base):
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=bad)
         self.assertEqual((r.returncode, r.stdout, r.stderr), (0, b"", b""))
 
+    def hook_python(self, env):
+        return subprocess.run([HOOK, "WhichPython"], stdout=subprocess.PIPE, universal_newlines=True,
+                              env=env).stdout.strip()
+
+    def timed(self, argv, payload, env):
+        t0 = time.perf_counter()
+        r = subprocess.run(argv, input=payload, stdout=subprocess.PIPE, env=env)
+        return (time.perf_counter() - t0) * 1000, r
+
     def test_hook_is_fast(self):
         """Every hook event, with the interpreter the wrapper picks in
         production, has a median under 100 ms (CI prints the medians on Linux
         and macOS)."""
         env = {k: v for k, v in self.env.items() if k != "CXD_PYTHON"}
-        for i, ev in enumerate(("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd")):
+        py = self.hook_python(env)
+        if sys.platform == "darwin" and py == "/usr/bin/python3":
+            self.skipTest("macOS's /usr/bin/python3 (an xcrun shim) is the only interpreter here: "
+                          "about three times slower; install Homebrew's python3")
+        payload = lambda sid: json.dumps({"session_id": sid, "source": "startup", "cwd": self.work,
+                                          "prompt": "x", "last_assistant_message": "x"}).encode()
+        sids = ["44444444-aaaa-0000-%04d" % n for n in range(12)]
+        self.timed([HOOK, "SessionStart"], payload("44444444-warm"), env)  # warm-up (bytecode caches)
+        for ev in ("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"):
             ts = []
-            for n in range(7):
-                payload = json.dumps({"session_id": "44444444-aaaa-%04d-%04d" % (i, n), "source": "startup",
-                                      "cwd": self.work, "prompt": "x", "last_assistant_message": "x"}).encode()
-                t0 = time.time()
-                subprocess.run([HOOK, ev], input=payload, stdout=subprocess.PIPE, env=env)
-                ts.append((time.time() - t0) * 1000)
-            med = sorted(ts)[3]
-            print("hook %s median %.1f ms" % (ev, med), file=sys.stderr)
+            for sid in sids[:11]:
+                ms, r = self.timed([HOOK, ev], payload(sid), env)
+                self.assertEqual(r.returncode, 0, ev)
+                ts.append(ms)
+            med = sorted(ts)[5]
+            print("hook %s median %.1f ms (python %s)" % (ev, med, py), file=sys.stderr)
             self.assertLess(med, 100, ev)
-        # A hook that delivers (claim, write, ack) is held to the same limit.
-        sid = "44444444-bbbb"
-        ts = []
-        for i in range(7):
-            self.queue(sid, i, "MARK-FAST-%d" % i)
-            t0 = time.time()
-            out = self.run_hook(sid, env=env)
-            ts.append((time.time() - t0) * 1000)
-            self.assertIn("MARK-FAST-%d" % i, out)
-        med = sorted(ts)[3]
-        print("hook PostToolUse delivering median %.1f ms" % med, file=sys.stderr)
-        self.assertLess(med, 100)
+            if ev == "SessionStart":  # it really registered them
+                self.assertTrue(all(os.path.exists(os.path.join(self.local, "sessions", s + ".json"))
+                                    for s in sids[:11]))
+        # Hooks that start Python because there is mail (claim, write, ack) are held to the same limit.
+        for ev in ("PostToolUse", "UserPromptSubmit"):
+            sid = "44444444-bbbb-" + ev
+            ts = []
+            for i in range(11):
+                self.queue(sid, i, "MARK-FAST-%d" % i)
+                ms, r = self.timed([HOOK, ev], json.dumps({"session_id": sid, "prompt": "x"}).encode(), env)
+                self.assertIn("MARK-FAST-%d" % i, r.stdout.decode())
+                ts.append(ms)
+            med = sorted(ts)[5]
+            print("hook %s delivering median %.1f ms" % (ev, med), file=sys.stderr)
+            self.assertLess(med, 100)
+
+    def fake_python(self, name, marker):
+        p = os.path.join(self.tmp, name)
+        with open(p, "w") as f:
+            f.write('#!/bin/sh\necho %s > "%s"\n' % (marker, os.path.join(self.tmp, "picked")))
+        os.chmod(p, 0o755)
+        return p
+
+    def picked(self, wrapper, env):
+        target = os.path.join(self.tmp, "picked")
+        if os.path.exists(target):
+            os.unlink(target)
+        subprocess.run([wrapper, "Stop"], input=b"{}", stdout=subprocess.PIPE, env=env)
+        with open(target) as f:
+            return f.read().strip()
 
     def test_the_wrapper_prefers_a_fast_stable_interpreter(self):
-        """GUARD hook-python. Mutation: the wrapper takes /usr/bin/python3 first
-        -> on macOS the hooks run on 3.9 behind the xcrun shim, about three
-        times slower (SessionStart over 100 ms)."""
+        """GUARD hook-python. Mutation: the wrapper does not stop at the first
+        interpreter it finds -> it ends on the last one, which on macOS is
+        /usr/bin/python3 (3.9 behind the xcrun shim, about three times slower)."""
         with open(HOOK) as f:
             src = f.read()
-        order = re.search(r"for c in ([^;]+); do  # GUARD:hook-python", src).group(1).split()
-        self.assertEqual(order, ["/opt/homebrew/bin/python3", "/usr/bin/python3"])
-        # Without any of them, python3 from PATH.
-        fake = os.path.join(self.tmp, "fakepy")
-        os.makedirs(fake)
-        with open(os.path.join(fake, "python3"), "w") as f:
-            f.write("#!/bin/sh\necho picked-from-path > %s\n" % os.path.join(self.tmp, "picked"))
-        os.chmod(os.path.join(fake, "python3"), 0o755)
-        patched = os.path.join(self.tmp, "cxd-hook")
-        with open(patched, "w") as f:
-            f.write(src.replace("for c in /opt/homebrew/bin/python3 /usr/bin/python3;", "for c in /nonexistent/python3;"))
-        os.chmod(patched, 0o755)
+        first, second = self.fake_python("py-first", "first"), self.fake_python("py-second", "second")
+        wrapper = os.path.join(self.tmp, "cxd-hook")
+
+        def with_candidates(cands):
+            with open(wrapper, "w") as f:
+                f.write(re.sub(r'(?m)^  cands=.*\n  \[ -d /System/Library \].*\n', '  cands="%s"\n' % cands, src))
+            os.chmod(wrapper, 0o755)
         env = {k: v for k, v in self.env.items() if k != "CXD_PYTHON"}
-        env["PATH"] = fake + os.pathsep + env.get("PATH", "")
-        subprocess.run([patched, "Stop"], input=b"{}", stdout=subprocess.PIPE, env=env)
-        self.assertTrue(os.path.exists(os.path.join(self.tmp, "picked")))
+        with_candidates("%s %s" % (first, second))
+        self.assertEqual(self.picked(wrapper, env), "first")
+        with_candidates("/nonexistent/python3 %s" % second)
+        self.assertEqual(self.picked(wrapper, env), "second")
+        with_candidates("%s %s" % (first, second))
+        self.assertEqual(self.picked(wrapper, dict(env, CXD_PYTHON=second)), "second")  # CXD_PYTHON wins
+        # Without any of them, python3 from PATH.
+        fake_dir = os.path.join(self.tmp, "fakepy")
+        os.makedirs(fake_dir)
+        shutil.copy(self.fake_python("py-path", "from-path"), os.path.join(fake_dir, "python3"))
+        with_candidates("/nonexistent/python3")
+        self.assertEqual(self.picked(wrapper, dict(env, PATH=fake_dir + os.pathsep + env.get("PATH", ""))),
+                         "from-path")
 
     def test_notify_lands_in_outbox(self):
         r = self.ok("notify", "built it MARK-N", env={"CLAUDE_CODE_SESSION_ID": "55555555-aaaa"})

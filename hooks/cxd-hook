@@ -17,12 +17,16 @@ root="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)" || exit 0
 py="${CXD_PYTHON:-}"
 if [ -z "$py" ]; then
   # A stable interpreter, the fastest first: on macOS, Homebrew's (Apple
-  # Silicon) starts about three times faster than /usr/bin/python3, which is
-  # 3.9 behind an xcrun shim; elsewhere the system's own.
-  for c in /opt/homebrew/bin/python3 /usr/bin/python3; do  # GUARD:hook-python
+  # Silicon, then Intel) starts about three times faster than
+  # /usr/bin/python3, which is 3.9 behind an xcrun shim; elsewhere the
+  # system's own. (/System/Library: macOS, tested without a fork.)
+  cands="/usr/bin/python3"
+  [ -d /System/Library ] && cands="/opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3"
+  for c in $cands; do  # GUARD:hook-python
     if [ -x "$c" ]; then py=$c; break; fi
   done
   [ -n "$py" ] || py=python3
 fi
+if [ "$ev" = WhichPython ]; then printf '%s\n' "$py"; exit 0; fi  # for cxd doctor
 CXD_HOOK_PARENT=$$ "$py" -I -S "$root/bin/cxd" _hook "$ev" 2>/dev/null
 exit 0
