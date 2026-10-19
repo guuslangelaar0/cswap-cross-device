@@ -68,7 +68,7 @@ class TestClaims(unittest.TestCase):
         self.assertEqual(dedupe.go(rid(), "b" * 32)[0], "duplicate")
         self.assertEqual(dedupe.go(rid(), "a" * 32)[0], "run")
 
-    def test_pruning_waits_for_claims_in_progress(self):
+    def test_pruning_leaves_a_store_busy_with_claims_for_the_next_pass(self):
         """GUARD claim-store-lock. Mutation: prune does not take the store lock
         -> it removes a lock file that another process holds or waits on, and
         two processes then lock different files for the same request."""
@@ -76,20 +76,22 @@ class TestClaims(unittest.TestCase):
         dedupe.arrive(rid(), "a" * 32, wait=30, now=old)
         dedupe.go(rid(), "a" * 32, now=old)
         dedupe.finish(rid(), "a" * 32, reply={}, now=old)
-        holding, released = threading.Event(), []
+        holding, release = threading.Event(), threading.Event()
 
         def hold():
             with dedupe._Locked(rid()):
                 holding.set()
-                time.sleep(0.6)
-                released.append(time.monotonic())
+                release.wait(5)
         t = threading.Thread(target=hold)
         t.start()
         holding.wait(5)
+        try:
+            self.assertEqual(dedupe.prune(), [], "pruned while a claim lock was held")
+            self.assertTrue(os.path.exists(os.path.join(self.home, "dedupe", rid() + ".lock")))
+        finally:
+            release.set()
+            t.join(5)
         self.assertEqual(dedupe.prune(), [rid()])
-        done = time.monotonic()
-        t.join(5)
-        self.assertTrue(released and done >= released[0], "prune ran while a claim lock was held")
 
     def test_without_go_in_time_nothing_ever_runs(self):
         """GUARD claim-lapse. Mutation: the lapse deadline is ignored -> a go
@@ -112,20 +114,45 @@ class TestClaims(unittest.TestCase):
         """GUARD claim-lock. Mutation: changes are made without the claim's lock
         -> two attempts that arrive and go at the same time can both run it."""
         for n in range(40):
-            runs, barrier = [], threading.Barrier(6)
+            runs, errors, barrier = [], [], threading.Barrier(6)
 
             def attempt(i):
                 me = "%032x" % (1000 + i)
-                barrier.wait()
-                dedupe.arrive(rid(n), me, wait=30, seq=i)
-                if dedupe.go(rid(n), me)[0] == "run":
-                    runs.append(me)
+                try:
+                    barrier.wait()
+                    dedupe.arrive(rid(n), me, wait=30, seq=i)
+                    if dedupe.go(rid(n), me)[0] == "run":
+                        runs.append(me)
+                except Exception as e:  # noqa: BLE001
+                    errors.append(e)
             threads = [threading.Thread(target=attempt, args=(i,)) for i in range(6)]
             for t in threads:
                 t.start()
             for t in threads:
                 t.join(30)
-            self.assertLessEqual(len(runs), 1, "request %d ran %d times" % (n, len(runs)))
+            self.assertFalse(any(t.is_alive() for t in threads))
+            self.assertEqual(errors, [])
+            self.assertEqual(len(runs), 1, "request %d ran %d times" % (n, len(runs)))
+
+    def test_separate_processes_run_each_request_once(self):
+        """The guarantee across processes, with prune passes alongside."""
+        code = ("import os, random, sys; sys.path.insert(0, %r); from cxd import dedupe\n"
+                "me = '%%032x' %% (int(sys.argv[1]) + 7)\n"
+                "out = open(sys.argv[2], 'w')\n"
+                "for n in range(40):\n"
+                "    r = '%%032x' %% (n + 100)\n"
+                "    dedupe.arrive(r, me, wait=30, seq=random.randrange(1, 10**6))\n"
+                "    v, _ = dedupe.go(r, me)\n"
+                "    if v == 'run':\n"
+                "        out.write(r + '\\n'); out.flush(); dedupe.finish(r, me, reply={})\n"
+                "    if n %% 10 == 0: dedupe.prune()\n" % os.path.join(REPO, "lib"))
+        outs = [os.path.join(self.tmp, "runs-%d" % i) for i in range(6)]
+        procs = [subprocess.Popen([sys.executable, "-c", code, str(i), outs[i]], env=dict(os.environ, CXD_HOME=self.home))
+                 for i in range(6)]
+        for p in procs:
+            self.assertEqual(p.wait(120), 0)
+        runs = [l.strip() for o in outs for l in open(o)]
+        self.assertEqual(sorted(runs), sorted("%032x" % (n + 100) for n in range(40)))
 
     def test_a_dead_executor_makes_the_outcome_unknown(self):
         """GUARD claim-executor-dead. Mutation: a running claim is not checked
@@ -156,7 +183,7 @@ class TestClaims(unittest.TestCase):
     def test_ids_are_hex_only(self):
         """GUARD claim-id. Mutation: ids are not checked -> a request id like
         '../../x' writes outside the store."""
-        for bad in ("../../escape", "", "A" * 32, "a" * 31, None, "a" * 32 + "/x"):
+        for bad in ("../../escape", "", "A" * 32, "a" * 31, None, "a" * 32 + "/x", "a" * 32 + "\n"):
             with self.assertRaises(ValueError, msg=bad):
                 dedupe.arrive(bad, "a" * 32, wait=30)
             with self.assertRaises(ValueError, msg=bad):
@@ -210,6 +237,123 @@ class TestClaims(unittest.TestCase):
             dedupe.finish(r, "a" * 32, reply={}, now=t0 - 25 * 3600)  # ...but "done" 25 h ago by a jumped clock
         self.assertEqual(dedupe.prune(now=t0), [old])
         self.assertIsNotNone(dedupe.current(young))
+
+    def test_records_are_synced_to_disk(self):
+        """GUARD claim-durable. Mutation: claim changes are not fsynced -> after
+        a power loss a claim that was running reads as awaiting again, and the
+        request runs a second time."""
+        writes = []
+        real = dedupe.atomic_write
+
+        def recording(p, data, fsync=False):
+            writes.append((os.path.basename(p), fsync))
+            return real(p, data, fsync=fsync)
+        with mock.patch.object(dedupe, "atomic_write", recording):
+            dedupe.arrive(rid(), "a" * 32, wait=30)
+            dedupe.go(rid(), "a" * 32)
+            dedupe.finish(rid(), "a" * 32, reply={})
+        self.assertTrue(writes)
+        self.assertTrue(all(sync for _, sync in writes), writes)
+
+    def test_a_corrupt_record_has_an_unknown_outcome(self):
+        """GUARD claim-shape. Mutation: any JSON is taken for a claim -> an empty,
+        null or wrong-shaped record crashes arrive/go/prune, or reads as a
+        claim for another operation."""
+        d = os.path.join(self.home, "dedupe")
+        os.makedirs(d, exist_ok=True)
+        old = time.time() - 40 * 3600
+        for n, junk in enumerate(("", "null", "[]", "{}", '{"state": "other"}', "{trunc")):
+            r = dedupe.new_request_id(now=old)[:-2] + "%02x" % n
+            with open(os.path.join(d, r + ".json"), "w") as f:
+                f.write(junk)
+            rec = dedupe.arrive(r, "a" * 32, wait=30, op="send", digest="d")
+            self.assertEqual(rec["state"], dedupe.UNKNOWN, junk)
+            self.assertEqual(dedupe.go(r, "a" * 32)[0], "final")
+            os.utime(os.path.join(d, r + ".json"), (old, old))
+        self.assertEqual(len(dedupe.prune()), 6)
+
+    def test_no_run_without_the_executors_identity(self):
+        """GUARD claim-executor-ident. Mutation: go runs without the executor's
+        identity -> nobody can ever tell it died: the claim stays running for
+        good and every re-issue waits on it."""
+        dedupe.arrive(rid(), "a" * 32, wait=30)
+        with mock.patch.object(dedupe, "proc_identity", lambda pid: None):
+            self.assertEqual(dedupe.go(rid(), "a" * 32)[0], "refused")
+        self.assertEqual(dedupe.current(rid())["state"], dedupe.AWAITING)
+
+    def test_wait_and_seq_are_checked(self):
+        """GUARD claim-wait-finite. Mutation: any wait is taken -> wait=inf makes
+        a claim that never lapses and is never pruned."""
+        for wait in (float("inf"), float("nan"), "x", None):
+            with self.assertRaises(ValueError, msg=wait):
+                dedupe.arrive(rid(), "a" * 32, wait=wait)
+        for seq in ("1", None, 1.5, True):
+            with self.assertRaises(ValueError, msg=seq):
+                dedupe.arrive(rid(), "a" * 32, wait=30, seq=seq)
+        t0 = time.time()
+        r = dedupe.arrive(rid(), "a" * 32, wait=10 ** 9, now=t0)
+        self.assertLessEqual(r["lapse_at"], t0 + dedupe.MAX_WAIT + dedupe.LAPSE_SLACK)
+
+    def test_a_running_claim_is_never_taken_over(self):
+        dedupe.arrive(rid(), "a" * 32, wait=30, seq=1)
+        dedupe.go(rid(), "a" * 32)
+        r = dedupe.arrive(rid(), "b" * 32, wait=30, seq=9)  # the CLI's re-issue after running
+        self.assertEqual((r["state"], r["owner"]), (dedupe.RUNNING, "a" * 32))
+        self.assertTrue(dedupe.finish(rid(), "a" * 32, reply={"ok": 1}))
+
+    def test_cancelled_stays_cancelled_when_the_clock_steps_back(self):
+        t0 = time.time()
+        dedupe.arrive(rid(), "a" * 32, wait=10, now=t0)
+        self.assertEqual(dedupe.go(rid(), "a" * 32, now=t0 + 60)[0], "cancelled")
+        self.assertEqual(dedupe.go(rid(), "a" * 32, now=t0)[0], "cancelled")
+
+    def test_only_a_running_claim_is_finished(self):
+        """GUARD claim-finish-running. Mutation: finish accepts any state -> a
+        late executor overwrites a claim that lapsed (cancelled: nothing ran)
+        with an outcome."""
+        dedupe.arrive(rid(), "a" * 32, wait=30)
+        self.assertFalse(dedupe.finish(rid(), "a" * 32, reply={}))  # awaiting
+        dedupe.go(rid(), "a" * 32)
+        self.assertTrue(dedupe.finish(rid(), "a" * 32, reply={"v": 1}))
+        self.assertFalse(dedupe.finish(rid(), "a" * 32, reply={"v": 2}))  # done already
+        self.assertEqual(dedupe.current(rid())["reply"], {"v": 1})
+
+    def test_a_failed_claim_lock_does_not_keep_the_store_locked(self):
+        """GUARD claim-lock-noleak. Mutation: the store lock is not released when
+        opening the claim's lock fails -> every later prune finds the store
+        busy (in a long-lived process: for good)."""
+        import errno as _errno
+        t0 = time.time()
+        old = dedupe.new_request_id(now=t0 - 40 * 3600)
+        dedupe.arrive(old, "a" * 32, wait=30, now=t0 - 30 * 3600)
+        dedupe.go(old, "a" * 32, now=t0 - 30 * 3600)
+        dedupe.finish(old, "a" * 32, reply={}, now=t0 - 30 * 3600)
+        real_open = os.open
+
+        def failing(p, *a, **kw):
+            if str(p).endswith(".lock") and not str(p).endswith(".store.lock"):
+                raise OSError(_errno.EMFILE, "too many open files")
+            return real_open(p, *a, **kw)
+        with mock.patch.object(dedupe.os, "open", failing):
+            with self.assertRaises(OSError):
+                dedupe.arrive(rid(5), "a" * 32, wait=30)
+        self.assertEqual(dedupe.prune(now=t0), [old])
+
+    def test_pruning_removes_orphans(self):
+        """GUARD claim-prune-orphans. Mutation: only records are pruned -> lock
+        files without a record and temporary files of killed writers pile up."""
+        d = os.path.join(self.home, "dedupe")
+        os.makedirs(d, exist_ok=True)
+        stray_lock = os.path.join(d, "f" * 32 + ".lock")
+        stray_tmp = os.path.join(d, "e" * 32 + ".json.new.123.abcd")
+        for p in (stray_lock, stray_tmp):
+            open(p, "w").close()
+        old = time.time() - 7200
+        os.utime(stray_tmp, (old, old))
+        dedupe.prune()
+        self.assertFalse(os.path.exists(stray_lock))
+        self.assertFalse(os.path.exists(stray_tmp))
+        self.assertTrue(os.path.exists(os.path.join(d, ".store.lock")))
 
     def test_only_old_final_records_are_pruned(self):
         t0 = time.time()

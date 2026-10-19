@@ -27,6 +27,7 @@ import fcntl
 import json
 import os
 import re
+import math
 import time
 
 from .common import atomic_write, ensure_dir, path, proc_identity, proc_state
@@ -37,7 +38,8 @@ FINAL = (DONE, ERROR, CANCELLED, UNKNOWN)
 LAPSE_SLACK = 5.0
 KEEP_FINAL_SECONDS = 24 * 3600
 KEEP_BY_ID_SECONDS = 36 * 3600
-_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+MAX_WAIT = 12 * 3600  # no client waits longer (the CLI caps its timeouts at 12 h)
+_ID_RE = re.compile(r"[0-9a-f]{32}")
 
 
 class Mismatch(ValueError):
@@ -58,7 +60,7 @@ def id_time(rid):
 
 def _check(*ids):
     for i in ids:
-        if not isinstance(i, str) or not _ID_RE.match(i):  # GUARD:claim-id
+        if not isinstance(i, str) or not _ID_RE.fullmatch(i):  # GUARD:claim-id
             raise ValueError("a request or attempt id is 32 lowercase hex digits")
 
 
@@ -69,8 +71,35 @@ def _files(rid):
 
 def _store_lock(mode):
     fd = os.open(os.path.join(ensure_dir(path("dedupe")), ".store.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
-    fcntl.flock(fd, mode)
+    try:
+        fcntl.flock(fd, mode)
+    except BaseException:
+        os.close(fd)
+        raise
     return fd
+
+
+def _sync_dir(d):
+    """Make a new or replaced name in d survive a crash of the host."""
+    try:
+        fd = os.open(d, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _unreadable(p, why):
+    try:
+        changed = os.stat(p).st_mtime
+    except OSError:
+        changed = 0
+    return {"state": UNKNOWN, "unreadable": True, "changed": changed,
+            "error": {"code": "outcome_unknown", "message": "unreadable claim (%s)" % why}}
 
 
 class _Record(object):
@@ -80,20 +109,26 @@ class _Record(object):
         self.rec_path, self.lock_path = _files(rid)
 
     def read(self):
+        """The record; for a file that is there but no claim (empty after a
+        crash, corrupt, the wrong shape) an `unknown` record marked unreadable,
+        whose outcome nobody can know."""
         try:
             with open(self.rec_path, "r", encoding="utf-8") as f:
                 rec = json.load(f)
         except FileNotFoundError:
             return None
-        except ValueError:
-            rec = {"state": UNKNOWN, "error": {"code": "outcome_unknown", "message": "unreadable claim"}}
-        return rec if isinstance(rec, dict) else None
+        except (OSError, ValueError) as e:
+            return _unreadable(self.rec_path, type(e).__name__)
+        if not isinstance(rec, dict) or rec.get("state") not in (AWAITING, RUNNING) + FINAL:  # GUARD:claim-shape
+            return _unreadable(self.rec_path, "not a claim")
+        return rec
 
     def create(self, rec):
         """The first record; os.link fails if one exists, so even a caller
-        that forgot the lock could not overwrite a claim."""
+        that forgot the lock could not overwrite a claim. Synced to disk: a
+        claim lost in a crash could run its request a second time."""
         tmp = "%s.new.%d.%s" % (self.rec_path, os.getpid(), os.urandom(4).hex())
-        atomic_write(tmp, _dump(rec))
+        atomic_write(tmp, _dump(rec), fsync=True)
         try:
             os.link(tmp, self.rec_path)
             return True
@@ -101,9 +136,11 @@ class _Record(object):
             return False
         finally:
             os.unlink(tmp)
+            _sync_dir(os.path.dirname(self.rec_path))
 
     def write(self, rec):
-        atomic_write(self.rec_path, _dump(rec))
+        atomic_write(self.rec_path, _dump(rec), fsync=True)  # GUARD:claim-durable
+        _sync_dir(os.path.dirname(self.rec_path))
 
 
 class _Locked(_Record):
@@ -112,8 +149,17 @@ class _Locked(_Record):
 
     def __enter__(self):
         self.store = _store_lock(fcntl.LOCK_SH)
-        self.fd = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
-        fcntl.flock(self.fd, fcntl.LOCK_EX)  # GUARD:claim-lock
+        try:
+            self.fd = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+        except BaseException:
+            os.close(self.store)
+            raise
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX)  # GUARD:claim-lock
+        except BaseException:
+            os.close(self.fd)
+            os.close(self.store)
+            raise
         return self
 
     def __exit__(self, *exc):
@@ -128,8 +174,8 @@ def _dump(rec):
 def _settle(lk, rec, now):
     """Apply the changes that time and death make: an awaiting claim past its
     deadline is cancelled; a running claim whose executor died is unknown."""
-    if rec is None:
-        return None
+    if rec is None or rec.get("unreadable"):
+        return rec
     if rec.get("state") == AWAITING and now >= rec.get("lapse_at", 0):  # GUARD:claim-lapse
         rec.update(state=CANCELLED, changed=now)
         lk.write(rec)
@@ -151,10 +197,20 @@ def arrive(rid, attempt, wait, seq=0, op=None, digest=None, now=None):
     given to the wrong command must not get another command's outcome).
     Returns the record as it stands afterwards."""
     _check(rid, attempt)
+    if isinstance(seq, bool) or not isinstance(seq, int):
+        raise ValueError("an attempt's sequence number is an integer")
+    try:
+        wait = float(wait)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("wait is a number of seconds")
+    if not math.isfinite(wait):  # GUARD:claim-wait-finite (inf would never lapse nor be pruned)
+        raise ValueError("wait is a finite number of seconds")
     now = time.time() if now is None else now
-    deadline = now + max(0.0, float(wait)) + LAPSE_SLACK
+    deadline = now + min(max(0.0, wait), MAX_WAIT) + LAPSE_SLACK
     with _Locked(rid) as lk:
         rec = _settle(lk, lk.read(), now)
+        if rec is not None and rec.get("unreadable"):
+            return rec  # its outcome is unknown, whatever operation asks
         if rec is None:
             rec = {"id": rid, "state": AWAITING, "owner": attempt, "seq": seq, "lapse_at": deadline,
                    "created": now, "changed": now, "op": op, "digest": digest}
@@ -172,9 +228,13 @@ def go(rid, attempt, now=None):
     """The attempt's client still waits: run it if this attempt owns the claim.
     Returns (verdict, record): "run" (the caller executes, then finish()),
     "duplicate" (another attempt owns or runs it: wait_final()), "cancelled"
-    (the claim lapsed: nothing ran) or "final" (the record has the outcome)."""
+    (the claim lapsed: nothing ran), "refused" (this process cannot record
+    itself as the executor: nothing ran) or "final" (the record has the
+    outcome)."""
     _check(rid, attempt)
     now = time.time() if now is None else now
+    if not os.path.exists(_files(rid)[0]):
+        raise ValueError("go for a request that never arrived")  # (and no lock file left behind)
     with _Locked(rid) as lk:
         rec = _settle(lk, lk.read(), now)
         if rec is None:
@@ -184,7 +244,13 @@ def go(rid, attempt, now=None):
             if rec.get("owner") != attempt:  # GUARD:claim-go-owner
                 return "duplicate", rec
             pid = os.getpid()
-            rec.update(state=RUNNING, changed=now, executor={"pid": pid, "ident": proc_identity(pid)})
+            ident = proc_identity(pid)
+            if not ident:  # GUARD:claim-executor-ident
+                # Without its identity nobody could ever tell that the executor
+                # died: the claim would stay running for good. Do not run; the
+                # claim stays awaiting and lapses (nothing ran).
+                return "refused", rec
+            rec.update(state=RUNNING, changed=now, executor={"pid": pid, "ident": ident})
             lk.write(rec)
             return "run", rec
         if state == RUNNING:
@@ -214,9 +280,11 @@ def finish(rid, attempt, reply=None, error=None, now=None):
     claim's running owner (the record is left alone)."""
     _check(rid, attempt)
     now = time.time() if now is None else now
+    if not os.path.exists(_files(rid)[0]):
+        return False
     with _Locked(rid) as lk:
         rec = lk.read()
-        if not rec or rec.get("state") != RUNNING or rec.get("owner") != attempt:
+        if not rec or rec.get("state") != RUNNING or rec.get("owner") != attempt:  # GUARD:claim-finish-running
             return False
         if error is not None:
             rec.update(state=ERROR, error=error)
@@ -252,31 +320,57 @@ def wait_final(rid, timeout, poll=0.2):
 def prune(now=None):
     """Remove records that reached a final state KEEP_FINAL_SECONDS ago and
     whose id was made KEEP_BY_ID_SECONDS ago (so a clock that jumped forward
-    cannot prune a record early on its own). Returns the removed ids."""
+    cannot prune a record early on its own); also lock files without a record
+    and temporary files an hour old. A store busy with claims is left for the
+    next pass. Returns the removed ids."""
     now = time.time() if now is None else now
     d = path("dedupe")
     if not os.path.isdir(d):
         return []
     removed = []
-    store = _store_lock(fcntl.LOCK_EX)  # GUARD:claim-store-lock
     try:
-        for n in sorted(os.listdir(d)):
-            if not n.endswith(".json") or not _ID_RE.match(n[:-5]):
-                continue
-            rid = n[:-5]
-            lk = _Record(rid)  # under the exclusive store lock nobody holds a claim lock
-            rec = _settle(lk, lk.read(), now)
-            if not rec or rec.get("state") not in FINAL or now - rec.get("changed", now) < KEEP_FINAL_SECONDS:
-                continue
-            if now - id_time(rid) < KEEP_BY_ID_SECONDS:  # GUARD:claim-prune-id-time
-                continue
-            for p in (lk.rec_path, lk.lock_path):
+        store = _store_lock(fcntl.LOCK_EX | fcntl.LOCK_NB)  # GUARD:claim-store-lock
+    except BlockingIOError:
+        return []  # claims are being made or changed: next pass
+    try:
+        names = os.listdir(d)
+        for n in sorted(names):
+            p = os.path.join(d, n)
+            if n.endswith(".json") and _ID_RE.fullmatch(n[:-5]):
+                rid = n[:-5]
                 try:
-                    os.unlink(p)
-                except FileNotFoundError:
-                    pass
-            removed.append(rid)
+                    lk = _Record(rid)  # under the exclusive store lock nobody holds a claim lock
+                    rec = _settle(lk, lk.read(), now)
+                    if not rec or rec.get("state") not in FINAL or now - float(rec.get("changed", now)) < KEEP_FINAL_SECONDS:
+                        continue
+                    if now - id_time(rid) < KEEP_BY_ID_SECONDS:  # GUARD:claim-prune-id-time
+                        continue
+                    for q in (lk.rec_path, lk.lock_path):
+                        try:
+                            os.unlink(q)
+                        except FileNotFoundError:
+                            pass
+                    removed.append(rid)
+                except (OSError, ValueError, TypeError):
+                    continue  # one bad record must not stop the pass
+            elif n.endswith(".lock") and n != ".store.lock" and not os.path.exists(p[:-5] + ".json"):
+                _remove_quietly(p)  # a lock without a record (a go for an unknown id, a crash)
+            elif (".new." in n or ".tmp." in n) and _older_than(p, now, 3600):
+                _remove_quietly(p)  # left by a process killed mid-write
     finally:
         os.close(store)
     return removed
 
+
+def _older_than(p, now, seconds):
+    try:
+        return now - os.stat(p).st_mtime > seconds
+    except OSError:
+        return False
+
+
+def _remove_quietly(p):
+    try:
+        os.unlink(p)
+    except OSError:
+        pass

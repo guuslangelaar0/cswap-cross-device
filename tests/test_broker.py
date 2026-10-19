@@ -303,5 +303,33 @@ class TestWire(unittest.TestCase):
                 self.wire.Reader(authenticated=True).feed(bad)
 
 
+class TestWireHostileInput(unittest.TestCase):
+    """What a peer sends must end as FrameError, never as another exception."""
+
+    def setUp(self):
+        from cxd.broker import wire
+        self.wire = wire
+
+    def test_deep_nesting_is_a_frame_error(self):
+        """GUARD frame-decode. Mutation: only ValueError is caught -> a joiner's
+        60,000 nested brackets raise RecursionError out of the reader."""
+        line = b'{"t":"x","a":' + b"[" * 60000 + b"\n"
+        self.assertLess(len(line), self.wire.PRE_AUTH_LIMIT)
+        with self.assertRaises(self.wire.FrameError):
+            self.wire.Reader().feed(line)
+
+    def test_nan_infinity_and_huge_numbers_are_refused(self):
+        for bad in (b'{"t":"x","v":NaN}\n', b'{"t":"x","v":Infinity}\n', b'{"t":"x","v":-Infinity}\n',
+                    b'{"t":"x","v":' + b"9" * 5000 + b"}\n"):
+            with self.assertRaises(self.wire.FrameError, msg=bad[:30]):
+                self.wire.Reader(authenticated=True).feed(bad)
+        self.assertEqual(self.wire.Reader().feed(b'{"t":"x","v":1e400}\n')[0]["v"], float("inf"))
+
+    def test_what_cannot_be_sent_is_a_frame_error(self):
+        for bad in ({"t": "x", "v": float("nan")}, {"t": "x", "v": "\ud800"}):
+            with self.assertRaises(self.wire.FrameError):
+                self.wire.encode(bad)
+
+
 if __name__ == "__main__":
     unittest.main()
