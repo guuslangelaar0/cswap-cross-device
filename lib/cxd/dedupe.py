@@ -8,11 +8,15 @@ the lock, reads the record, checks that it is in the state the change
 expects, and replaces it atomically:
 
   (none)    -> awaiting   the first attempt arrives; it owns the claim
-  awaiting  -> awaiting   a later attempt with a waiting client takes it over
+  awaiting  -> awaiting   an attempt with a higher sequence number takes it over
   awaiting  -> running    go from the owner, before the lapse deadline
   awaiting  -> cancelled  the deadline passed without go: nothing ran
   running   -> done/error the executor finished
   running   -> unknown    the executor died before it finished
+
+Every operation also holds the store lock (.store.lock) shared; prune holds
+it exclusively, so a lock file is only removed while nobody holds or waits
+on it.
 
 The lapse deadline is the record's wall time: a clock step makes a claim
 lapse early (cancelled: the client retries with a new id) or late (harmless:
@@ -46,19 +50,17 @@ def _files(rid):
     return os.path.join(d, rid + ".json"), os.path.join(d, rid + ".lock")
 
 
-class _Locked(object):
-    """The claim's lock, held for one read-check-write."""
+def _store_lock(mode):
+    fd = os.open(os.path.join(ensure_dir(path("dedupe")), ".store.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+    fcntl.flock(fd, mode)
+    return fd
+
+
+class _Record(object):
+    """A claim's record, read and written by whoever holds its locks."""
 
     def __init__(self, rid):
-        self.rec_path, lock_path = _files(rid)
-        self.fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
-
-    def __enter__(self):
-        fcntl.flock(self.fd, fcntl.LOCK_EX)  # GUARD:claim-lock
-        return self
-
-    def __exit__(self, *exc):
-        os.close(self.fd)  # releases the lock
+        self.rec_path, self.lock_path = _files(rid)
 
     def read(self):
         try:
@@ -87,6 +89,21 @@ class _Locked(object):
         atomic_write(self.rec_path, _dump(rec))
 
 
+class _Locked(_Record):
+    """The claim's lock (and the store lock, shared), held for one
+    read-check-write."""
+
+    def __enter__(self):
+        self.store = _store_lock(fcntl.LOCK_SH)
+        self.fd = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)  # GUARD:claim-lock
+        return self
+
+    def __exit__(self, *exc):
+        os.close(self.fd)  # releases the locks
+        os.close(self.store)
+
+
 def _dump(rec):
     return json.dumps(rec, sort_keys=True).encode("utf-8")
 
@@ -108,21 +125,23 @@ def _settle(lk, rec, now):
     return rec
 
 
-def arrive(rid, attempt, wait, now=None):
-    """An attempt of rid arrives with a client that will wait `wait` more
-    seconds. Returns the record as it stands afterwards."""
+def arrive(rid, attempt, wait, seq=0, now=None):
+    """Attempt number `seq` of rid arrives with a client that will wait `wait`
+    more seconds. It takes over an awaiting claim only with a higher sequence
+    number than the owner's (a stale attempt never does). Returns the record
+    as it stands afterwards."""
     _check(rid, attempt)
     now = time.time() if now is None else now
     deadline = now + max(0.0, float(wait)) + LAPSE_SLACK
     with _Locked(rid) as lk:
         rec = _settle(lk, lk.read(), now)
         if rec is None:
-            rec = {"id": rid, "state": AWAITING, "owner": attempt, "lapse_at": deadline,
+            rec = {"id": rid, "state": AWAITING, "owner": attempt, "seq": seq, "lapse_at": deadline,
                    "created": now, "changed": now}
             if not lk.create(rec):  # cannot happen under the lock; never overwrite
                 rec = _settle(lk, lk.read(), now)
-        elif rec["state"] == AWAITING:
-            rec.update(owner=attempt, lapse_at=max(rec["lapse_at"], deadline), changed=now)
+        elif rec["state"] == AWAITING and seq > rec.get("seq", 0):  # GUARD:claim-seq
+            rec.update(owner=attempt, seq=seq, lapse_at=max(rec["lapse_at"], deadline), changed=now)
             lk.write(rec)
         return rec
 
@@ -196,20 +215,26 @@ def prune(now=None):
     Returns the removed ids."""
     now = time.time() if now is None else now
     d = path("dedupe")
-    try:
-        names = os.listdir(d)
-    except OSError:
+    if not os.path.isdir(d):
         return []
     removed = []
-    for n in sorted(names):
-        if not n.endswith(".json") or not _ID_RE.match(n[:-5]):
-            continue
-        rid = n[:-5]
-        with _Locked(rid) as lk:
+    store = _store_lock(fcntl.LOCK_EX)  # GUARD:claim-store-lock
+    try:
+        for n in sorted(os.listdir(d)):
+            if not n.endswith(".json") or not _ID_RE.match(n[:-5]):
+                continue
+            rid = n[:-5]
+            lk = _Record(rid)  # under the exclusive store lock nobody holds a claim lock
             rec = _settle(lk, lk.read(), now)
             if not rec or rec.get("state") not in FINAL or now - rec.get("changed", now) < KEEP_FINAL_SECONDS:
                 continue
-            os.unlink(lk.rec_path)
-            os.unlink(os.path.join(d, rid + ".lock"))
+            for p in (lk.rec_path, lk.lock_path):
+                try:
+                    os.unlink(p)
+                except FileNotFoundError:
+                    pass
             removed.append(rid)
+    finally:
+        os.close(store)
     return removed
+

@@ -401,6 +401,23 @@ MUTATIONS = [
         "expect": "red",
     },
     {
+        "name": "claim-seq",
+        "what": "any attempt takes over an awaiting claim (a stale attempt takes it back from the ssh fallback)",
+        "edits": [("lib/cxd/dedupe.py",
+                   '        elif rec["state"] == AWAITING and seq > rec.get("seq", 0):  # GUARD:claim-seq\n',
+                   '        elif rec["state"] == AWAITING:  # MUTATION\n')],
+        "tests": [TESTS + "dedupe.TestClaims.test_only_a_later_attempt_takes_over"],
+        "expect": "red",
+    },
+    {
+        "name": "claim-store-lock",
+        "what": "prune does not take the store lock (it removes lock files that others hold or wait on)",
+        "edits": [("lib/cxd/dedupe.py", "    store = _store_lock(fcntl.LOCK_EX)  # GUARD:claim-store-lock\n",
+                   "    store = os.open(os.devnull, os.O_RDONLY)  # MUTATION\n")],
+        "tests": [TESTS + "dedupe.TestClaims.test_pruning_waits_for_claims_in_progress"],
+        "expect": "red",
+    },
+    {
         "name": "claim-go-owner",
         "what": "go does not check the claim's owner (the broker copy and the ssh copy of a request both run it)",
         "edits": [("lib/cxd/dedupe.py", '            if rec.get("owner") != attempt:  # GUARD:claim-go-owner\n',

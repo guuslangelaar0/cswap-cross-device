@@ -50,13 +50,46 @@ class TestClaims(unittest.TestCase):
     def test_a_waiting_attempt_takes_over_and_the_earlier_owner_cannot_run_it(self):
         """GUARD claim-go-owner. Mutation: go does not check the owner -> the
         broker copy and the ssh copy of one request both run it."""
-        dedupe.arrive(rid(), "a" * 32, wait=30)  # broker attempt
-        r = dedupe.arrive(rid(), "b" * 32, wait=60)  # the ssh fallback takes over
+        dedupe.arrive(rid(), "a" * 32, wait=30, seq=1)  # broker attempt
+        r = dedupe.arrive(rid(), "b" * 32, wait=60, seq=2)  # the ssh fallback takes over
         self.assertEqual(r["owner"], "b" * 32)
         self.assertEqual(dedupe.go(rid(), "a" * 32)[0], "duplicate")
         self.assertEqual(dedupe.current(rid())["state"], dedupe.AWAITING)
         self.assertEqual(dedupe.go(rid(), "b" * 32)[0], "run")
         self.assertEqual(dedupe.go(rid(), "a" * 32)[0], "duplicate")
+
+    def test_only_a_later_attempt_takes_over(self):
+        """GUARD claim-seq. Mutation: any attempt takes over an awaiting claim ->
+        a stale broker attempt that arrives after the ssh fallback takes the
+        claim back, and the fallback's go is turned away."""
+        dedupe.arrive(rid(), "a" * 32, wait=30, seq=2)  # the ssh fallback
+        r = dedupe.arrive(rid(), "b" * 32, wait=30, seq=1)  # the broker attempt, late
+        self.assertEqual(r["owner"], "a" * 32)
+        self.assertEqual(dedupe.go(rid(), "b" * 32)[0], "duplicate")
+        self.assertEqual(dedupe.go(rid(), "a" * 32)[0], "run")
+
+    def test_pruning_waits_for_claims_in_progress(self):
+        """GUARD claim-store-lock. Mutation: prune does not take the store lock
+        -> it removes a lock file that another process holds or waits on, and
+        two processes then lock different files for the same request."""
+        old = time.time() - dedupe.KEEP_FINAL_SECONDS - 60
+        dedupe.arrive(rid(), "a" * 32, wait=30, now=old)
+        dedupe.go(rid(), "a" * 32, now=old)
+        dedupe.finish(rid(), "a" * 32, reply={}, now=old)
+        holding, released = threading.Event(), []
+
+        def hold():
+            with dedupe._Locked(rid()):
+                holding.set()
+                time.sleep(0.6)
+                released.append(time.monotonic())
+        t = threading.Thread(target=hold)
+        t.start()
+        holding.wait(5)
+        self.assertEqual(dedupe.prune(), [rid()])
+        done = time.monotonic()
+        t.join(5)
+        self.assertTrue(released and done >= released[0], "prune ran while a claim lock was held")
 
     def test_without_go_in_time_nothing_ever_runs(self):
         """GUARD claim-lapse. Mutation: the lapse deadline is ignored -> a go
@@ -84,7 +117,7 @@ class TestClaims(unittest.TestCase):
             def attempt(i):
                 me = "%032x" % (1000 + i)
                 barrier.wait()
-                dedupe.arrive(rid(n), me, wait=30)
+                dedupe.arrive(rid(n), me, wait=30, seq=i)
                 if dedupe.go(rid(n), me)[0] == "run":
                     runs.append(me)
             threads = [threading.Thread(target=attempt, args=(i,)) for i in range(6)]
