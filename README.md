@@ -320,9 +320,10 @@ See [SECURITY.md](SECURITY.md) to report a vulnerability.
   turn that is running. An interactive session that sits idle at its prompt is woken for a
   message by the waker (see How it works, for the Claude Code version it needs and when it
   does not run); otherwise it sees the message at its next prompt.
-- Inbox delivery into an interactive (TUI) session is proven with real Claude Code 2.1.302 on
-  Linux on `PostToolUse`, on `UserPromptSubmit` and at `Stop`, where the session continues and
-  acts on the message ([evidence](docs/evidence/2026-10-18-tui-delivery-linux.md)).
+- Inbox delivery into an interactive (TUI) session is proven with real Claude Code on Linux
+  on `PostToolUse`, on `UserPromptSubmit` and at `Stop`, where the session continues and acts
+  on the message, and by the idle waker, after a turn and in a session nobody has typed into
+  ([evidence](docs/evidence/2026-10-19-tui-delivery-waker-linux.md)).
 - Remote hosts need `ssh` access as the same user and `cxd init` run on them.
 - **Planned: a broker transport.** A small broker on your LAN or VPN, so hosts can reach each
   other without an ssh alias for every pair. Hosts would pair with `cxd join` and
