@@ -507,79 +507,88 @@ def op_notify(args):
 
 # ================================================================ events (watch)
 
-def _scan_out(out, cur, emit):
-    """Scan new complete lines of out.jsonl from cur['out'] and emit events.
-
-    A line can give several events (PR links, then the turn). All but the last
-    carry a cursor at the start of the line, the last one a cursor after it: a
-    client that resumes inside a line reads it again and skips the PRs it got.
-    emit returns the cursor it gave the event (or None)."""
-    try:
-        size = os.path.getsize(out)
-    except OSError:
-        return
-    off = cur.get("out", 0)
-    if size <= off:
-        return
-    with open(out, "rb") as f:
-        f.seek(off)
-        chunk = f.read(min(size - off, 8 * 1024 * 1024))
-    end = chunk.rfind(b"\n")
-    if end < 0:
-        return
-    seen_pr = set(cur.get("prs", []))
-    pos = off
-    for raw in chunk[: end + 1].split(b"\n")[:-1]:
-        start, pos = pos, pos + len(raw) + 1
-        cur["out"] = start  # GUARD:event-line-start
-        last = _scan_line(raw, cur, seen_pr, emit)
-        cur["out"] = pos
-        if isinstance(last, dict):
-            last["out"] = pos  # the line's last event resumes after it
-    cur["prs"] = sorted(seen_pr)
+SCAN_CHUNK = 8 * 1024 * 1024  # how much of out.jsonl one poll reads
 
 
-def _scan_line(raw, cur, seen_pr, emit):
-    """The events of one line of out.jsonl; returns the last one's cursor."""
-    last = None
-    ev = _parse(raw.decode("utf-8", "replace"))
-    if ev:
-        t = ev.get("type")
-        if t == "cxd" and ev.get("event") == "gen-start":
-            cur["gen"] = ev.get("gen")
-        elif t == "system" and ev.get("subtype") == "init":
-            sid = ev.get("session_id")
-            if sid:
-                cur.setdefault("sids", [])
-                if sid not in cur["sids"]:
-                    cur["sids"].append(sid)
-            last = emit({"ev": "init", "session_id": sid, "model": ev.get("model"), "gen": cur.get("gen")})
-        elif t == "assistant":
-            for block in (ev.get("message") or {}).get("content") or []:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    for url in PR_RE.findall(block.get("text") or ""):
-                        if url not in seen_pr:
-                            seen_pr.add(url)
-                            cur["prs"] = sorted(seen_pr)
-                            last = emit({"ev": "pr", "url": url})
-        elif t == "result":
-            res = ev.get("result")
-            for url in PR_RE.findall(res or ""):
-                if url not in seen_pr:
-                    seen_pr.add(url)
-                    cur["prs"] = sorted(seen_pr)
-                    last = emit({"ev": "pr", "url": url})
-            # Counted after the line's PRs: a resume after one of them reads it again.
-            cur["turns"] = cur.get("turns", 0) + 1
-            cost = ev.get("total_cost_usd")
-            if isinstance(cost, (int, float)):
-                # total_cost_usd is cumulative within one process; keep the last per gen.
-                cur.setdefault("gen_costs", {})[str(cur.get("gen"))] = cost
-            last = emit({"ev": "turn", "turn": cur["turns"], "is_error": bool(ev.get("is_error")),
-                         "subtype": ev.get("subtype"), "num_turns": ev.get("num_turns"),
-                         "cost_usd": cost, "duration_ms": ev.get("duration_ms"),
-                         "result": excerpt(res, 400), "session_id": ev.get("session_id")})
-    return last
+def _scan_out(out, cur, emit, drain=False):
+    """Scan new complete lines of out.jsonl from cur['out'] and emit events:
+    one chunk, or with drain everything up to the end of the file.
+
+    A line can give several events (PR links, then the turn). Every event but
+    a line's last carries the cursor as it stood at the start of the line plus
+    `out_skip`, the number of the line's events already delivered: a client
+    that resumes there reads the line again, from the same state, and skips
+    those. The line's last event carries the cursor after the line."""
+    while True:
+        try:
+            size = os.path.getsize(out)
+        except OSError:
+            return
+        off = cur.get("out", 0)
+        if size <= off:
+            return
+        with open(out, "rb") as f:
+            f.seek(off)
+            chunk = f.read(min(size - off, SCAN_CHUNK))
+        end = chunk.rfind(b"\n")
+        if end < 0:
+            return
+        for raw in chunk[: end + 1].split(b"\n")[:-1]:
+            skip = cur.pop("out_skip", 0)
+            ev = _parse(raw.decode("utf-8", "replace"))
+            # Only these lines can give several events; copy the state for them.
+            before = json.loads(json.dumps(cur)) if ev and ev.get("type") in ("assistant", "result") else None
+            line_events = []
+            if ev:
+                _scan_line(ev, cur, line_events.append)
+            cur["out"] = cur.get("out", 0) + len(raw) + 1
+            for n, e in enumerate(line_events):
+                if n < skip:
+                    continue  # delivered before the client resumed
+                if n < len(line_events) - 1:
+                    emit(e, at=dict(before, out_skip=n + 1))  # GUARD:event-line-skip
+                else:
+                    emit(e)
+        if not drain:
+            return
+
+
+def _add_pr(cur, url, emit):
+    if url not in cur.get("prs", []):
+        cur["prs"] = sorted(set(cur.get("prs", [])) | {url})
+        emit({"ev": "pr", "url": url})
+
+
+def _scan_line(ev, cur, emit):
+    """The events of one parsed line of out.jsonl."""
+    t = ev.get("type")
+    if t == "cxd" and ev.get("event") == "gen-start":
+        cur["gen"] = ev.get("gen")
+    elif t == "system" and ev.get("subtype") == "init":
+        sid = ev.get("session_id")
+        if sid:
+            cur.setdefault("sids", [])
+            if sid not in cur["sids"]:
+                cur["sids"].append(sid)
+        emit({"ev": "init", "session_id": sid, "model": ev.get("model"), "gen": cur.get("gen")})
+    elif t == "assistant":
+        for block in (ev.get("message") or {}).get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "text":
+                for url in PR_RE.findall(str(block.get("text") or "")):
+                    _add_pr(cur, url, emit)
+    elif t == "result":
+        cur["turns"] = cur.get("turns", 0) + 1
+        cost = ev.get("total_cost_usd")
+        if isinstance(cost, (int, float)):
+            # total_cost_usd is cumulative within one process; keep the last per gen.
+            cur.setdefault("gen_costs", {})[str(cur.get("gen"))] = cost
+        res = ev.get("result")
+        for url in PR_RE.findall(str(res or "")):
+            _add_pr(cur, url, emit)
+        emit({"ev": "turn", "turn": cur["turns"], "is_error": bool(ev.get("is_error")),
+              "subtype": ev.get("subtype"), "num_turns": ev.get("num_turns"),
+              "cost_usd": cost, "duration_ms": ev.get("duration_ms"),
+              "result": excerpt(res, 400), "session_id": ev.get("session_id")})
 
 
 def _scan_outbox(sid, cur, emit, skip_kinds=()):
@@ -626,9 +635,9 @@ def _exit_record(d, gen):
     return {}
 
 
-def _scan_run(d, meta, cur, emit):
+def _scan_run(d, meta, cur, emit, drain=False):
     """A run's events: its output, then its sessions' reports."""
-    _scan_out(os.path.join(d, "out.jsonl"), cur, emit)
+    _scan_out(os.path.join(d, "out.jsonl"), cur, emit, drain)
     for sid in list(cur.get("sids", [])) or ([meta["session_id"]] if meta.get("session_id") else []):
         _scan_outbox(sid, cur, emit, skip_kinds=("stop",))  # turn events already carry results
 
@@ -639,35 +648,37 @@ def run_cost(cur):
 
 def poll(target, cur):
     """One scan. Returns (events, cursor). Emits 'exit' once, from host state only.
-    Each event carries, under "_cursor", the cursor as it stands right after
+    Each event carries, under "_cursor", the cursor to resume from right after
     that event: a client that loses the stream between two events of one scan
-    resumes exactly after the last one it received."""
+    resumes exactly after the last one it received.
+
+    It decides first whether the target is alive, waiting for its exit code or
+    gone, and scans after that: every event of the poll carries the same wait
+    state, and the scan before an exit reads everything the target wrote."""
     events = []
     kind, ref = _resolve(target)
-    cur = json.loads(json.dumps(cur or {}))  # never change the caller's cursor
+    cur = json.loads(json.dumps(cur or {}))  # GUARD:poll-copy
 
-    def emit(e):
-        e["_cursor"] = json.loads(json.dumps(cur))  # GUARD:event-cursor
+    def emit(e, at=None):
+        e["_cursor"] = json.loads(json.dumps(cur if at is None else at))  # GUARD:event-cursor
         events.append(e)
-        return e["_cursor"]
     cur["kind"] = kind
     if kind == "run":
         d = ref
         meta, pids, _ = _run_files(d)
-        _scan_run(d, meta, cur, emit)
         gen = pids.get("gen")
+        exit_ev = None
         if not pids:
             # No pids at all: the supervisor of the first gen failed before it
             # started claude. Its exit record says why; nothing else will happen.
             ex = _exit_record(d, meta.get("gen"))
             if ex and cur.get("exit_gen") != ex["gen"]:
-                cur["exit_gen"] = ex["gen"]
-                emit({"ev": "exit", "rc": ex.get("rc"), "gen": ex["gen"], "error": ex.get("error"),
-                      "turns": cur.get("turns", 0), "cost_usd": run_cost(cur)})
+                exit_ev = {"ev": "exit", "rc": ex.get("rc"), "gen": ex["gen"], "error": ex.get("error")}
         elif claude_alive(pids):
-            cur.pop("exit_wait", None)
+            cur.pop("exit_wait", None)  # GUARD:exit-wait-alive
         elif cur.get("exit_gen") != gen:
             ex = _exit_record(d, gen)
+            waiting = False
             # The supervisor reaps claude, then writes exit.json: while it lives,
             # wait (bounded) for the rc rather than report the exit without it.
             if not ex and supervisor_alive(pids):  # GUARD:exit-rc
@@ -677,23 +688,23 @@ def poll(target, cur):
                 waited = time.time() - wait["t"]
                 if waited < 0:  # the clock stepped back: start the wait again
                     wait["t"], waited = time.time(), 0.0
-                if waited < EXIT_RECORD_WAIT:  # GUARD:exit-rc-cap
-                    for e in events:  # resuming after one of them continues this wait
-                        e["_cursor"]["exit_wait"] = dict(wait)
-                    return events, cur
-            ex = ex or _exit_record(d, gen)  # written just before the supervisor exited?
-            cur.pop("exit_wait", None)
-            # Final flush after the process ended, reports included: watch ends at the exit.
-            _scan_run(d, meta, cur, emit)  # GUARD:exit-flush-outbox
-            cur["exit_gen"] = gen
-            emit({"ev": "exit", "rc": ex.get("rc"), "gen": gen, "turns": cur.get("turns", 0),
-                  "cost_usd": run_cost(cur)})
+                waiting = waited < EXIT_RECORD_WAIT  # GUARD:exit-rc-cap
+            if not waiting:
+                ex = ex or _exit_record(d, gen)  # written just before the supervisor exited?
+                cur.pop("exit_wait", None)
+                exit_ev = {"ev": "exit", "rc": ex.get("rc"), "gen": gen}
+        # Before an exit, read to the end: watch ends at the exit.
+        _scan_run(d, meta, cur, emit, drain=exit_ev is not None)  # GUARD:exit-drain
+        if exit_ev:
+            cur["exit_gen"] = exit_ev["gen"]
+            exit_ev.update(turns=cur.get("turns", 0), cost_usd=run_cost(cur))
+            emit(exit_ev)
     else:
         rec = ref
         sid = rec["session_id"]
+        ended = not session_alive(rec) and not cur.get("exit_reported")
         _scan_outbox(sid, cur, emit)
-        if not session_alive(rec) and not cur.get("exit_reported"):
-            _scan_outbox(sid, cur, emit)
+        if ended:
             cur["exit_reported"] = True
             emit({"ev": "exit", "rc": None,
                   "reason": "session ended %s" % rec["ended"] if rec.get("ended") else "session process gone"})
@@ -762,7 +773,8 @@ def op_list(args):
                 continue
             meta, pids, ex = _run_files(d)
             cur = {}
-            _scan_out(os.path.join(d, "out.jsonl"), cur, lambda e, _c=cur: _c.__setitem__("last", e) if e["ev"] == "turn" else None)
+            _scan_out(os.path.join(d, "out.jsonl"), cur, drain=True,
+                      emit=lambda e, at=None, _c=cur: _c.__setitem__("last", e) if e["ev"] == "turn" else None)
             last = cur.get("last") or {}
             runs.append({
                 "name": name, "alive": claude_alive(pids), "keeper_alive": keeper_alive(pids),

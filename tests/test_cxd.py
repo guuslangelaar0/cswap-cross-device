@@ -629,7 +629,9 @@ class TestExitRecord(Base):
     """watch reports a run's exit with the rc its supervisor records. claude
     is reaped (and so already gone) a moment before exit.json is written."""
 
-    def fake_run(self, name, supervisor_alive, gen=1, pids=True):
+    def fake_run(self, name, supervisor_alive, gen=1, pids=True, claude=None):
+        """A run directory; claude is a live process standing in for claude, or
+        None for one that is gone."""
         from cxd.common import atomic_write_json, proc_identity
         d = os.path.join(self.local, "runs", name)
         os.makedirs(d, mode=0o700)
@@ -637,6 +639,8 @@ class TestExitRecord(Base):
         gone.wait()
         rec = {"gen": gen, "claude_pid": gone.pid, "claude_ident": "never:" + name,
                "keeper_pid": gone.pid, "keeper_ident": "never:" + name}
+        if claude is not None:
+            rec.update(claude_pid=claude.pid, claude_ident=proc_identity(claude.pid))
         if supervisor_alive:
             sup = subprocess.Popen(["sleep", "60"])
             self.bg.append(sup)
@@ -693,14 +697,48 @@ class TestExitRecord(Base):
 
     SID = "77777777-1111-2222-3333-444444444444"
 
-    def run_with_lines(self, name, lines):
-        from cxd.common import atomic_write_json
-        d = self.fake_run(name, supervisor_alive=False)
+    def run_with_lines(self, name, lines, claude=None):
+        d = self.fake_run(name, supervisor_alive=False, claude=claude)
+        self.add_lines(d, lines)
+        if claude is None:
+            self.exited(d)
+        return d
+
+    def add_lines(self, d, lines):
         with open(os.path.join(d, "out.jsonl"), "a") as f:
             for line in lines:
                 f.write(json.dumps(line) + "\n")
-        atomic_write_json(os.path.join(d, "exit.json"), {"gen": 1, "rc": 0})
-        return d
+
+    def exited(self, d, rc=0):
+        from cxd.common import atomic_write_json
+        atomic_write_json(os.path.join(d, "exit.json"), {"gen": 1, "rc": rc})
+
+    def live_claude(self):
+        p = subprocess.Popen(["sleep", "60"])
+        self.bg.append(p)
+        return p
+
+    @staticmethod
+    def text(t):
+        return {"type": "assistant", "message": {"content": [{"type": "text", "text": t}]}}
+
+    def assert_resumes_exactly(self, target, events, rest_after_poll=()):
+        """From every event's cursor, a poll gives exactly the events after it:
+        in the same order within one poll; across polls a resumed poll may give
+        the output's events before the reports', but none lost, none twice, and
+        the exit last."""
+        from cxd import state
+        strip = lambda evs: [{k: v for k, v in e.items() if k != "_cursor"} for e in evs]
+        for i, e in enumerate(events):
+            rest, _ = state.poll(target, json.loads(json.dumps(e["_cursor"])))
+            want = strip(list(events[i + 1:]) + list(rest_after_poll))
+            got = strip(rest)
+            if rest_after_poll:
+                key = lambda x: json.dumps(x, sort_keys=True)
+                self.assertEqual(sorted(got, key=key), sorted(want, key=key), "resumed after event %d (%s)" % (i, e))
+                self.assertEqual(got[-1:], want[-1:])
+            else:
+                self.assertEqual(got, want, "resumed after event %d (%s)" % (i, e))
 
     def notify(self, text):
         os.makedirs(os.path.join(self.local, "outbox"), mode=0o700, exist_ok=True)
@@ -708,11 +746,11 @@ class TestExitRecord(Base):
             f.write(json.dumps({"kind": "notify", "session_id": self.SID, "text": text}) + "\n")
 
     def test_resuming_after_any_event_delivers_exactly_the_rest(self):
-        """GUARD event-line-start. Mutation: every event of a line carries the
+        """GUARD event-line-skip. Mutation: every event of a line carries the
         cursor from after the line -> a client that drops after the first PR of
         a line (or after the PR of a final result) never gets the rest of it."""
         from cxd import state
-        text = lambda t: {"type": "assistant", "message": {"content": [{"type": "text", "text": t}]}}
+        text = self.text
         self.run_with_lines("wl", [
             {"type": "system", "subtype": "init", "session_id": self.SID, "model": "m"},
             text("see https://github.com/o/r/pull/1 and https://github.com/o/r/pull/2"),
@@ -723,20 +761,77 @@ class TestExitRecord(Base):
              "session_id": self.SID},
         ])
         self.notify("MARK-NOTIFY")
-        strip = lambda evs: [{k: v for k, v in e.items() if k != "_cursor"} for e in evs]
         with self.home_env():
             events, _ = state.poll("wl", {})
             self.assertEqual([e["ev"] for e in events],
                              ["init", "pr", "pr", "pr", "turn", "turn", "outbox", "exit"], events)
             self.assertEqual((events[-1]["turns"], events[-1]["cost_usd"]), (2, 0.03))
-            for i, e in enumerate(events[:-1]):
-                rest, _ = state.poll("wl", json.loads(json.dumps(e["_cursor"])))
-                self.assertEqual(strip(rest), strip(events[i + 1:]), "resumed after event %d (%s)" % (i, e))
+            self.assert_resumes_exactly("wl", events)
+
+    def test_resuming_across_polls_delivers_exactly_the_rest(self):
+        """GUARD event-cursor-deep. Mutation: an event's cursor is a shallow copy
+        -> the outbox offsets in it move on with the rest of the poll, and a
+        client that drops after an output event loses the reports after it."""
+        from cxd import state
+        claude = self.live_claude()
+        d = self.run_with_lines("wx", [{"type": "system", "subtype": "init", "session_id": self.SID}], claude=claude)
+        self.notify("MARK-1")
+        with self.home_env():
+            first, cur = state.poll("wx", {})
+            self.assertEqual([e["ev"] for e in first], ["init", "outbox"])
+            self.add_lines(d, [self.text("https://github.com/o/r/pull/7 https://github.com/o/r/pull/8"),
+                               {"type": "result", "subtype": "success", "result": "MARK-T1"}])
+            self.notify("MARK-2")
+            claude.kill()
+            claude.wait()
+            self.exited(d)
+            second, _ = state.poll("wx", cur)
+            self.assertEqual([e["ev"] for e in second], ["pr", "pr", "turn", "outbox", "exit"], second)
+            self.assert_resumes_exactly("wx", second)
+            self.assert_resumes_exactly("wx", first, rest_after_poll=second)
+
+    def test_a_live_claude_clears_an_earlier_wait_from_every_event(self):
+        """GUARD exit-wait-alive. Mutation: a live claude leaves an earlier exit
+        wait in the cursor -> a client that resumes from such an event later
+        cuts the wait for the exit code short (rc=None)."""
+        from cxd import state
+        d = self.run_with_lines("wa", [], claude=self.live_claude())
+        self.add_lines(d, [{"type": "result", "subtype": "success", "result": "x"}])
+        stale = {"exit_wait": {"gen": 1, "t": time.time() - 9}}  # a check that once failed
+        with self.home_env():
+            events, cur = state.poll("wa", stale)
+        self.assertEqual([e["ev"] for e in events], ["turn"])
+        self.assertNotIn("exit_wait", events[0]["_cursor"])
+        self.assertNotIn("exit_wait", cur)
+
+    def test_the_scan_before_the_exit_reads_to_the_end(self):
+        """GUARD exit-drain. Mutation: the scan before the exit reads one chunk
+        like any other -> after a long run the exit comes with too few turns and
+        the rest of its events are never sent."""
+        from cxd import state
+        self.run_with_lines("wd", [{"type": "result", "subtype": "success", "result": "MARK-%d" % i,
+                                    "total_cost_usd": 0.01 * (i + 1)} for i in range(10)])
+        with self.home_env(), mock.patch.object(state, "SCAN_CHUNK", 300):
+            events, _ = state.poll("wd", {})
+        self.assertEqual([e["ev"] for e in events], ["turn"] * 10 + ["exit"])
+        self.assertEqual((events[-1]["turns"], events[-1]["cost_usd"]), (10, 0.1))
+
+    def test_a_long_run_is_read_a_chunk_per_poll_while_it_lives(self):
+        from cxd import state
+        self.run_with_lines("wk", [{"type": "result", "subtype": "success", "result": "MARK-%d" % i}
+                                   for i in range(10)], claude=self.live_claude())
+        with self.home_env(), mock.patch.object(state, "SCAN_CHUNK", 300):
+            events, cur = state.poll("wk", {})
+            self.assertLess(len(events), 10)
+            while len(events) < 10:
+                more, cur = state.poll("wk", cur)
+                self.assertTrue(more)
+                events += more
+        self.assertEqual([e["turn"] for e in events], list(range(1, 11)))
 
     def test_a_notify_written_as_the_run_exits_comes_before_the_exit(self):
-        """GUARD exit-flush-outbox. Mutation: the final flush re-reads out.jsonl
-        but not the outbox -> a report written just before the exit is lost (the
-        watch ends at the exit)."""
+        """The exit is decided before the scan, so a report written while the
+        run exits is read before the exit (the watch ends there)."""
         from cxd import state
         self.run_with_lines("wn", [{"type": "system", "subtype": "init", "session_id": self.SID}])
         real = state._exit_record
@@ -751,6 +846,7 @@ class TestExitRecord(Base):
 
     def test_events_of_the_poll_that_starts_the_exit_wait_carry_it(self):
         """A break right after such an event does not start the wait again."""
+        # (the wait is decided before the scan)
         from cxd import state
         d = self.fake_run("ww", supervisor_alive=True)
         with open(os.path.join(d, "out.jsonl"), "a") as f:
