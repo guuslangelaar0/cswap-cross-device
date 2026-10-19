@@ -1204,7 +1204,7 @@ class TestSupervisorRobust(Base):
 
         def popen(cmd, *a, **kw):
             p = real_popen(cmd, *a, **kw)
-            if "-p" in cmd:
+            if cmd and cmd[0] == self.env["CXD_CLAUDE"]:  # claude itself (on macOS `ps -p` comes here too)
                 started.append(p)
             return p
         real_ident = supervise.proc_identity
