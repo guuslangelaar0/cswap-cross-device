@@ -2539,46 +2539,46 @@ class TestIdleWaker(Base):
         p = self.claude(sid, env={"CXD_WAKE_CHECK_S": "300"})
         self.assertTrue(self.registered(sid) and self.marked_idle(sid))
         time.sleep(1.0)  # past the waker's first check
-        waker = None
+        waker = wrapper = None
         for _ in range(50):
-            for pid in os.listdir("/proc") if os.path.isdir("/proc") else []:
-                try:
-                    with open("/proc/%s/cmdline" % pid, "rb") as f:
-                        cmd = f.read().split(b"\0")
-                except OSError:
-                    continue
-                if b"_hook" in cmd and b"Wake" in cmd and str(p.pid).encode() in self._ancestry(int(pid)):
-                    waker = int(pid)
+            procs = {}  # pid -> (ppid, args), from ps: the same on Linux and macOS
+            out = subprocess.run(["ps", "-ww", "-eo", "pid=,ppid=,args="], stdout=subprocess.PIPE,
+                                 universal_newlines=True).stdout
+            for line in out.splitlines():
+                parts = line.split(None, 2)
+                if len(parts) == 3:
+                    procs[int(parts[0])] = (int(parts[1]), parts[2])
+
+            def under(pid, ancestor):
+                for _ in range(8):
+                    pid = procs.get(pid, (0, ""))[0]
+                    if pid == ancestor:
+                        return True
+                    if pid <= 1:
+                        return False
+                return False
+            for pid, (ppid, args) in procs.items():
+                if "_hook Wake" in args and under(pid, p.pid):
+                    waker, wrapper = pid, ppid
             if waker:
                 break
             time.sleep(0.1)
-        if not waker:
-            self.skipTest("needs /proc to find the waker")
-        with open("/proc/%d/stat" % waker) as f:
-            wrapper = int(f.read().rsplit(")", 1)[1].split()[1])
+        self.assertTrue(waker, "the waker process was not found")
         os.kill(wrapper, signal.SIGKILL)
         self.queue(sid, "MARK-ORPHAN")
+        def alive(pid):
+            try:
+                os.kill(pid, 0)
+                return True
+            except OSError:
+                return False
         deadline = time.time() + 15
-        while os.path.exists("/proc/%d" % waker) and time.time() < deadline:
+        while alive(waker) and time.time() < deadline:
             time.sleep(0.1)
-        self.assertFalse(os.path.exists("/proc/%d" % waker), "the waker should have delivered and exited")
+        self.assertFalse(alive(waker), "the waker should have delivered and exited")
         delivered = os.path.join(self.local, "delivered", sid)
         self.assertEqual(os.listdir(delivered) if os.path.isdir(delivered) else [], [])
         self.assertTrue(os.listdir(os.path.join(self.local, "claimed", sid)))  # recovered by the next hook
-
-    @staticmethod
-    def _ancestry(pid):
-        out = []
-        for _ in range(8):
-            try:
-                with open("/proc/%d/stat" % pid) as f:
-                    pid = int(f.read().rsplit(")", 1)[1].split()[1])
-            except (OSError, ValueError):
-                break
-            out.append(str(pid).encode())
-            if pid <= 1:
-                break
-        return out
 
     def test_the_running_version_is_read_from_the_executable(self):
         from cxd import hook
