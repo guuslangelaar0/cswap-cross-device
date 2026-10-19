@@ -469,8 +469,12 @@ class Driver(object):
         return "PASS: after Esc the message waited for the next prompt, which delivered it (documented limitation)"
 
     def _streaming(self, n0):
-        """The numbers have started to appear on screen."""
-        return len(re.findall(r"(?m)^\s*\d+\s*$", self.pane())) >= 3 or len(self.assistant_texts()) > n0
+        """The answer is streaming: numbers on screen, or the spinner counting
+        tokens down ("(12s · ↓ 1.2k tokens)"), which is all Claude Code shows of
+        a long answer until it is done."""
+        pane = self.pane()
+        return (len(re.findall(r"(?m)^\s*\d+\s*$", pane)) >= 3 or bool(re.search(r"\u2193 [\d.]+k? tokens", pane))
+                or len(self.assistant_texts()) > n0)
 
     def _interrupted(self):
         try:
