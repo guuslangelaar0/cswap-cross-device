@@ -11,6 +11,7 @@ Runs of real Claude Code that prove documented features, beyond the stub-based t
 
 | Date | Feature | Platform | Result | Log |
 | --- | --- | --- | --- | --- |
+| 2026-10-19 | Secret scans: gitleaks over every commit and the tree, and the repository's own check | Linux, macOS | clean | [log](2026-10-19-gitleaks.md) |
 | 2026-10-18 | Hook delivery into an interactive session: PostToolUse, UserPromptSubmit, Stop (and the session continues), idle | Linux, Claude Code 2.1.302 | A, B, C pass; D: idle sessions wait for the next prompt | [log](2026-10-18-tui-delivery-linux.md) |
 
 Drivers live in `scripts/evidence/`.
