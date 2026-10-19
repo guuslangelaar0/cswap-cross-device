@@ -2131,7 +2131,8 @@ class TestIdleWaker(Base):
             f.write(FAKE_CLAUDE_WAKER)
         outdir = os.path.join(self.tmp, "wake-" + sid[:8] + "-%d" % len(self.bg))
         os.makedirs(outdir)
-        e = dict(self.env, HOOK=HOOK, OUTDIR=outdir, CXD_WAKE_CHECK_S="0.5", CXD_CLAUDE_VERSION="2.1.302")
+        e = dict(self.env, HOOK=HOOK, OUTDIR=outdir, CXD_WAKE_CHECK_S="0.5", CXD_CLAUDE_VERSION="2.1.302",
+                 CLAUDE_CODE_ENTRYPOINT="cli")
         e.update(env or {})
         p = subprocess.Popen(["claude", script, sid] + list(extra), executable="/bin/bash", env=e,
                              stdin=subprocess.DEVNULL, start_new_session=True)
@@ -2170,6 +2171,41 @@ class TestIdleWaker(Base):
             time.sleep(0.1)
         return False
 
+    def marked_idle(self, sid, timeout=10):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if os.path.exists(os.path.join(self.local, "turn", sid + ".idle")):
+                return True
+            time.sleep(0.05)
+        return False
+
+    def is_idle(self, sid):
+        from cxd import hook
+        with mock.patch.dict(os.environ, {"CXD_HOME": self.local}):
+            return hook.is_idle(sid)
+
+    def run_hook(self, event, payload, env=None):
+        return subprocess.run([HOOK, event], input=json.dumps(payload).encode(), stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, env=dict(self.env, **(env or {})), timeout=30)
+
+    def tag(self, sid):
+        with open(os.path.join(self.local, "sessions", sid + ".json")) as f:
+            return json.load(f)["tag"]
+
+    def queue(self, sid, text, n=1):
+        inbox = os.path.join(self.local, "inbox", sid)
+        os.makedirs(inbox, mode=0o700, exist_ok=True)
+        mid = "000000000000000000%d-000001" % n
+        with open(os.path.join(inbox, mid + ".json"), "w") as f:
+            json.dump({"id": mid, "ts": "t", "sender": "s", "text": text}, f)
+
+    @staticmethod
+    def tick():
+        """File times come from the kernel's coarse clock: marks a few
+        milliseconds apart can carry the same time (and a tie counts as busy).
+        Real turns are seconds apart; tests space their marks."""
+        time.sleep(0.05)
+
     def lock_free(self, sid):
         import fcntl
         p = os.path.join(self.local, "wake", sid + ".lock")
@@ -2195,6 +2231,7 @@ class TestIdleWaker(Base):
         err = self.wake_err(p)
         self.assertIn("arrived while it was idle", err)
         self.assertIn("MARK-WAKE", err)
+        self.assertIn("[cxd:%s]" % self.tag(sid), err)  # GUARD wake-tagged: the lead's mark
         with open(os.path.join(self.local, "outbox", sid + ".jsonl")) as f:
             receipts = [json.loads(l) for l in f if '"delivered"' in l]
         self.assertEqual([r["event"] for r in receipts], ["Wake"])
@@ -2240,7 +2277,7 @@ class TestIdleWaker(Base):
         sid = "a6a6a6a6-2222-3333-4444-555555555555"
         os.makedirs(os.path.join(self.local, "sessions"), mode=0o700, exist_ok=True)
         rec_p = os.path.join(self.local, "sessions", sid + ".json")
-        atomic_write_json(rec_p, {"session_id": sid, "ended": "2026-01-01T00:00:00+0000"})
+        atomic_write_json(rec_p, {"session_id": sid, "ended": "2026-01-01T00:00:00+0000", "tag": "t0t0t0t0t0t0"})
         os.utime(rec_p, (time.time() - 60,) * 2)
         os.makedirs(os.path.join(self.local, "turn"), mode=0o700, exist_ok=True)
         open(os.path.join(self.local, "turn", sid + ".idle"), "w").close()  # the resume's SessionStart
@@ -2259,6 +2296,25 @@ class TestIdleWaker(Base):
         hold the session."""
         sid = "a4a4a4a4-2222-3333-4444-555555555555"
         p = self.claude(sid, extra=["-p", "hello"])
+        self.assertEqual(self.wake_rc(p, timeout=10), 0)
+        p = self.claude(sid, extra=["--print", "hello"], env={"NO_REGISTER": "1"})
+        self.assertEqual(self.wake_rc(p, timeout=10), 0)
+
+    def test_print_mode_in_a_group_of_short_flags_is_print_mode(self):
+        """GUARD wake-short-flags. Mutation: only `-p` and `--print` count ->
+        `claude -cp "..."` is held by its waker for up to a day."""
+        sid = "a4a4a4b4-2222-3333-4444-555555555555"
+        p = self.claude(sid, extra=["-cp", "hello"])
+        self.assertEqual(self.wake_rc(p, timeout=10), 0)
+
+    def test_only_the_interactive_entry_point_gets_a_waker(self):
+        """GUARD wake-entrypoint. Mutation: the entry point is not checked -> a
+        print-mode session whose flags the waker cannot see (a launcher, a
+        renamed process) is held."""
+        sid = "a4a4a4c4-2222-3333-4444-555555555555"
+        p = self.claude(sid, env={"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"})
+        self.assertEqual(self.wake_rc(p, timeout=10), 0)
+        p = self.claude(sid, env={"CLAUDE_CODE_ENTRYPOINT": "", "NO_REGISTER": "1"})
         self.assertEqual(self.wake_rc(p, timeout=10), 0)
 
     def test_waker_needs_a_claude_code_that_backgrounds_it(self):
@@ -2285,10 +2341,12 @@ class TestIdleWaker(Base):
 
     def test_waker_leaves_a_busy_turn_to_the_hooks(self):
         """GUARD wake-idle-only. Mutation: the waker claims during a turn ->
-        it races PostToolUse and the message arrives out of turn."""
+        it races PostToolUse and the message arrives out of turn. GUARD
+        busy-mark: the same if UserPromptSubmit does not mark the turn."""
         sid = "a8a8a8a8-2222-3333-4444-555555555555"
         p = self.claude(sid)
         self.assertTrue(self.registered(sid))
+        self.assertTrue(self.marked_idle(sid))
         # A prompt starts a turn (the UserPromptSubmit hook marks the session busy).
         r = subprocess.run([HOOK, "UserPromptSubmit"], input=json.dumps({"session_id": sid, "prompt": "go"}).encode(),
                            stdout=subprocess.PIPE, env=self.env)
@@ -2309,11 +2367,215 @@ class TestIdleWaker(Base):
         self.assertEqual(self.wake_rc(p), 2, self.wake_err(p))
         self.assertIn("MARK-IDLE-AGAIN", self.wake_err(p))
 
+    def test_a_woken_turn_is_busy(self):
+        """GUARD wake-marks-busy. Mutation: the waker wakes the session but leaves
+        it marked idle -> the woken turn has no UserPromptSubmit, so the next
+        waker claims mail in the middle of that turn."""
+        sid = "a9a9a9a9-2222-3333-4444-555555555555"
+        p = self.claude(sid)
+        self.assertTrue(self.registered(sid) and self.marked_idle(sid))
+        self.ok("send", "laptop", sid, "MARK-W1")
+        self.assertEqual(self.wake_rc(p), 2, self.wake_err(p))
+        self.assertFalse(self.is_idle(sid))
+        # The woken turn runs; a waker that a Stop of another turn started meanwhile
+        # (here a second process for the same session) must leave new mail alone.
+        w2 = self.claude(sid, env={"NO_REGISTER": "1"})
+        time.sleep(1.0)
+        self.ok("send", "laptop", sid, "MARK-W2")
+        self.assertIsNone(self.wake_rc(w2, timeout=2.0), "claimed during the woken turn")
+
+    def test_a_stop_that_delivered_keeps_the_turn_busy(self):
+        """GUARD stop-delivered-busy. Mutation: a Stop that delivered mail leaves
+        an idle mark standing -> in a turn that did not start with a prompt
+        (woken by Claude Code itself) the waker claims while the turn goes on."""
+        sid = "b1b1b1b1-2222-3333-4444-555555555555"
+        self.run_hook("SessionStart", {"session_id": sid, "source": "startup", "cwd": self.tmp})
+        self.assertTrue(self.is_idle(sid))
+        self.queue(sid, "MARK-STOP")  # (no claude around this test's hooks: queue it directly)
+        self.tick()
+        r = self.run_hook("Stop", {"session_id": sid, "last_assistant_message": "x"})
+        self.assertIn("MARK-STOP", r.stdout.decode())
+        self.assertFalse(self.is_idle(sid))
+        self.tick()
+        self.run_hook("Stop", {"session_id": sid, "last_assistant_message": "y"})  # nothing to deliver
+        self.assertTrue(self.is_idle(sid))
+
+    def test_a_compaction_leaves_the_turn_marks_alone(self):
+        """GUARD idle-not-on-compact. Mutation: SessionStart marks idle after a
+        compaction too -> an automatic compaction in the middle of a turn lets
+        the waker claim during that turn."""
+        sid = "b2b2b2b2-2222-3333-4444-555555555555"
+        self.run_hook("SessionStart", {"session_id": sid, "source": "startup", "cwd": self.tmp})
+        self.tick()
+        self.run_hook("UserPromptSubmit", {"session_id": sid, "prompt": "go"})
+        self.assertFalse(self.is_idle(sid))
+        self.tick()
+        self.run_hook("SessionStart", {"session_id": sid, "source": "compact", "cwd": self.tmp})
+        self.assertFalse(self.is_idle(sid))
+        for source in ("clear", "resume"):
+            self.tick()
+            self.run_hook("SessionStart", {"session_id": sid, "source": source, "cwd": self.tmp})
+            self.assertTrue(self.is_idle(sid), source)
+
+    def test_a_turn_ended_by_an_api_error_is_idle(self):
+        """GUARD stopfailure-idle. Mutation: StopFailure is ignored -> after a
+        turn that ended in an API error the session stays busy and mail waits
+        for the next prompt."""
+        sid = "b3b3b3b3-2222-3333-4444-555555555555"
+        self.run_hook("SessionStart", {"session_id": sid, "source": "startup", "cwd": self.tmp})
+        self.tick()
+        self.run_hook("UserPromptSubmit", {"session_id": sid, "prompt": "go"})
+        self.tick()
+        r = self.run_hook("StopFailure", {"session_id": sid, "error": "rate_limit"})
+        self.assertEqual((r.returncode, r.stdout), (0, b""))
+        self.assertTrue(self.is_idle(sid))
+
+    def test_marks_with_the_same_time_count_as_busy(self):
+        """GUARD wake-tie-busy. Mutation: a tie counts as idle -> on a file
+        system with coarse timestamps a prompt in the same tick as the Stop
+        looks idle."""
+        sid = "b4b4b4b4-2222-3333-4444-555555555555"
+        d = os.path.join(self.local, "turn")
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        for n in ("idle", "busy"):
+            open(os.path.join(d, "%s.%s" % (sid, n)), "w").close()
+            os.utime(os.path.join(d, "%s.%s" % (sid, n)), ns=(1700000000 * 10 ** 9,) * 2)
+        self.assertFalse(self.is_idle(sid))
+
+    def test_only_the_wakers_own_code_wakes_claude(self):
+        """GUARD wake-exit-code. Mutation: the wrapper passes Python's exit 2 on
+        -> a broken install (`can't open file`, exit 2) wakes Claude with the
+        error after every turn."""
+        fake = os.path.join(self.tmp, "py-exits-2")
+        with open(fake, "w") as f:
+            f.write("#!/bin/sh\necho 'python3: cannot open file' >&2\nexit 2\n")
+        os.chmod(fake, 0o755)
+        r = self.run_hook("Wake", {"session_id": "b5b5b5b5-2222-3333-4444-555555555555"}, env={"CXD_PYTHON": fake})
+        self.assertEqual(r.returncode, 0)
+
+    def test_a_record_without_a_tag_is_left_to_the_hooks(self):
+        """GUARD wake-tag. Mutation: the waker also delivers for a record
+        without a tag -> it wakes Claude with a message that carries no lead
+        mark."""
+        from cxd.common import atomic_write_json
+        sid = "b6b6b6b6-2222-3333-4444-555555555555"
+        p = self.claude(sid)
+        self.assertTrue(self.registered(sid) and self.marked_idle(sid))
+        rec_p = os.path.join(self.local, "sessions", sid + ".json")
+        with open(rec_p) as f:
+            rec = json.load(f)
+        rec.pop("tag")
+        atomic_write_json(rec_p, rec)
+        self.queue(sid, "MARK-UNTAGGED")
+        self.assertEqual(self.wake_rc(p), 0)
+        self.assertTrue(os.listdir(os.path.join(self.local, "inbox", sid)))  # still queued
+
+    def test_the_session_ending_just_before_the_claim_is_checked(self):
+        """GUARD wake-recheck. Mutation: no check right before the claim -> mail
+        that arrives with the session's end is woken into an ended session
+        (between two periodic checks)."""
+        sid = "b7b7b7b7-2222-3333-4444-555555555555"
+        p = self.claude(sid, env={"CXD_WAKE_CHECK_S": "300"})
+        self.assertTrue(self.registered(sid) and self.marked_idle(sid))
+        time.sleep(1.0)  # past the waker's first check
+        self.run_hook("SessionEnd", {"session_id": sid, "reason": "other"})
+        self.queue(sid, "MARK-LATE")
+        self.assertEqual(self.wake_rc(p), 0)
+        self.assertTrue(os.listdir(os.path.join(self.local, "inbox", sid)))
+
+    def test_a_session_resumed_by_another_process_loses_its_old_waker(self):
+        """GUARD wake-moved. Mutation: only the end is checked -> after the
+        session is resumed elsewhere the old waker keeps its lock, and its mail
+        would go into the conversation the old process hosts now."""
+        from cxd.common import atomic_write_json, proc_identity
+        sid = "b8b8b8b8-2222-3333-4444-555555555555"
+        p = self.claude(sid)
+        self.assertTrue(self.registered(sid) and self.marked_idle(sid))
+        time.sleep(1.0)
+        other = subprocess.Popen(["sleep", "60"])
+        self.bg.append(other)
+        rec_p = os.path.join(self.local, "sessions", sid + ".json")
+        with open(rec_p) as f:
+            rec = json.load(f)
+        rec.update(pid=other.pid, pid_ident=proc_identity(other.pid))
+        atomic_write_json(rec_p, rec)
+        self.assertEqual(self.wake_rc(p), 0)
+
+    def test_without_its_wrapper_the_waker_does_not_ack(self):
+        """GUARD wake-ack-wrapper. Mutation: the waker acks whether or not its
+        wrapper still lives -> a waker whose wrapper was killed after its last
+        check marks mail delivered that nobody showed to Claude."""
+        sid = "b9b9b9b9-2222-3333-4444-555555555555"
+        p = self.claude(sid, env={"CXD_WAKE_CHECK_S": "300"})
+        self.assertTrue(self.registered(sid) and self.marked_idle(sid))
+        time.sleep(1.0)  # past the waker's first check
+        waker = None
+        for _ in range(50):
+            for pid in os.listdir("/proc") if os.path.isdir("/proc") else []:
+                try:
+                    with open("/proc/%s/cmdline" % pid, "rb") as f:
+                        cmd = f.read().split(b"\0")
+                except OSError:
+                    continue
+                if b"_hook" in cmd and b"Wake" in cmd and str(p.pid).encode() in self._ancestry(int(pid)):
+                    waker = int(pid)
+            if waker:
+                break
+            time.sleep(0.1)
+        if not waker:
+            self.skipTest("needs /proc to find the waker")
+        with open("/proc/%d/stat" % waker) as f:
+            wrapper = int(f.read().rsplit(")", 1)[1].split()[1])
+        os.kill(wrapper, signal.SIGKILL)
+        self.queue(sid, "MARK-ORPHAN")
+        deadline = time.time() + 15
+        while os.path.exists("/proc/%d" % waker) and time.time() < deadline:
+            time.sleep(0.1)
+        self.assertFalse(os.path.exists("/proc/%d" % waker), "the waker should have delivered and exited")
+        delivered = os.path.join(self.local, "delivered", sid)
+        self.assertEqual(os.listdir(delivered) if os.path.isdir(delivered) else [], [])
+        self.assertTrue(os.listdir(os.path.join(self.local, "claimed", sid)))  # recovered by the next hook
+
+    @staticmethod
+    def _ancestry(pid):
+        out = []
+        for _ in range(8):
+            try:
+                with open("/proc/%d/stat" % pid) as f:
+                    pid = int(f.read().rsplit(")", 1)[1].split()[1])
+            except (OSError, ValueError):
+                break
+            out.append(str(pid).encode())
+            if pid <= 1:
+                break
+        return out
+
+    def test_the_running_version_is_read_from_the_executable(self):
+        from cxd import hook
+        vdir = os.path.join(self.tmp, "share", "claude", "versions")
+        os.makedirs(vdir)
+        exe = os.path.join(vdir, "2.1.301")
+        shutil.copy("/bin/sleep", exe)
+        proc = subprocess.Popen([exe, "30"])
+        self.bg.append(proc)
+        pkg = os.path.join(self.tmp, "node_modules", "@anthropic-ai", "claude-code")
+        os.makedirs(os.path.join(pkg, "bin"))
+        with open(os.path.join(pkg, "package.json"), "w") as f:
+            json.dump({"name": "@anthropic-ai/claude-code", "version": "2.1.290"}, f)
+        env = {k: v for k, v in os.environ.items() if k != "CXD_CLAUDE_VERSION"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            if os.path.exists("/proc/%d/exe" % proc.pid):
+                self.assertEqual(hook._claude_version(proc.pid, ["claude"]), (2, 1, 301))
+            self.assertEqual(hook._claude_version(os.getpid(), ["node", os.path.join(pkg, "bin", "claude.exe")]),
+                             (2, 1, 290))
+            self.assertEqual(hook._claude_version(os.getpid(), ["node", os.path.join(pkg, "cli.js")]), (2, 1, 290))
+            self.assertIsNone(hook._claude_version(os.getpid(), ["claude"]))  # never `claude --version`
+
     def test_hooks_json_runs_the_waker_as_async_rewake(self):
         from cxd.hook import WAKE_SECONDS
         with open(os.path.join(REPO, "hooks", "hooks.json")) as f:
             hooks = json.load(f)["hooks"]
-        for event in ("SessionStart", "Stop"):
+        for event in ("SessionStart", "Stop", "StopFailure"):
             wakers = [h for group in hooks[event] for h in group["hooks"] if h["command"].endswith(" Wake")]
             self.assertEqual(len(wakers), 1, event)
             self.assertIs(wakers[0].get("asyncRewake"), True)

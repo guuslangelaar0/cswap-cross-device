@@ -8,7 +8,11 @@ SessionStart      register ~/.cxd/sessions/<sid>.json (pid, cwd, config dir, tag
 PostToolUse       \
 UserPromptSubmit   > claim queued inbox messages, return them as additionalContext,
 Stop              /  ack them once written (Stop also records last_assistant_message)
+StopFailure       the turn ended in an API error: the session is idle
 SessionEnd        mark the session ended
+Wake              the idle waker (an asyncRewake hook started at SessionStart, Stop
+                  and StopFailure): deliver mail to an idle interactive session and
+                  wake it (see the comment above wake())
 """
 
 import json
@@ -60,23 +64,28 @@ def _is_claude(argv):
     return False
 
 
-def _claude_pid():
-    """The nearest claude ancestor of this hook process. (CLAUDE_PID in the
-    environment is not trusted: a session started from another session's Bash
-    tool inherits the parent's value.) If the session's own claude were not
-    recognised, the walk would reach an outer session's claude and register
-    that pid, so this recognises every way Claude Code is launched."""
+def _claude_process():
+    """(pid, argv) of the nearest claude ancestor of this hook process, or
+    (None, None). (CLAUDE_PID in the environment is not trusted: a session
+    started from another session's Bash tool inherits the parent's value.) If
+    the session's own claude were not recognised, the walk would reach an
+    outer session's claude, so this recognises every way Claude Code is
+    launched."""
     pid = os.getppid()
     for _ in range(6):
         if not pid or pid <= 1:
-            return None
+            return None, None
         ppid, argv = proc_parent_and_argv(pid)
         if argv is None:
-            return None
+            return None, None
         if _is_claude(argv):
-            return pid
+            return pid, argv
         pid = ppid
-    return None
+    return None, None
+
+
+def _claude_pid():
+    return _claude_process()[0]
 
 
 def _account_label():
@@ -313,8 +322,15 @@ def handle(event, data):
         tag = session_tag(sid)
         if tag:
             ctx = ANNOUNCE % tag + ("\n\n" + ctx if ctx else "")
-    if event == "SessionStart" or (event == "Stop" and not claims):
-        mark_idle(sid)  # a Stop that delivered mail continues the turn: still busy
+    if event == "SessionStart" and data.get("source") != "compact":  # GUARD:idle-not-on-compact
+        mark_idle(sid)  # a compaction can come in the middle of a turn
+    elif event == "Stop":
+        if claims:
+            mark_busy(sid)  # GUARD:stop-delivered-busy (the turn goes on with the mail)
+        else:
+            mark_idle(sid)
+    elif event == "StopFailure":
+        mark_idle(sid)  # GUARD:stopfailure-idle (an API error ended the turn: there is no Stop)
     if event == "Stop":
         ensure_dir(path("outbox"))
         last = data.get("last_assistant_message")
@@ -353,47 +369,50 @@ def _announce(data, fresh_tag=False):
 
 # The idle waker. Hooks run only while a session does something, so a session
 # that sits idle at its prompt would see a message only when someone types.
-# hooks.json also runs `cxd-hook Wake` on SessionStart and Stop as an
-# asyncRewake hook: in an interactive session Claude Code runs it in the
+# hooks.json also runs `cxd-hook Wake` on SessionStart, Stop and StopFailure
+# as an asyncRewake hook: in an interactive session Claude Code runs it in the
 # background, and when it exits 2 it shows its stderr to Claude as hook
 # feedback and wakes the session. The waker waits for mail for its session,
-# claims it like any hook, writes it to stderr, acks it and exits 2.
+# claims it like any hook, writes it to stderr, acks it and returns
+# WAKE_DELIVERED, which the wrapper turns into exit 2 (any other failure,
+# even Python's own exit 2, ends as exit 0: never a wake-up loop).
 #
 # Claude Code runs an asyncRewake hook in the background only in interactive
 # sessions (and with streamed input); with `claude -p "prompt"` it runs it
 # synchronously, and a waiting waker would hold the session. So the waker
 # first finds its own claude process and leaves at once (exit 0) unless that
-# process is interactive and runs a Claude Code version known to background
-# asyncRewake hooks. While it waits it watches that process (not the session
-# record, which a resume rewrites), its wrapper, the session's end and the
-# idle_wake setting, and claims mail only while the session is idle (marked
-# by SessionStart and by a Stop that delivered nothing, cleared by
-# UserPromptSubmit): during a turn the other hooks deliver. One waker per session (a lock
-# held while it lives); WAKE_SECONDS is below Claude Code's timeout in
-# hooks.json.
+# process is interactive (CLAUDE_CODE_ENTRYPOINT=cli and no print flag) and
+# its executable is a Claude Code version known to background asyncRewake
+# hooks. While it waits it watches that process, its wrapper, the session's
+# end, the session moving to another process and the idle_wake setting. It
+# claims mail only while the session is idle: marked at SessionStart (not
+# after a compaction, which can happen mid-turn), at a Stop that delivered
+# nothing and at StopFailure; marked busy by UserPromptSubmit, by a Stop that
+# delivered mail, and by the waker itself when it wakes the session (a woken
+# turn has no UserPromptSubmit). During a turn the other hooks deliver. One
+# waker per session (a lock held while it lives); WAKE_SECONDS is below
+# Claude Code's timeout in hooks.json.
 
 WAKE_SECONDS = 86400 - 600
 WAKE_POLL = 1.0
+WAKE_DELIVERED = 42  # hooks/cxd-hook turns this, and only this, into exit 2
 MIN_CLAUDE_FOR_WAKER = (2, 1, 287)
 
 
-def _session_claude():
-    """(pid, argv) of this hook's Claude Code process, or (None, None)."""
-    pid = os.getppid()
-    for _ in range(6):
-        if not pid or pid <= 1:
-            return None, None
-        ppid, argv = proc_parent_and_argv(pid)
-        if argv is None:
-            return None, None
-        if _is_claude(argv):
-            return pid, argv
-        pid = ppid
-    return None, None
-
-
-def _interactive(argv):
-    return not any(a in ("-p", "--print") or a.startswith("--print=") for a in argv[1:])
+def _interactive(argv, env=None):
+    """An interactive Claude Code: started by the CLI entry point, and no
+    print flag, also not inside a group of short flags (`-cp`)."""
+    env = os.environ if env is None else env
+    if env.get("CLAUDE_CODE_ENTRYPOINT") != "cli":  # GUARD:wake-entrypoint
+        return False
+    for a in argv[1:]:
+        if a == "--":
+            break
+        if a in ("--print",) or a.startswith("--print="):
+            return False
+        if a.startswith("-") and not a.startswith("--") and "p" in a[1:]:  # GUARD:wake-short-flags
+            return False
+    return True
 
 
 def _version(text):
@@ -402,49 +421,73 @@ def _version(text):
     return tuple(int(x) for x in m.groups()) if m else None
 
 
+def _exe_path(pid):
+    """The executable a process runs: /proc on Linux, proc_pidpath on macOS."""
+    try:
+        return os.readlink("/proc/%d/exe" % pid)
+    except OSError:
+        pass
+    if sys.platform == "darwin":
+        try:
+            import ctypes
+            buf = ctypes.create_string_buffer(4096)
+            n = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidpath(int(pid), buf, ctypes.sizeof(buf))
+            return buf.value.decode("utf-8", "replace") if n > 0 else None
+        except (OSError, AttributeError, ValueError):
+            return None
+    return None
+
+
 def _claude_version(pid, argv):
-    """The session's Claude Code version: from its executable's path
-    (.../claude/versions/X.Y.Z), else from `<claude> --version`, else None.
+    """The version of the Claude Code this process runs, or None when it
+    cannot be told for sure: from the native executable's path
+    (.../claude/versions/X.Y.Z), or for an npm install from the package.json
+    of the script node runs. `claude --version` is not asked: it reports the
+    installed version, and a long-running session may run an older one.
     CXD_CLAUDE_VERSION overrides it (tests, unusual installs)."""
     if os.environ.get("CXD_CLAUDE_VERSION"):
         return _version(os.environ["CXD_CLAUDE_VERSION"])
     import re
-    paths = list(argv[:2])
-    try:
-        paths.append(os.readlink("/proc/%d/exe" % pid))
-    except OSError:
-        pass
-    for p in paths:
-        for cand in (p, os.path.realpath(p) if os.path.isabs(p) else p):
-            m = re.search(r"/claude/versions/(\d+\.\d+\.\d+)", cand)
-            if m:
-                return _version(m.group(1))
-    import shutil
-    import subprocess
-    exe = argv[0] if os.path.isabs(argv[0]) else shutil.which("claude")
-    if not exe:
-        return None
-    try:
-        r = subprocess.run([exe, "--version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                           universal_newlines=True, timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return _version(r.stdout) if "claude" in r.stdout.lower() else None
+    exe = _exe_path(pid)
+    for cand in ([exe] if exe else []) + [argv[0]]:
+        m = re.search(r"/claude/versions/(\d+\.\d+\.\d+)", os.path.realpath(cand) if os.path.isabs(cand) else cand)
+        if m:
+            return _version(m.group(1))
+    if len(argv) > 1 and os.path.isabs(argv[1]):
+        d = os.path.dirname(os.path.realpath(argv[1]))
+        for _ in range(4):  # .../@anthropic-ai/claude-code/{cli.js,bin/claude.exe}
+            pkg = read_json(os.path.join(d, "package.json"), None)
+            if isinstance(pkg, dict) and pkg.get("name") == "@anthropic-ai/claude-code":
+                return _version(str(pkg.get("version")))
+            d = os.path.dirname(d)
+    return None
+
+
+def _touch(p):
+    ensure_dir(os.path.dirname(p))
+    os.close(os.open(p, os.O_WRONLY | os.O_CREAT, 0o600))
+    os.utime(p, None)
 
 
 def mark_idle(sid):
-    """The session waits at its prompt (SessionStart, or a Stop that delivered
-    nothing). The UserPromptSubmit hook marks it busy again (hooks/cxd-hook)."""
+    """The session waits at its prompt."""
     try:
-        ensure_dir(path("turn"))
-        os.close(os.open(path("turn", sid + ".idle"), os.O_WRONLY | os.O_CREAT, 0o600))
-        os.utime(path("turn", sid + ".idle"), None)
+        _touch(path("turn", sid + ".idle"))
+    except OSError:
+        pass
+
+
+def mark_busy(sid):
+    """A turn runs (hooks/cxd-hook marks it for UserPromptSubmit)."""
+    try:
+        _touch(path("turn", sid + ".busy"))
     except OSError:
         pass
 
 
 def is_idle(sid):
-    """Marked idle, and not marked busy since (mtimes of turn/<sid>.idle|.busy)."""
+    """Marked idle, and not marked busy since. A tie (coarse timestamps)
+    counts as busy."""
     try:
         idle = os.stat(path("turn", sid + ".idle")).st_mtime_ns
     except OSError:
@@ -453,28 +496,55 @@ def is_idle(sid):
         busy = os.stat(path("turn", sid + ".busy")).st_mtime_ns
     except OSError:
         return True
-    return idle >= busy
+    return idle > busy  # GUARD:wake-tie-busy
 
 
-def _ended_since(sid, t0):
-    """The session was marked ended after t0 (an older mark is a previous run
-    of the same session id, before a resume re-registered it)."""
+def _record_since(sid, t0):
+    """The session record, if it was written at or after t0 (an older one may
+    be from a previous run of the same session id), else None."""
     p = path("sessions", sid + ".json")
     rec = read_json(p, None)
     try:
-        return isinstance(rec, dict) and bool(rec.get("ended")) and os.stat(p).st_mtime >= t0
+        return rec if isinstance(rec, dict) and os.stat(p).st_mtime >= t0 else None
     except OSError:
-        return False
+        return None
+
+
+def _gone(sid, t0, pid, ident):
+    """The session ended, or another process took it over (a resume
+    elsewhere), since t0; or its claude is gone."""
+    rec = _record_since(sid, t0)
+    if rec and (rec.get("ended") or rec.get("pid") not in (None, pid)):  # GUARD:wake-moved
+        return True
+    return not proc_alive(pid, ident)
+
+
+def _release(sid, claims):
+    """Put claimed messages back in the inbox (the session went busy)."""
+    inbox = ensure_dir(path("inbox", sid))
+    for _, claimed in claims:
+        try:
+            os.rename(claimed, os.path.join(inbox, os.path.basename(claimed).partition(".claim-")[0] + ".json"))
+        except OSError:
+            pass
 
 
 def wake(data):
+    started = time.time()  # before anything slow: an end after this counts
     sid = data.get("session_id")
     if not isinstance(sid, str) or not SID_RE.match(sid):
         return 0
     from .common import load_config
     if load_config().get("idle_wake") is False:
         return 0
-    pid, argv = _session_claude()
+    import fcntl
+    lock = os.open(os.path.join(ensure_dir(path("wake")), sid + ".lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)  # GUARD:wake-single
+    except OSError:
+        os.close(lock)
+        return 0  # another waker already waits for this session
+    pid, argv = _claude_process()
     if not pid:
         return 0  # without its claude process the waker can neither stay safe nor know when to leave
     if not _interactive(argv):  # GUARD:wake-interactive-only
@@ -485,34 +555,34 @@ def wake(data):
     claude_ident = proc_identity(pid)
     if not claude_ident:
         return 0
-    import fcntl
-    lock = os.open(os.path.join(ensure_dir(path("wake")), sid + ".lock"), os.O_WRONLY | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)  # GUARD:wake-single
-    except OSError:
-        os.close(lock)
-        return 0  # another waker already waits for this session
     check_every = float(os.environ.get("CXD_WAKE_CHECK_S") or 10)
-    started, deadline = time.time(), time.monotonic() + WAKE_SECONDS
+    deadline = time.monotonic() + WAKE_SECONDS
     next_check = 0.0
     inbox, claimed = path("inbox", sid), path("claimed", sid)
     while time.monotonic() < deadline:
         if time.monotonic() >= next_check:
             next_check = time.monotonic() + check_every
-            if (not os.path.isdir(path()) or not proc_alive(pid, claude_ident) or not _wrapper_alive()
-                    or load_config().get("idle_wake") is False or _ended_since(sid, started)):
+            if (not os.path.isdir(path()) or not _wrapper_alive() or load_config().get("idle_wake") is False
+                    or _gone(sid, started, pid, claude_ident)):
                 return 0  # GUARD:wake-leave
         if (_has_json(inbox) or _has_json(claimed)) and is_idle(sid):  # GUARD:wake-idle-only
-            if _ended_since(sid, started) or not proc_alive(pid, claude_ident):
+            if _gone(sid, started, pid, claude_ident):  # GUARD:wake-recheck
                 return 0
+            tag = session_tag(sid)
+            if not tag:  # GUARD:wake-tag
+                return 0  # a record without a tag: leave the mail to the hooks
             claims = claim_inbox(sid)
+            if claims and not is_idle(sid):  # GUARD:wake-release (a prompt came in meanwhile: its hooks deliver)
+                _release(sid, claims)
+                claims = []
             if claims:  # GUARD:wake-deliver
-                sys.stderr.write("cxd: a message for this session arrived while it was idle at its prompt.\n\n"
-                                 + format_messages([m for m, _ in claims], session_tag(sid), sid))
+                mark_busy(sid)  # GUARD:wake-marks-busy
+                text = format_messages([m for m, _ in claims], tag, sid)  # GUARD:wake-tagged
+                sys.stderr.write("cxd: a message for this session arrived while it was idle at its prompt.\n\n" + text)
                 sys.stderr.flush()
-                if _wrapper_alive():
+                if _wrapper_alive():  # GUARD:wake-ack-wrapper
                     ack(sid, claims, "Wake")
-                return 2
+                return WAKE_DELIVERED
         time.sleep(WAKE_POLL)
     return 0
 

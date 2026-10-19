@@ -82,11 +82,21 @@ flowchart LR
 - **Idle sessions.** A session that waits at its prompt runs no hooks, so the plugin also
   starts a small *waker* when a session starts and whenever a turn ends: an `asyncRewake`
   hook that Claude Code runs in the background. It waits (polling once a second) for mail
-  for its session, hands it over, and exits with code 2, which wakes Claude with the
-  message as hook feedback. There is one waker per session; it leaves on its own when the
-  session ends, its claude process is gone, or after about a day. Headless runs do not use
-  it (their messages go through the FIFO). Turn it off with `"idle_wake": false` in
-  `~/.cxd/config.json`.
+  for its session, hands it over with the session's `[cxd:<tag>]` mark, and exits with
+  code 2, which wakes Claude with the message as hook feedback.
+  - It only hands mail over while the session is idle. A typed prompt, a turn the waker
+    started and a `Stop` that delivered mail mark the session busy; during a turn the
+    other hooks deliver.
+  - There is one waker per session. It leaves on its own when the session ends or is
+    resumed by another process, when its claude process is gone, or after about a day;
+    after that, mail waits for the next prompt.
+  - It needs an interactive session of Claude Code 2.1.287 or later (read from the
+    running executable). In `claude -p` sessions, headless runs included (their messages
+    go through the FIFO), and with older or unknown versions it leaves at once.
+  - A turn you interrupt with Esc ends without a `Stop`, so the session counts as busy
+    until your next prompt: mail sent in between waits for it. A turn that ends in an API
+    error (`StopFailure`) does count as idle.
+  - Turn it off with `"idle_wake": false` in `~/.cxd/config.json`.
 - **Reports.** The `Stop` hook appends the last assistant message of every turn to the
   session's outbox, and a worker can add its own lines with `cxd notify "…"`. The lead
   sees them in `cxd watch`.
@@ -307,8 +317,9 @@ See [SECURITY.md](SECURITY.md) to report a vulnerability.
 ## Limitations and roadmap
 
 - Messages to a headless run are queued as its next turn; they are not injected into the
-  turn that is running. A session that sits idle at its prompt is woken for a message by
-  the waker (see How it works); with `"idle_wake": false` it sees it at its next prompt.
+  turn that is running. An interactive session that sits idle at its prompt is woken for a
+  message by the waker (see How it works, for the Claude Code version it needs and when it
+  does not run); otherwise it sees the message at its next prompt.
 - Inbox delivery into an interactive (TUI) session is proven with real Claude Code 2.1.302 on
   Linux on `PostToolUse`, on `UserPromptSubmit` and at `Stop`, where the session continues and
   acts on the message ([evidence](docs/evidence/2026-10-18-tui-delivery-linux.md)).

@@ -550,6 +550,15 @@ MUTATIONS = [
         "expect": "red",
     },
     {
+        "name": "wake-idle-first-only",
+        "what": "defence in depth: removing ONLY the idle check before the claim must stay green (the claim is released when the session is busy)",
+        "edits": [("lib/cxd/hook.py",
+                   "        if (_has_json(inbox) or _has_json(claimed)) and is_idle(sid):  # GUARD:wake-idle-only\n",
+                   "        if (_has_json(inbox) or _has_json(claimed)):  # MUTATION\n")],
+        "tests": [T + "TestIdleWaker.test_waker_leaves_a_busy_turn_to_the_hooks"],
+        "expect": "green",
+    },
+    {
         "name": "init-no-link",
         "what": "cxd init does not link ~/.cxd/bin/cxd, so peers cannot reach this host",
         "edits": [("lib/cxd/cli.py", "    link, target = _link_cli()\n",
