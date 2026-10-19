@@ -454,8 +454,7 @@ class Driver(object):
             self.settle()
         else:
             return "FAIL: no turn could be interrupted in 3 attempts"
-        self.note("pressed Esc while the answer streamed: no Stop record; interruptions in the transcript: %d"
-                  % self._interrupted())
+        self.note("pressed Esc while the answer streamed; the turn ended without a Stop record (interrupted)")
         n1 = len(self.assistant_texts())
         mid = self.send("Reply with the word PEAR-F. (cxd evidence check)")
         deadline = time.time() + wait_s
@@ -479,14 +478,6 @@ class Driver(object):
         pane = self.pane()
         return (len(re.findall(r"(?m)^\s*\d+\s*$", pane)) >= 3 or bool(re.search(r"\u2193 [\d.]+k? tokens", pane))
                 or len(self.assistant_texts()) > n0)
-
-    def _interrupted(self):
-        """How many interruptions the transcript records."""
-        try:
-            with open(self.transcript) as f:
-                return sum("[request interrupted by user" in line.lower() for line in f)
-        except (OSError, TypeError):
-            return 0
 
     def _new_record(self, old_sid):
         d = os.path.join(self.home, "sessions")
