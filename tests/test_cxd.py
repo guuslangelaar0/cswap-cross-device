@@ -177,6 +177,26 @@ class Base(unittest.TestCase):
 
 
 class TestRuns(Base):
+    def test_concurrent_sends_to_a_run_never_interleave(self):
+        """GUARD fifo-one-writer. Mutation: senders write to the run's FIFO at
+        the same time -> a message larger than the pipe's atomic size (512
+        bytes on macOS) is cut into another one's, claude reads a broken JSON
+        line, and the run dies."""
+        self.start("laptop", "wi", "MARK-0")
+        self.wait_results("laptop", "wi", 1)
+        procs = []
+        for i in range(6):
+            p = self.prompt("MARK-C%d %s" % (i, "x" * 300000))  # far above any pipe buffer
+            procs.append(subprocess.Popen([sys.executable, CXD, "send", "laptop", "wi", "@" + p],
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env))
+        for p in procs:
+            _, err = p.communicate(timeout=60)
+            self.assertEqual(p.returncode, 0, err)
+        res = self.wait_results("laptop", "wi", 7, timeout=60)
+        for i in range(6):
+            self.assertEqual(sum("MARK-C%d" % i in r for r in res), 1, res)
+        self.assertTrue(self.pids("laptop", "wi") and self.ok("list", "laptop", "--json"))
+
     def test_start_send_list(self):
         self.start("laptop", "w1", "hello MARK-A")
         res = self.wait_results("laptop", "w1", 1)

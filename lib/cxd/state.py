@@ -98,24 +98,33 @@ def _run_accepts_input(d):
 
 def fifo_write(fifo, data):
     """Write one complete message to a FIFO. Raises CxdError('dead') if no
-    process is reading it. Never holds the FIFO open after returning."""
+    process is reading it. Never holds the FIFO open after returning.
+
+    One writer at a time (<fifo>.lock): a write larger than the pipe's atomic
+    size (PIPE_BUF: 512 bytes on macOS, 4096 on Linux) goes in pieces, and two
+    senders' pieces would mix into a line claude cannot parse."""
+    lock = os.open(fifo + ".lock", os.O_WRONLY | os.O_CREAT, 0o600)
     try:
-        fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)  # GUARD:fifo-open
-    except OSError as e:
-        if e.errno in (errno.ENXIO, errno.ENOENT):
-            raise CxdError("no process is reading %s: the run is not running" % fifo, "dead")
-        raise
-    try:
-        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
-        fcntl.fcntl(fd, fcntl.F_SETFL, fl & ~os.O_NONBLOCK)
-        view = memoryview(data)
-        while view:
-            n = os.write(fd, view)
-            view = view[n:]
-    except BrokenPipeError:
-        raise CxdError("the run's reader went away while writing", "dead")
+        fcntl.flock(lock, fcntl.LOCK_EX)  # GUARD:fifo-one-writer
+        try:
+            fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)  # GUARD:fifo-open
+        except OSError as e:
+            if e.errno in (errno.ENXIO, errno.ENOENT):
+                raise CxdError("no process is reading %s: the run is not running" % fifo, "dead")
+            raise
+        try:
+            fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, fl & ~os.O_NONBLOCK)
+            view = memoryview(data)
+            while view:
+                n = os.write(fd, view)
+                view = view[n:]
+        except BrokenPipeError:
+            raise CxdError("the run's reader went away while writing", "dead")
+        finally:
+            os.close(fd)
     finally:
-        os.close(fd)
+        os.close(lock)
 
 
 def user_message(text):
