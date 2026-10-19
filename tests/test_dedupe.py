@@ -164,6 +164,53 @@ class TestClaims(unittest.TestCase):
         self.assertEqual(os.listdir(self.tmp), ["a"])
         self.assertEqual(os.listdir(os.path.join(self.tmp, "a")), ["home"])
 
+    def test_an_attempt_for_another_operation_is_refused(self):
+        """GUARD claim-same-op. Mutation: the operation is not compared -> a
+        --request-id given to `cxd stop` returns the recorded reply of a send
+        as if the stop had happened."""
+        dedupe.arrive(rid(), "a" * 32, wait=30, seq=1, op="send", digest="d1")
+        for op, digest in (("stop", "d1"), ("send", "d2"), (None, None)):
+            with self.assertRaises(dedupe.Mismatch):
+                dedupe.arrive(rid(), "b" * 32, wait=30, seq=2, op=op, digest=digest)
+        r = dedupe.arrive(rid(), "c" * 32, wait=30, seq=3, op="send", digest="d1")
+        self.assertEqual(r["owner"], "c" * 32)
+
+    def test_only_the_owner_cancels_and_only_before_go(self):
+        """GUARD claim-cancel-owner. Mutation: any attempt's end of input
+        cancels -> the broker attempt's client going away cancels the claim
+        that the ssh fallback took over and is about to run."""
+        dedupe.arrive(rid(), "a" * 32, wait=30, seq=1)
+        dedupe.arrive(rid(), "b" * 32, wait=30, seq=2)  # taken over
+        self.assertFalse(dedupe.cancel(rid(), "a" * 32))
+        self.assertEqual(dedupe.current(rid())["state"], dedupe.AWAITING)
+        self.assertTrue(dedupe.cancel(rid(), "b" * 32))
+        self.assertEqual(dedupe.current(rid())["state"], dedupe.CANCELLED)
+        dedupe.arrive(rid(2), "a" * 32, wait=30)
+        dedupe.go(rid(2), "a" * 32)
+        self.assertFalse(dedupe.cancel(rid(2), "a" * 32))  # running: too late to cancel
+        self.assertFalse(dedupe.cancel(rid(3), "a" * 32))  # never arrived
+
+    def test_ids_carry_their_creation_time(self):
+        t = 1792390000.123
+        r = dedupe.new_request_id(now=t)
+        self.assertRegex(r, r"^[0-9a-f]{32}$")
+        self.assertAlmostEqual(dedupe.id_time(r), t, places=2)
+        self.assertNotEqual(dedupe.new_request_id(now=t), r)
+
+    def test_a_record_is_pruned_only_when_its_id_is_old_too(self):
+        """GUARD claim-prune-id-time. Mutation: only the final-state stamp counts
+        -> after a clock jumped forward, a record pruned early lets a
+        re-issued request run a second time."""
+        t0 = time.time()
+        young = dedupe.new_request_id(now=t0 - 3600)  # made an hour ago...
+        old = dedupe.new_request_id(now=t0 - 40 * 3600)
+        for r in (young, old):
+            dedupe.arrive(r, "a" * 32, wait=30, now=t0 - 25 * 3600)
+            dedupe.go(r, "a" * 32, now=t0 - 25 * 3600)
+            dedupe.finish(r, "a" * 32, reply={}, now=t0 - 25 * 3600)  # ...but "done" 25 h ago by a jumped clock
+        self.assertEqual(dedupe.prune(now=t0), [old])
+        self.assertIsNotNone(dedupe.current(young))
+
     def test_only_old_final_records_are_pruned(self):
         t0 = time.time()
         old = t0 - dedupe.KEEP_FINAL_SECONDS - 60

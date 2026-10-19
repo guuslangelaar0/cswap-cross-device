@@ -36,7 +36,24 @@ AWAITING, RUNNING, DONE, ERROR, CANCELLED, UNKNOWN = (
 FINAL = (DONE, ERROR, CANCELLED, UNKNOWN)
 LAPSE_SLACK = 5.0
 KEEP_FINAL_SECONDS = 24 * 3600
+KEEP_BY_ID_SECONDS = 36 * 3600
 _ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+class Mismatch(ValueError):
+    """An attempt whose operation or arguments differ from the claim's."""
+
+
+def new_request_id(now=None):
+    """32 hex digits: the creation time in milliseconds (48 bits), then 80
+    random bits."""
+    ms = int((time.time() if now is None else now) * 1000) & ((1 << 48) - 1)
+    return "%012x%s" % (ms, os.urandom(10).hex())
+
+
+def id_time(rid):
+    """The creation time an id carries (seconds)."""
+    return int(rid[:12], 16) / 1000.0
 
 
 def _check(*ids):
@@ -125,11 +142,14 @@ def _settle(lk, rec, now):
     return rec
 
 
-def arrive(rid, attempt, wait, seq=0, now=None):
-    """Attempt number `seq` of rid arrives with a client that will wait `wait`
-    more seconds. It takes over an awaiting claim only with a higher sequence
-    number than the owner's (a stale attempt never does). Returns the record
-    as it stands afterwards."""
+def arrive(rid, attempt, wait, seq=0, op=None, digest=None, now=None):
+    """Attempt number `seq` of rid, for operation `op` with arguments whose
+    digest is `digest`, arrives with a client that will wait `wait` more
+    seconds. It takes over an awaiting claim only with a higher sequence
+    number than the owner's (a stale attempt never does). An attempt for
+    another operation or other arguments raises Mismatch (a --request-id
+    given to the wrong command must not get another command's outcome).
+    Returns the record as it stands afterwards."""
     _check(rid, attempt)
     now = time.time() if now is None else now
     deadline = now + max(0.0, float(wait)) + LAPSE_SLACK
@@ -137,10 +157,12 @@ def arrive(rid, attempt, wait, seq=0, now=None):
         rec = _settle(lk, lk.read(), now)
         if rec is None:
             rec = {"id": rid, "state": AWAITING, "owner": attempt, "seq": seq, "lapse_at": deadline,
-                   "created": now, "changed": now}
+                   "created": now, "changed": now, "op": op, "digest": digest}
             if not lk.create(rec):  # cannot happen under the lock; never overwrite
                 rec = _settle(lk, lk.read(), now)
-        elif rec["state"] == AWAITING and seq > rec.get("seq", 0):  # GUARD:claim-seq
+        if (rec.get("op"), rec.get("digest")) != (op, digest):  # GUARD:claim-same-op
+            raise Mismatch("request %s was for another operation or other arguments" % rid)
+        if rec["state"] == AWAITING and seq > rec.get("seq", 0):  # GUARD:claim-seq
             rec.update(owner=attempt, seq=seq, lapse_at=max(rec["lapse_at"], deadline), changed=now)
             lk.write(rec)
         return rec
@@ -168,6 +190,23 @@ def go(rid, attempt, now=None):
         if state == RUNNING:
             return "duplicate", rec
         return ("cancelled" if state == CANCELLED else "final"), rec
+
+
+def cancel(rid, attempt, now=None):
+    """The attempt's client went away before go: cancel the claim if this
+    attempt still owns it and it is awaiting (a newer attempt that took it
+    over is left alone). True when it cancelled."""
+    _check(rid, attempt)
+    now = time.time() if now is None else now
+    if not os.path.exists(_files(rid)[0]):
+        return False
+    with _Locked(rid) as lk:
+        rec = _settle(lk, lk.read(), now)
+        if not rec or rec.get("state") != AWAITING or rec.get("owner") != attempt:  # GUARD:claim-cancel-owner
+            return False
+        rec.update(state=CANCELLED, changed=now)
+        lk.write(rec)
+        return True
 
 
 def finish(rid, attempt, reply=None, error=None, now=None):
@@ -211,8 +250,9 @@ def wait_final(rid, timeout, poll=0.2):
 
 
 def prune(now=None):
-    """Remove records that reached a final state KEEP_FINAL_SECONDS ago.
-    Returns the removed ids."""
+    """Remove records that reached a final state KEEP_FINAL_SECONDS ago and
+    whose id was made KEEP_BY_ID_SECONDS ago (so a clock that jumped forward
+    cannot prune a record early on its own). Returns the removed ids."""
     now = time.time() if now is None else now
     d = path("dedupe")
     if not os.path.isdir(d):
@@ -227,6 +267,8 @@ def prune(now=None):
             lk = _Record(rid)  # under the exclusive store lock nobody holds a claim lock
             rec = _settle(lk, lk.read(), now)
             if not rec or rec.get("state") not in FINAL or now - rec.get("changed", now) < KEEP_FINAL_SECONDS:
+                continue
+            if now - id_time(rid) < KEEP_BY_ID_SECONDS:  # GUARD:claim-prune-id-time
                 continue
             for p in (lk.rec_path, lk.lock_path):
                 try:
