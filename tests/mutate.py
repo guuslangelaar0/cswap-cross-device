@@ -578,15 +578,6 @@ MUTATIONS = [
         "expect": "red",
     },
     {
-        "name": "idle-prompt",
-        "what": "the idle notification is ignored (after Esc or a blocked prompt the session stays busy)",
-        "edits": [("lib/cxd/hook.py",
-                   "        mark_idle(sid)  # GUARD:idle-prompt (waiting for input, also after Esc or a blocked prompt)\n",
-                   "        pass  # MUTATION\n")],
-        "tests": [T + "TestIdleWaker.test_the_idle_notification_marks_the_session_idle"],
-        "expect": "red",
-    },
-    {
         "name": "stop-handover",
         "what": "a Stop marks busy whenever it claimed mail, also when its output never reached Claude",
         "edits": [("lib/cxd/hook.py", "        if handed_over and claims:\n            mark_busy(sid)",

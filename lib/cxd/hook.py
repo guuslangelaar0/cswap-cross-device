@@ -10,11 +10,10 @@ PostToolUse       \
 UserPromptSubmit   > claim queued inbox messages, return them as additionalContext,
 Stop              /  ack them once written (Stop also records last_assistant_message)
 StopFailure       the turn ended in an API error: the session is idle
-Notification      (idle_prompt) the session waits for input: it is idle
 SessionEnd        mark the session ended
-Wake              the idle waker (an asyncRewake hook started at SessionStart, Stop,
-                  StopFailure and the idle notification): deliver mail to an idle
-                  interactive session and wake it (see the comment above wake())
+Wake              the idle waker (an asyncRewake hook started at SessionStart, Stop
+                  and StopFailure): deliver mail to an idle interactive session and
+                  wake it (see the comment above wake())
 """
 
 import json
@@ -335,8 +334,6 @@ def handle(event, data):
         mark_idle(sid)  # a compaction can come in the middle of a turn
     elif event == "StopFailure":
         mark_idle(sid)  # GUARD:stopfailure-idle (an API error ended the turn: there is no Stop)
-    elif event == "Notification" and data.get("notification_type") == "idle_prompt":
-        mark_idle(sid)  # GUARD:idle-prompt (waiting for input, also after Esc or a blocked prompt)
     # (A Stop marks idle or busy in main(), once its output is handed over.)
     if event == "Stop":
         ensure_dir(path("outbox"))

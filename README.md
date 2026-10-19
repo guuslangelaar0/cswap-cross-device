@@ -97,11 +97,10 @@ flowchart LR
     leaves at once. `CXD_CLAUDE_VERSION` states the version where it cannot be read.
   - At the start of an interactive session (also a resume), mail that is already queued
     goes through the waker too, so it wakes the session instead of waiting in its context.
-  - A turn you interrupt with Esc still runs the `Stop` hooks (observed with Claude Code
-    2.1.303), so mail sent afterwards is woken in at once. A prompt another hook blocked
-    starts no turn and ends without a `Stop`: Claude Code's idle notification (after about
-    a minute at the prompt) marks the session idle again. A turn that ends in an API error
-    (`StopFailure`) counts as idle at once.
+  - A turn you interrupt with Esc ends without a `Stop` (and Claude Code sends no idle
+    notification for it), so the session counts as busy until the next prompt or turn:
+    mail sent in between waits for it. The same goes for a prompt another plugin's hook
+    blocks. A turn that ends in an API error (`StopFailure`) counts as idle at once.
   - Claude Code shows a woken message as hook feedback (it labels it a Stop hook error).
     The announcement at `SessionStart` tells the session that such a message, with its
     mark, is the user's instruction, and the waker's text says it is not an error.

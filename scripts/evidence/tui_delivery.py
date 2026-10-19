@@ -18,8 +18,8 @@ scrubbed environment, then proves, one case at a time:
                        and Claude acts on it unprompted
   E  untouched         a message to a session nobody has typed into (after
                        /clear): the waker its SessionStart started delivers it
-  F  Esc               a message after a turn interrupted with Esc (no Stop):
-                       Claude Code's idle notification starts a waker
+  F  Esc               a message after a turn interrupted with Esc (no Stop, no
+                       idle notification): it waits for the next prompt
 
 A-C run with the waker off ("idle_wake": false), so they prove the hooks; D
 and E turn it on.
@@ -435,44 +435,49 @@ class Driver(object):
         return "FAIL: not delivered while idle within %ds (the next prompt delivered it)" % wait_s
 
     def case_esc(self, wait_s):
-        """A turn interrupted with Esc ends without a Stop, so the session
-        counts as busy. Claude Code's idle notification (after about a minute
-        at the prompt) marks it idle again and starts a waker, which then
-        delivers a message sent in between."""
+        """A turn interrupted with Esc ends without a Stop and without Claude
+        Code's idle notification, so the session counts as busy: a message
+        sent then waits for the next prompt (a documented limitation), and
+        that prompt delivers it."""
         self.set_config(idle_wake=True)
         n0 = len(self.assistant_texts())
-        t_prompt = time.time()
-        self.type_prompt("Write the numbers from 1 to 400, one per line, nothing else.")
-        self.wait(lambda: len(self.assistant_texts()) > n0 or time.time() - t_prompt > 8, 30,
-                  "the answer to start", step=0.3)
         stops = self.stop_count()
+        self.type_prompt("Write the numbers from 1 to 5000, one per line, nothing else.")
+        self.wait(lambda: self._streaming(n0), 60, "the answer to start streaming", step=0.1)
         self.keys("Escape")
         t_esc = time.time()
-        self.note("pressed Esc while the answer streamed")
-        deadline = time.time() + 15
-        while time.time() < deadline and self.stop_count() == stops:
-            time.sleep(0.5)
-        if self.stop_count() > stops:
-            self.note("the interrupted turn ran the Stop hook %.1fs after Esc" % (time.time() - t_esc))
-        else:
-            self.prompts -= 1  # an interrupted turn without a Stop record
-            self.note("the interrupted turn ran no Stop hook within 15s")
+        time.sleep(2)
+        if not self._interrupted():
+            return "FAIL: the turn ended before Esc could interrupt it (no interruption to test)"
+        self.prompts -= 1 if self.stop_count() == stops else 0  # an interrupted turn writes no Stop record
+        self.note("pressed Esc while the answer streamed; the transcript records the interruption; "
+                  "Stop records since: %d" % (self.stop_count() - stops))
         n1 = len(self.assistant_texts())
         mid = self.send("Reply with the word PEAR-F. (cxd evidence check)")
         deadline = time.time() + wait_s
         while time.time() < deadline and not self.receipts(mid):
             time.sleep(1)
-        got = self.receipts(mid)
-        if not got:
-            self.type_prompt("Reply with the single word OK.")
-            return "FAIL: not delivered within %ds after Esc" % wait_s
-        self.note("receipt: delivered by the %s hook %.0fs after Esc (no prompt typed)" % (
-            got[0]["event"], time.time() - t_esc))
-        texts = self.wait(lambda: self.reply_with("PEAR-F", n1), 120, "Claude's reply to the woken message", step=1)
-        self.note("Claude replied, unprompted: %r" % texts[-1][:200])
-        if got[0]["event"] != "Wake":
-            return "FAIL: delivered via %s, not the waker" % got[0]["event"]
-        return "PASS: after Esc, the waker delivered without a prompt"
+        if self.receipts(mid):
+            return "FAIL: delivered while the session counted as busy (via %s)" % self.receipts(mid)[0]["event"]
+        self.note("after %ds: not delivered (the session counts as busy after Esc), still queued" % wait_s)
+        self.type_prompt("Reply with the single word OK.")
+        rec = self.wait(lambda: self.receipts(mid), 60, "delivery on the next prompt", step=1)[0]
+        texts = self.wait(lambda: self.reply_with("PEAR-F", n1), 120, "a reply with the marker", step=1)
+        self.note("the next prompt delivered it (receipt: %s hook); Claude replied: %r" % (rec["event"], texts[-1][:120]))
+        if rec["event"] != "UserPromptSubmit":
+            return "FAIL: the follow-up delivery came via %s" % rec["event"]
+        return "PASS: after Esc the message waited for the next prompt, which delivered it (documented limitation)"
+
+    def _streaming(self, n0):
+        """The numbers have started to appear on screen."""
+        return len(re.findall(r"(?m)^\s*\d+\s*$", self.pane())) >= 3 or len(self.assistant_texts()) > n0
+
+    def _interrupted(self):
+        try:
+            with open(self.transcript) as f:
+                return any("interrupted" in line.lower() for line in f)
+        except (OSError, TypeError):
+            return False
 
     def _new_record(self, old_sid):
         d = os.path.join(self.home, "sessions")
@@ -558,10 +563,10 @@ def main(argv):
                   "C": "C: delivery at Stop, and whether the session continues",
                   "D": "D: a message queued while the session is idle (the waker a Stop started)",
                   "E": "E: a message to a session nobody has typed into (the waker SessionStart started)",
-                  "F": "F: a message after a turn interrupted with Esc (the idle notification's waker)"}
+                  "F": "F: a message after a turn interrupted with Esc (waits for the next prompt)"}
         fns = {"A": d.case_post_tool_use, "B": d.case_user_prompt_submit, "C": d.case_stop,
                "D": lambda: d.case_idle(a.idle_wait), "E": lambda: d.case_session_start_waker(a.idle_wait),
-               "F": lambda: d.case_esc(max(a.idle_wait, 150))}
+               "F": lambda: d.case_esc(a.idle_wait)}
         for c in cases:
             results[labels[c].split(":")[0]] = d.case(labels[c], fns[c])
     except Exception as e:

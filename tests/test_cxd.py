@@ -1443,7 +1443,7 @@ class TestHooks(Base):
         cases = [b"", b"not json", b"[]", json.dumps({"session_id": "../../etc"}).encode()]
         for inp in cases:
             for ev in ("SessionStart", "PostToolUse", "Stop", "SessionEnd", "UserPromptSubmit",
-                       "StopFailure", "Notification", "Wake"):
+                       "StopFailure", "Wake"):
                 r = subprocess.run([HOOK, ev], input=inp, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    env=dict(self.env, CLAUDE_CODE_ENTRYPOINT="cli"))
                 self.assertEqual((r.returncode, r.stdout, r.stderr), (0, b"", b""), (ev, inp))
@@ -2623,23 +2623,6 @@ class TestIdleWaker(Base):
             receipts = [json.loads(l)["event"] for l in f if '"delivered"' in l]
         self.assertEqual(receipts, ["Wake"])
 
-    def test_the_idle_notification_marks_the_session_idle(self):
-        """GUARD idle-prompt. Mutation: the idle notification is ignored -> after
-        a turn interrupted with Esc (no Stop) or a prompt another hook blocked,
-        the session stays busy and mail waits for the next prompt."""
-        sid = "c2c2c2c2-2222-3333-4444-555555555555"
-        self.run_hook("SessionStart", {"session_id": sid, "source": "startup", "cwd": self.tmp})
-        self.tick()
-        self.run_hook("UserPromptSubmit", {"session_id": sid, "prompt": "go"})
-        self.tick()
-        self.run_hook("Notification", {"session_id": sid, "notification_type": "permission_prompt"})
-        self.assertFalse(self.is_idle(sid))  # a permission dialog is no idle prompt
-        self.tick()
-        r = self.run_hook("Notification", {"session_id": sid, "notification_type": "idle_prompt",
-                                           "message": "Claude is waiting for your input"})
-        self.assertEqual((r.returncode, r.stdout), (0, b""))
-        self.assertTrue(self.is_idle(sid))
-
     def test_a_stop_whose_output_was_not_handed_over_is_idle(self):
         """GUARD stop-handover. Mutation: a Stop marks busy whenever it claimed
         mail -> when its output never reached Claude (the wrapper was killed),
@@ -2661,8 +2644,8 @@ class TestIdleWaker(Base):
         from cxd.hook import WAKE_SECONDS
         with open(os.path.join(REPO, "hooks", "hooks.json")) as f:
             hooks = json.load(f)["hooks"]
-        self.assertEqual([g.get("matcher") for g in hooks["Notification"]], ["idle_prompt"])
-        for event in ("SessionStart", "Stop", "StopFailure", "Notification"):
+        self.assertNotIn("Notification", hooks)
+        for event in ("SessionStart", "Stop", "StopFailure"):
             wakers = [h for group in hooks[event] for h in group["hooks"] if h["command"].endswith(" Wake")]
             self.assertEqual(len(wakers), 1, event)
             self.assertIs(wakers[0].get("asyncRewake"), True)
