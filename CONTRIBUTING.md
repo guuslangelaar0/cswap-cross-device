@@ -91,6 +91,10 @@ or OpenAI-style keys, AWS keys, `.env` files or long base64 blobs. If it flags s
 mistake, change the content rather than bypassing the check, or explain the false positive
 in your pull request. Never use `git commit --no-verify` to get a secret past it.
 
+Every commit of every branch is also scanned with [gitleaks](https://github.com/gitleaks/gitleaks):
+`scripts/gitleaks.sh` downloads a pinned release into a throwaway directory, checks its SHA-256
+and runs it over the whole history (Linux x64 and macOS arm64).
+
 ## Reporting bugs and security problems
 
 Use the issue templates for bugs and feature requests. Report vulnerabilities privately, as
