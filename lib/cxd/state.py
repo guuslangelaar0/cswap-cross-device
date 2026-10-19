@@ -33,7 +33,7 @@ import time
 from .common import (
     CxdError, NAME_RE, SID_RE, VERSION, PROTO, append_jsonl, atomic_write_json,
     cxd_bin, cxd_home, ensure_dir, excerpt, find_claude, find_cswap, load_config,
-    now_iso, path, proc_alive, read_json, self_label, signal_verified, wait_dead,
+    now_iso, path, proc_alive, proc_state, read_json, self_label, signal_verified, wait_dead,
     worker_env,
 )
 
@@ -675,6 +675,28 @@ def _scan_run(d, meta, cur, emit, drain=False):
         _scan_outbox(sid, cur, emit, skip_kinds=("stop",))  # turn events already carry results
 
 
+# How long a gen may go without its supervisor's first record before watch
+# reports that it never started (the launch failed after bumping the gen).
+SUPERVISOR_START = 30.0
+
+
+def _supervisor_gone(d, gen):
+    """An exit record for gen when its supervisor died without writing one, or
+    never started; else {}. supervisor.json is the supervisor's first write."""
+    sup = read_json(os.path.join(d, "supervisor.json"), None) or {}
+    if sup.get("gen") == gen:
+        if proc_state(sup.get("pid"), sup.get("ident")) == "dead":  # GUARD:supervisor-gone
+            return {"gen": gen, "rc": None, "error": "the supervisor died before it started claude"}
+        return {}
+    try:
+        age = time.time() - os.stat(os.path.join(d, "meta.json")).st_mtime
+    except OSError:
+        return {}
+    if gen is not None and age > SUPERVISOR_START:
+        return {"gen": gen, "rc": None, "error": "the supervisor of gen %s never started" % gen}
+    return {}
+
+
 def run_cost(cur):
     return round(sum((cur.get("gen_costs") or {}).values()), 6)
 
@@ -701,10 +723,11 @@ def poll(target, cur, drain=False):
         meta, pids, _ = _run_files(d)
         gen = pids.get("gen")
         exit_ev = None
-        if not pids:
-            # No pids at all: the supervisor of the first gen failed before it
-            # started claude. Its exit record says why; nothing else will happen.
-            ex = _exit_record(d, meta.get("gen"))
+        if not pids or gen != meta.get("gen"):  # GUARD:pending-gen
+            # The current gen has no pids yet (pids.json may still hold the gen
+            # before a resume): its supervisor is starting, failed before it
+            # started claude (its exit record says why), or died without one.
+            ex = _exit_record(d, meta.get("gen")) or _supervisor_gone(d, meta.get("gen"))
             if ex and cur.get("exit_gen") != ex["gen"]:
                 exit_ev = {"ev": "exit", "rc": ex.get("rc"), "gen": ex["gen"], "error": ex.get("error")}
         elif claude_alive(pids):
@@ -723,8 +746,10 @@ def poll(target, cur, drain=False):
                     wait["t"], waited = time.time(), 0.0
                 waiting = waited < EXIT_RECORD_WAIT  # GUARD:exit-rc-cap
             if not waiting:
-                ex = ex or _exit_record(d, gen)  # written just before the supervisor exited?
+                ex = ex or _exit_record(d, gen)  # GUARD:exit-reread (written just before the supervisor exited?)
                 exit_ev = {"ev": "exit", "rc": ex.get("rc"), "gen": gen}
+                if ex.get("error"):
+                    exit_ev["error"] = ex["error"]  # the supervisor's guard recorded why
         # Before an exit, read to the end: watch ends at the exit.
         _scan_run(d, meta, cur, emit, drain=drain or exit_ev is not None)  # GUARD:exit-drain
         if exit_ev:
