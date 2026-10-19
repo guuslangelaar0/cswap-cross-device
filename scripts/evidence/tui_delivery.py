@@ -449,12 +449,14 @@ class Driver(object):
         self.keys("Escape")
         t_esc = time.time()
         self.note("pressed Esc while the answer streamed")
-        time.sleep(3)
+        deadline = time.time() + 15
+        while time.time() < deadline and self.stop_count() == stops:
+            time.sleep(0.5)
         if self.stop_count() > stops:
-            self.note("the interrupted turn ended with a Stop hook run (this Claude Code runs Stop on Esc)")
+            self.note("the interrupted turn ran the Stop hook %.1fs after Esc" % (time.time() - t_esc))
         else:
             self.prompts -= 1  # an interrupted turn without a Stop record
-            self.note("the interrupted turn ended without a Stop hook run")
+            self.note("the interrupted turn ran no Stop hook within 15s")
         n1 = len(self.assistant_texts())
         mid = self.send("Reply with the word PEAR-F. (cxd evidence check)")
         deadline = time.time() + wait_s
