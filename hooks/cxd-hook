@@ -1,8 +1,19 @@
 #!/bin/sh
 # cswap-cross-device hook entry point. $1 = hook event name, hook JSON on stdin.
-# Contract: fast, silent on any error, always exit 0 - never break the session.
+# Contract: fast, silent on any error, never break the session: exit 0, except
+# that the idle waker (Wake) exits 2 when, and only when, it delivered mail.
 ev="$1"
 d="${CXD_HOME:-$HOME/.cxd}"
+input=
+if [ "$ev" = UserPromptSubmit ]; then
+  input="$(cat 2>/dev/null)"
+  if [ -d "$d" ]; then
+    # A turn starts: mark the session busy, so the idle waker leaves its mail
+    # to the hooks of this turn. (The session id is a strict character set.)
+    sid="$(printf '%s' "$input" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([A-Za-z0-9._-][A-Za-z0-9._-]*\)".*/\1/p' | head -n 1)"
+    if [ -n "$sid" ]; then (umask 077; mkdir -p "$d/turn" && touch "$d/turn/$sid.busy") 2>/dev/null; fi  # GUARD:busy-mark
+  fi
+fi
 case "$ev" in
   PostToolUse|UserPromptSubmit)
     # Fast path: nothing queued or claimed for any session -> skip Python entirely.
@@ -10,7 +21,10 @@ case "$ev" in
     for f in "$d"/inbox/*/*.json "$d"/claimed/*/*.json; do
       if [ -e "$f" ]; then mail=1; break; fi
     done
-    if [ -z "$mail" ]; then cat >/dev/null 2>&1; exit 0; fi
+    if [ -z "$mail" ]; then
+      [ "$ev" = PostToolUse ] && cat >/dev/null 2>&1
+      exit 0
+    fi
     ;;
 esac
 root="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)" || exit 0
@@ -18,5 +32,20 @@ py="${CXD_PYTHON:-}"
 if [ -z "$py" ]; then
   if [ -x /usr/bin/python3 ]; then py=/usr/bin/python3; else py=python3; fi
 fi
-CXD_HOOK_PARENT=$$ "$py" -I -S "$root/bin/cxd" _hook "$ev" 2>/dev/null
+if [ "$ev" = Wake ]; then
+  # The idle waker (asyncRewake): exit 2 with the message on stderr wakes
+  # Claude. Only the waker's own "delivered" code (42) becomes exit 2; any
+  # failure, Python's own exit 2 included, must not wake Claude. Outside an
+  # interactive session (claude -p runs this hook synchronously) it has
+  # nothing to do: skip Python.
+  [ "$CLAUDE_CODE_ENTRYPOINT" = cli ] || { cat >/dev/null 2>&1; exit 0; }  # GUARD:wake-shell-entrypoint
+  CXD_HOOK_PARENT=$$ "$py" -I -S "$root/bin/cxd" _hook Wake
+  [ $? -eq 42 ] && exit 2  # GUARD:wake-exit-code
+  exit 0
+fi
+if [ "$ev" = UserPromptSubmit ]; then
+  printf '%s' "$input" | CXD_HOOK_PARENT=$$ "$py" -I -S "$root/bin/cxd" _hook "$ev" 2>/dev/null
+else
+  CXD_HOOK_PARENT=$$ "$py" -I -S "$root/bin/cxd" _hook "$ev" 2>/dev/null
+fi
 exit 0

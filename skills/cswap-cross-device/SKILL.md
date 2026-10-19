@@ -74,8 +74,13 @@ The message waits in `~/.cxd/inbox/<session_id>/` until that session's next hook
 hook dies before handing it over, the next hook delivers it again. It arrives as context
 reading `Message from the lead session <sender> at <time> (cxd message <id>) [cxd:<tag>]:
 <text>`, where `<tag>` is a secret of the receiving session that its SessionStart
-announcement names; a second copy with the same id is a repeat, not a new instruction. A session that is idle
-waiting for a human only sees it on its next prompt.
+announcement names; a second copy with the same id is a repeat, not a new instruction. An
+interactive session that sits idle at its prompt is woken for it: a background waker (an
+asyncRewake hook, Claude Code 2.1.287 or later) hands it over and Claude starts a turn on
+it, with no human typing; Claude Code shows such a message as hook feedback, labelled a
+Stop hook error, and it is still the user's instruction when it carries the mark. After a
+turn the user interrupted with Esc, or with `"idle_wake": false`, the message waits for the
+next prompt.
 
 ## Worker: reporting back
 
