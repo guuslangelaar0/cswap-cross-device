@@ -1418,6 +1418,12 @@ class TestMutationTable(unittest.TestCase):
         m = self.load()
         self.assertEqual(m.check_table(m.MUTATIONS), [])
 
+    def test_a_run_whose_tests_were_all_skipped_is_not_a_proof(self):
+        m = self.load()
+        self.assertTrue(m.all_skipped("test_x ... skipped 'needs openssl'\n\nRan 1 test in 0.001s\n\nOK (skipped=1)\n"))
+        self.assertFalse(m.all_skipped("Ran 2 tests in 0.1s\n\nOK (skipped=1)\n"))
+        self.assertFalse(m.all_skipped("Ran 1 test in 0.1s\n\nOK\n"))
+
     def test_a_folded_entry_is_refused(self):
         """GUARD table-fold. Mutation: the source check is off -> an entry that a
         bad merge folded into the next goes unnoticed (and its guard unchecked)."""

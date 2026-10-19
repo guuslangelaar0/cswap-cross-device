@@ -8,6 +8,7 @@ unmutated copy must pass the same tests.
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,8 @@ import tempfile
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 T = "tests.test_cxd."
+B = "tests.test_broker."
+TESTS = "tests.test_"
 MUTATIONS = [
     {
         "name": "keeper",
@@ -287,6 +290,66 @@ MUTATIONS = [
         "expect": "red",
     },
     {
+        "name": "pin-node-id",
+        "what": "a broker peer is admitted on TLS verification alone (a certificate signed by a member's key gets in)",
+        "edits": [("lib/cxd/broker/identity.py",
+                   "    return MEMBER if peer in member_ids else None  # GUARD:pin-node-id\n",
+                   "    return MEMBER  # MUTATION\n")],
+        "tests": [B + "TestIdentity.test_a_certificate_signed_by_a_member_passes_tls_but_not_the_pin"],
+        "expect": "red",
+    },
+    {
+        "name": "identity-lock",
+        "what": "two first users of the broker identity each create one (one gets an identity that is not the one on disk)",
+        "edits": [("lib/cxd/broker/identity.py", "        fcntl.flock(lock, fcntl.LOCK_EX)  # GUARD:identity-lock\n",
+                   "        pass  # MUTATION\n")],
+        "tests": [B + "TestIdentity.test_concurrent_first_use_makes_one_identity"],
+        "expect": "red",
+    },
+    {
+        "name": "identity-pair",
+        "what": "the broker identity loads a key that is not its certificate's (after a crash between the two writes)",
+        "edits": [("lib/cxd/broker/identity.py",
+                   "            ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(self.cert, self.key)"
+                   "  # GUARD:identity-pair\n",
+                   "            pass  # MUTATION\n")],
+        "tests": [B + "TestIdentity.test_a_key_that_is_not_the_certificates_is_refused"],
+        "expect": "red",
+    },
+    {
+        "name": "one-cert",
+        "what": "a PEM holding several certificates gets a node id (a hash of garbage)",
+        "edits": [("lib/cxd/broker/identity.py",
+                   "    if not isinstance(pem, str) or pem.count(_PEM_BEGIN) != 1:  # GUARD:one-cert\n",
+                   "    if not isinstance(pem, str) or pem.count(_PEM_BEGIN) < 1:  # MUTATION\n")],
+        "tests": [B + "TestIdentity.test_a_node_id_is_of_exactly_one_certificate"],
+        "expect": "red",
+    },
+    {
+        "name": "client-verify",
+        "what": "a member dialing another does not verify the server's certificate",
+        "edits": [("lib/cxd/broker/identity.py", "    ctx.verify_mode = ssl.CERT_REQUIRED  # GUARD:client-verify\n",
+                   "    ctx.verify_mode = ssl.CERT_NONE  # MUTATION\n")],
+        "tests": [B + "TestIdentity.test_a_member_refuses_a_stranger_server"],
+        "expect": "red",
+    },
+    {
+        "name": "tls-ciphers",
+        "what": "broker TLS takes the default cipher list (CBC ciphers negotiable)",
+        "edits": [("lib/cxd/broker/identity.py", "    ctx.set_ciphers(CIPHERS)  # GUARD:tls-ciphers\n",
+                   "    pass  # MUTATION\n")],
+        "tests": [B + "TestIdentity.test_only_aead_ciphers_with_ecdhe"],
+        "expect": "red",
+    },
+    {
+        "name": "tls-floor",
+        "what": "broker TLS allows TLS 1.0",
+        "edits": [("lib/cxd/broker/identity.py", "    ctx.minimum_version = ssl.TLSVersion.TLSv1_2  # GUARD:tls-floor\n",
+                   "    ctx.minimum_version = ssl.TLSVersion.TLSv1  # MUTATION\n")],
+        "tests": [B + "TestIdentity.test_tls_1_2_is_the_floor"],
+        "expect": "red",
+    },
+    {
         "name": "prune-age",
         "what": "pruning ignores the age: recently ended sessions are removed too",
         "edits": [("lib/cxd/prune.py", "    if _last_change(_session_paths(sid)) >= cutoff:  # GUARD:prune-age\n",
@@ -391,9 +454,13 @@ def check_source(text):
 
 def guard_names_in_tests():
     """Names in test docstrings that say `GUARD <name>.`: each needs a mutation."""
+    import glob
     import re
-    with open(os.path.join(REPO, "tests", "test_cxd.py"), encoding="utf-8") as f:
-        return set(re.findall(r'"""GUARD ([a-z0-9-]+)[.\s]', f.read()))
+    names = set()
+    for p in sorted(glob.glob(os.path.join(REPO, "tests", "test_*.py"))):
+        with open(p, encoding="utf-8") as f:
+            names |= set(re.findall(r'"""GUARD ([a-z0-9-]+)[.\s]', f.read()))
+    return names
 
 
 def check_table(mutations, root=REPO):
@@ -413,8 +480,8 @@ def check_table(mutations, root=REPO):
         if m["expect"] not in ("red", "green"):
             problems.append("%s: expect must be red or green" % where)
         tests = m["tests"]
-        if not isinstance(tests, list) or not tests or not all(isinstance(t, str) and t.startswith(T) for t in tests):
-            problems.append("%s: tests must be a non-empty list of %s* names" % (where, T))
+        if not isinstance(tests, list) or not tests or not all(isinstance(t, str) and t.startswith(TESTS) for t in tests):
+            problems.append("%s: tests must be a non-empty list of %s* names" % (where, TESTS))
         edits = m["edits"]
         if not isinstance(edits, list) or not edits:
             problems.append("%s: edits must be a non-empty list" % where)
@@ -462,7 +529,7 @@ def main(names):
         print("\n".join("!! " + p for p in problems))
         return 1
     chosen = [m for m in MUTATIONS if not names or m["name"] in names]
-    failures = 0
+    failures = skipped = 0
     for m in chosen:
         print("=" * 78)
         print("MUTATION %s: %s" % (m["name"], m["what"]))
@@ -473,6 +540,10 @@ def main(names):
             rc, out = run_tests(clean, m["tests"])
             print("-- unmutated: rc=%d %s" % (rc, "GREEN" if rc == 0 else "RED"))
             print(_summary(out))
+            if rc == 0 and all_skipped(out):
+                print("-> NOT RUN: its tests are skipped here, so this guard is not proven here")
+                skipped += 1
+                continue
             mutant = os.path.join(base, "mutant")
             copy_repo(mutant)
             for rel, old, new in m["edits"]:
@@ -495,8 +566,16 @@ def main(names):
         finally:
             shutil.rmtree(base, ignore_errors=True)
     print("=" * 78)
-    print("%d mutation(s), %d failure(s)" % (len(chosen), failures))
-    return 1 if failures else 0
+    print("%d mutation(s), %d failure(s)%s" % (len(chosen), failures,
+                                               ", %d not run (tests skipped)" % skipped if skipped else ""))
+    return 1 if failures or skipped else 0
+
+
+def all_skipped(out):
+    """unittest ran the tests but skipped every one of them."""
+    ran = re.search(r"^Ran (\d+) test", out, re.M)
+    skips = re.search(r"^OK \(skipped=(\d+)\)", out, re.M)
+    return bool(ran and skips and ran.group(1) == skips.group(1))
 
 
 def _summary(out, failures_only=False):
