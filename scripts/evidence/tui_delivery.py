@@ -443,20 +443,19 @@ class Driver(object):
         for attempt in range(1, 4):
             n0 = len(self.assistant_texts())
             stops = self.stop_count()
-            interruptions = self._interrupted()
             self.type_prompt("Write the numbers from 1 to 5000, one per line, nothing else.")
             self.wait(lambda: self._streaming(n0), 60, "the answer to start streaming", step=0.1)
             self.keys("Escape")
-            time.sleep(4)
-            if self._interrupted() > interruptions:
+            time.sleep(6)
+            if self.stop_count() == stops:  # no Stop record: the turn was interrupted
+                self.prompts -= 1
                 break
-            self.note("attempt %d: the answer ended before Esc reached it; again" % attempt)
+            self.note("attempt %d: the answer ended (with a Stop) before Esc reached it; again" % attempt)
             self.settle()
         else:
             return "FAIL: no turn could be interrupted in 3 attempts"
-        self.prompts -= 1 if self.stop_count() == stops else 0  # an interrupted turn writes no Stop record
-        self.note("pressed Esc while the answer streamed; the transcript records the interruption; "
-                  "Stop records since: %d" % (self.stop_count() - stops))
+        self.note("pressed Esc while the answer streamed: no Stop record; interruptions in the transcript: %d"
+                  % self._interrupted())
         n1 = len(self.assistant_texts())
         mid = self.send("Reply with the word PEAR-F. (cxd evidence check)")
         deadline = time.time() + wait_s
